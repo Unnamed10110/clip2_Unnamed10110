@@ -1863,31 +1863,106 @@ void ClipboardManager::ProcessClipboard() {
 }
 
 void ClipboardManager::PlayClickSound() {
-    // Play click.mp3 with notification priority using MCI (Media Control Interface)
-    // MCI supports MP3 files and plays with notification priority
+    // Try to play click.mp3 from embedded resource first, fallback to file if resource not found
     
-    // Get executable directory
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileName(GetModuleHandle(nullptr), exePath, MAX_PATH);
+    std::wstring soundPath;
+    bool useTempFile = false;
+    wchar_t tempFile[MAX_PATH] = {0};
     
-    // Get directory path
-    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
-    if (lastSlash) {
-        *(lastSlash + 1) = L'\0';
+    // Try to find the resource (resource ID 101)
+    HRSRC hRes = FindResource(GetModuleHandle(nullptr), MAKEINTRESOURCE(101), RT_RCDATA);
+    if (hRes) {
+        // Load the resource
+        HGLOBAL hResData = LoadResource(GetModuleHandle(nullptr), hRes);
+        if (hResData) {
+            // Lock the resource to get pointer to data
+            void* pResData = LockResource(hResData);
+            DWORD resSize = SizeofResource(GetModuleHandle(nullptr), hRes);
+            
+            if (pResData && resSize > 0) {
+                // Get temporary file path with .mp3 extension
+                wchar_t tempPath[MAX_PATH];
+                GetTempPathW(MAX_PATH, tempPath);
+                GetTempFileNameW(tempPath, L"clip2", 0, tempFile);
+                
+                // Change extension to .mp3
+                wchar_t* lastDot = wcsrchr(tempFile, L'.');
+                if (lastDot) {
+                    wcscpy_s(lastDot, MAX_PATH - (lastDot - tempFile), L".mp3");
+                } else {
+                    wcscat_s(tempFile, MAX_PATH, L".mp3");
+                }
+                
+                // Write resource data to temporary file
+                HANDLE hFile = CreateFileW(tempFile, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    DWORD bytesWritten;
+                    if (WriteFile(hFile, pResData, resSize, &bytesWritten, nullptr)) {
+                        CloseHandle(hFile);
+                        soundPath = tempFile;
+                        useTempFile = true;
+                    } else {
+                        CloseHandle(hFile);
+                        DeleteFileW(tempFile);
+                    }
+                }
+                
+                // Clean up
+                UnlockResource(pResData);
+            }
+            FreeResource(hResData);
+        }
     }
     
-    std::wstring soundPath = std::wstring(exePath) + L"click.mp3";
+    // Fallback: try to read from file in executable directory
+    if (!useTempFile) {
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(GetModuleHandle(nullptr), exePath, MAX_PATH);
+        
+        // Get directory path
+        wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+        if (lastSlash) {
+            *(lastSlash + 1) = L'\0';
+        }
+        
+        std::wstring filePath = std::wstring(exePath) + L"click.mp3";
+        
+        // Verify file exists
+        DWORD fileAttr = GetFileAttributesW(filePath.c_str());
+        if (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+            soundPath = filePath;
+        }
+    }
     
-    // Close any existing instance first (in case previous play is still active)
-    mciSendString(L"close clickSound", nullptr, 0, nullptr);
-    
-    // Use MCI to play MP3 file asynchronously
-    // Format: open "filepath" type mpegvideo alias sound
-    std::wstring mciCommand = L"open \"" + soundPath + L"\" type mpegvideo alias clickSound";
-    if (mciSendString(mciCommand.c_str(), nullptr, 0, nullptr) == 0) {
-        // Play the sound asynchronously (non-blocking)
-        // The sound will play with notification priority (same as Windows notifications)
-        mciSendString(L"play clickSound notify", nullptr, 0, nullptr);
+    // Play the sound
+    if (!soundPath.empty()) {
+        // Close any existing instance first (in case previous play is still active)
+        mciSendString(L"close clickSound", nullptr, 0, nullptr);
+        
+        // Use MCI to play MP3 file asynchronously
+        // Try with mpegvideo type first (for MP3)
+        std::wstring mciCommand = L"open \"" + soundPath + L"\" type mpegvideo alias clickSound";
+        MCIERROR mciError = mciSendString(mciCommand.c_str(), nullptr, 0, nullptr);
+        
+        if (mciError != 0) {
+            // If mpegvideo fails, try mpegvideoaudio or mpeg
+            mciCommand = L"open \"" + soundPath + L"\" type mpegvideoaudio alias clickSound";
+            mciError = mciSendString(mciCommand.c_str(), nullptr, 0, nullptr);
+        }
+        
+        if (mciError == 0) {
+            // Play the sound asynchronously (non-blocking)
+            // The sound will play with notification priority (same as Windows notifications)
+            mciSendString(L"play clickSound", nullptr, 0, nullptr);
+        } else {
+            // If MCI fails, try using mciSendCommand with MPEG type
+            // Alternative approach: try opening without specifying type (let MCI auto-detect)
+            mciCommand = L"open \"" + soundPath + L"\" alias clickSound";
+            mciError = mciSendString(mciCommand.c_str(), nullptr, 0, nullptr);
+            if (mciError == 0) {
+                mciSendString(L"play clickSound", nullptr, 0, nullptr);
+            }
+        }
     }
 }
 

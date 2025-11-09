@@ -1,79 +1,113 @@
 # clip2
 
-A fast and modern clipboard manager for Windows with OLED theme and rich format support.
+A modern clipboard manager for Windows with OLED theme and advanced features.
+
+## Developer Information
+
+- **Developer**: Unnamed10110
+- **Email**: trojan.v6@gmail.com
+- **Alternative Email**: sergiobritos10110@gmail.com
 
 ## Features
 
-- **Background Operation**: Runs silently in the system tray
-- **Rich Format Support**: Preserves formatting (bold, colors, sizes, etc.) when copying and pasting
-- **Multiple Formats**: Supports text, rich text, images, files, and more
-- **History Management**: Stores up to 1000 clipboard items
-- **Modern UI**: Black OLED theme with bright red accents and rounded borders
-- **Quick Access**: Press `Ctrl+NumPadDot` to show/hide the clipboard list
-- **Search**: Real-time search filtering with `Ctrl+F`
-- **Keyboard Navigation**: Arrow keys to navigate, Enter to paste
-- **Image Preview**: Hover over image/video items to see larger previews
-- **Duplicate Prevention**: Automatically prevents duplicate consecutive copies
-- **Start with Windows**: Option to start automatically with Windows session
-
-## Usage
-
-### Basic Operations
-
-- **Show/Hide List**: Press `Ctrl+NumPadDot`
-- **Paste Item**: 
-  - Type a number and press `Enter` (e.g., type `5` then `Enter` to paste item 5)
-  - Press a single digit (1-9) for quick paste
-  - Double-click an item
-  - Use arrow keys to select and press `Enter`
-- **Search**: Press `Ctrl+F` to focus search box, type to filter, press `Enter` to paste first result
-- **Plain Text Paste**: Hold `Ctrl` while pasting to paste as plain text only
-- **Clear List**: Right-click the list and select "Clear List"
-
-### Tray Icon Menu
-
-Right-click the tray icon to access:
-- **Show Clipboard**: Show the clipboard list
-- **Start with Windows**: Toggle automatic startup (checkmark indicates enabled)
-- **Exit**: Close the application
-
-## Requirements
-
-- Windows 10 or later
-- Visual C++ Redistributable (if not included)
+- ✅ **Background Operation**: Runs silently in the system tray
+- ✅ **Universal Clipboard Support**: Captures text, rich text, images, files, and more
+- ✅ **LIFO History**: Most recently copied item appears first (up to 1000 items)
+- ✅ **Hotkey Access**: Press **Ctrl+NumPadDot** to show/hide the clipboard list
+- ✅ **Quick Paste**: Press **1-9** or type number + Enter to paste items from the list
+- ✅ **Visual Feedback**: Click sound plays when items are copied
+- ✅ **System Tray Icon**: Always visible when running (uses misc02.ico)
+- ✅ **Modern OLED Theme**: Black background with bright red accents and rounded borders
+- ✅ **Search Functionality**: Filter clipboard history with Ctrl+F
+- ✅ **Image/Video Thumbnails**: Visual previews for images and videos
+- ✅ **Format Preservation**: Pastes with original formatting (bold, colors, etc.)
+- ✅ **Plain Text Mode**: Hold Ctrl while pasting for plain text
+- ✅ **Start with Windows**: Option to auto-start with Windows session
+- ✅ **Fast Performance**: Optimized for minimal CPU usage
 
 ## Building
 
 ### Prerequisites
 
+- Windows 10/11
 - CMake 3.15 or later
-- C++17 compatible compiler (MSVC, MinGW, etc.)
+- C++ compiler (MSVC, MinGW, or Clang)
+- Visual Studio 2019/2022 (optional, for MSVC)
 
-### Build Instructions
+### Build Steps
 
-```bash
-mkdir build
-cd build
-cmake ..
-cmake --build . --config Release
-```
+1. **Using CMake (Recommended)**:
+   ```bash
+   mkdir build
+   cd build
+   cmake .. -G "Visual Studio 17 2022" -A x64
+   cmake --build . --config Release
+   ```
 
-The executable will be created as `clip2.exe` in the `build` directory.
+2. **Using the batch script**:
+   ```bash
+   build.bat
+   ```
 
-## Files
+3. **Manual compilation** (MinGW):
+   ```bash
+   windres ClipboardManager.rc -o ClipboardManager.res
+   g++ -std=c++17 -O2 -mwindows ClipboardManager.cpp ClipboardManager.res -o ClipboardManager.exe -luser32 -lgdi32 -lshell32 -lwinmm
+   ```
 
-- `ClipboardManager.cpp` / `ClipboardManager.h`: Main application code
-- `CMakeLists.txt`: Build configuration
-- `ClipboardManager.rc`: Resource file for icon
-- `misc02.ico`: Application icon
-- `click.mp3`: Sound effect played when copying
+The executable will be created as `clip2.exe`.
 
-## Developer
+## Usage
 
-**Unnamed10110**
-- Email: trojan.v6@gmail.com
-- Email: sergiobritos10110@gmail.com
+1. **Start the application**: Run `clip2.exe`
+   - The icon will appear in the system tray
+
+2. **View clipboard history**: Press **Ctrl+NumPadDot**
+   - A floating window shows your clipboard history with modern OLED theme
+   - Each item displays: number, preview, format type, and timestamp
+   - Images and videos show thumbnails
+
+3. **Paste an item**: 
+   - With the list visible, press **1-9** for quick paste, or type number + **Enter** for multi-digit selection
+   - Use **Arrow keys** to navigate and **Enter** to paste selected item
+   - **Double-click** an item to paste it
+   - Hold **Ctrl** while pasting for plain text mode
+
+4. **Search**: Press **Ctrl+F** to focus the search box and filter items
+
+5. **Hide the list**: Press **Ctrl+NumPadDot** again, **Escape**, or click outside the window
+
+6. **System tray menu**: Right-click the tray icon for options
+   - **Show Clipboard**: Show the clipboard list
+   - **Start with Windows**: Toggle auto-start with Windows (checkmark indicates enabled)
+   - **Exit**: Close the application
+
+## Technical Details
+
+- **Maximum History**: 1000 items
+- **Supported Formats**: Text, Unicode text, Rich Text Format (RTF), HTML, images (bitmap, DIB, DIBV5), files, and more
+- **Format Preservation**: All clipboard formats are preserved when pasting (bold, colors, sizes, etc.)
+- **Memory Limit**: 100MB per format
+- **Hotkey**: Ctrl+NumPadDot (low-level keyboard hook for reliable detection)
+- **Update Frequency**: Asynchronous clipboard monitoring with retry logic
+- **Duplicate Detection**: Prevents adding identical consecutive items
+- **Sound**: Embedded click.mp3 plays on copy (with fallback to file)
+
+## Requirements
+
+- Windows API libraries: `user32`, `gdi32`, `shell32`, `winmm`, `comctl32`, `shlwapi`, `ole32`
+- C++17 standard
+- misc02.ico icon file (included)
+- click.mp3 sound file (embedded as resource, with file fallback)
+
+## Troubleshooting
+
+- **Icon not showing**: Ensure `misc02.ico` is in the same directory or compiled as a resource
+- **Hotkey not working**: Ensure NumLock is enabled or try the extended key combination
+- **Sound not playing**: Ensure `click.mp3` is in the same directory as `clip2.exe` (or embedded as resource)
+- **Performance issues**: The application uses minimal resources; if issues occur, check system resources
 
 ## License
 
 This project is provided as-is for personal use.
+

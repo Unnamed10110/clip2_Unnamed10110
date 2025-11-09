@@ -20,6 +20,14 @@ if(WIN32)
         ClipboardManager.h
         ${RESOURCE_FILE}
         misc02.ico
+        click.mp3
+    )
+    
+    # Copy click.mp3 to build directory for fallback
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/click.mp3"
+        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/click.mp3"
     )
     
     # Link necessary libraries
