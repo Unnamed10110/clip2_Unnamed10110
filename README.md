@@ -23,7 +23,9 @@ A modern clipboard manager for Windows with OLED theme and advanced features.
 - ✅ **Format Preservation**: Pastes with original formatting (bold, colors, etc.)
 - ✅ **Plain Text Mode**: Hold Ctrl while pasting for plain text
 - ✅ **Start with Windows**: Option to auto-start with Windows session
-- ✅ **Fast Performance**: Optimized for minimal CPU usage
+- ✅ **Duplicate Prevention**: Automatically skips identical consecutive copies
+- ✅ **Stability**: Robust error handling prevents crashes with large or complex clipboard data
+- ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
 
 ## Building
 
@@ -84,14 +86,20 @@ The executable will be created as `clip2.exe`.
 
 ## Technical Details
 
-- **Maximum History**: 1000 items
+- **Maximum History**: 100 items (optimized for stability)
 - **Supported Formats**: Text, Unicode text, Rich Text Format (RTF), HTML, images (bitmap, DIB, DIBV5), files, and more
 - **Format Preservation**: All clipboard formats are preserved when pasting (bold, colors, sizes, etc.)
-- **Memory Limit**: 100MB per format
+- **Memory Limits**: 
+  - Max 5 formats per item
+  - Max 5MB per individual format
+  - Max 10MB total per clipboard item
+  - Aggressive cleanup when exceeding 50 items
 - **Hotkey**: Ctrl+NumPadDot (low-level keyboard hook for reliable detection)
 - **Update Frequency**: Asynchronous clipboard monitoring with retry logic
-- **Duplicate Detection**: Prevents adding identical consecutive items
+- **Duplicate Detection**: Prevents adding identical consecutive items by comparing all formats and data
 - **Sound**: Embedded click.mp3 plays on copy (with fallback to file)
+- **Navigation**: Arrow keys, Page Up/Down, Home/End for list navigation
+- **Auto-hide**: List automatically hides when focus moves to another window
 
 ## Requirements
 
@@ -106,6 +114,38 @@ The executable will be created as `clip2.exe`.
 - **Hotkey not working**: Ensure NumLock is enabled or try the extended key combination
 - **Sound not playing**: Ensure `click.mp3` is in the same directory as `clip2.exe` (or embedded as resource)
 - **Performance issues**: The application uses minimal resources; if issues occur, check system resources
+
+## Recent Improvements & Fixes
+
+### Stability Enhancements
+- ✅ **Fixed crashes with multiple images**: Properly handles CF_BITMAP format conversion to DIB
+- ✅ **Fixed crashes with rich text from Word**: Added extensive validation and error handling for RTF and complex formats
+- ✅ **Fixed crashes with rapid copying**: Implemented re-entrant call protection with `isProcessingClipboard` flag
+- ✅ **Fixed memory leaks**: Aggressive memory management with strict limits per format and item
+- ✅ **Fixed long-running stability**: Proper COM initialization handling and resource cleanup
+
+### Memory Management
+- Reduced maximum history from 1000 to 100 items for better stability
+- Limited to 5 formats per clipboard item (down from unlimited)
+- Max 5MB per individual format (down from 100MB)
+- Max 10MB total per clipboard item
+- Automatic cleanup when history exceeds 50 items
+- Forced memory deallocation on history clear
+- Simplified preview generation to prevent resource exhaustion
+
+### Error Handling
+- Extensive try-catch blocks around clipboard operations
+- Validation of all data sizes, pointers, and structures before processing
+- Safe bounds checking for text and binary data
+- Proper cleanup in all error paths (clipboard, GDI resources, COM objects)
+- Prevention of buffer overruns and invalid memory access
+
+### Performance Optimizations
+- Streamlined clipboard format storage and retrieval
+- Optimized duplicate detection for large formats
+- Reduced preview bitmap complexity
+- Minimized GDI object creation and destruction
+- Efficient filtering and search operations
 
 ## License
 
