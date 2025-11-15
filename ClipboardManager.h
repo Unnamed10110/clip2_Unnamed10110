@@ -31,12 +31,86 @@ struct ClipboardItem {
     bool isVideo;
     
     ClipboardItem(UINT fmt, const std::vector<BYTE>& d) 
-        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), isImage(false), isVideo(false) {
+        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), isImage(false), isVideo(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]") {
+        // CRITICAL: Store data first, before any processing
+        if (d.empty() || d.size() > 200 * 1024 * 1024) {
+            return;
+        }
+        
+        // Store format data immediately - this must succeed
         formats[fmt] = d;
-        formatName = GetFormatName(fmt);
-        fileType = GetFileType(fmt);
-        preview = GetPreview(d, fmt);
-        GenerateThumbnail();
+        
+        // Get format name - simple, safe operation
+        if (fmt == CF_TEXT) formatName = L"Text";
+        else if (fmt == CF_UNICODETEXT) formatName = L"Unicode Text";
+        else if (fmt == CF_OEMTEXT) formatName = L"OEM Text";
+        else if (fmt == CF_BITMAP) formatName = L"Bitmap";
+        else if (fmt == CF_DIB) formatName = L"DIB";
+        else if (fmt == CF_DIBV5) formatName = L"DIB v5";
+        else if (fmt == CF_HDROP) formatName = L"File Drop";
+        else {
+            // Try to get format name, but don't crash if it fails
+            try {
+                wchar_t name[256] = {0};
+                if (GetClipboardFormatNameW(fmt, name, 256)) {
+                    formatName = name;
+                }
+            } catch (...) {
+                formatName = L"Unknown Format";
+            }
+        }
+        
+        // Get file type - simple checks only
+        if (fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT) {
+            fileType = L"Text";
+        } else if (fmt == CF_BITMAP || fmt == CF_DIB || fmt == CF_DIBV5) {
+            fileType = L"Image";
+            isImage = true;
+        } else if (fmt == CF_HDROP) {
+            fileType = L"Files";
+        } else {
+            fileType = L"Other";
+        }
+        
+        // Get preview - ONLY for text formats, skip complex processing
+        if (fmt == CF_UNICODETEXT && d.size() >= sizeof(wchar_t) && d.size() < 100000) {
+            try {
+                size_t len = d.size() / sizeof(wchar_t);
+                if (len > 0 && len < 10000) {
+                    const wchar_t* text = (const wchar_t*)d.data();
+                    if (text) {
+                        size_t previewLen = std::min(len, (size_t)50);
+                        preview.assign(text, previewLen);
+                        if (len > 50) preview += L"...";
+                    }
+                }
+            } catch (...) {
+                preview = L"[Unicode Text]";
+            }
+        } else if (fmt == CF_TEXT && d.size() > 0 && d.size() < 100000) {
+            try {
+                size_t len = std::min(d.size(), (size_t)50);
+                const char* text = (const char*)d.data();
+                if (text) {
+                    std::string str(text, len);
+                    preview = std::wstring(str.begin(), str.end());
+                    if (d.size() > 50) preview += L"...";
+                }
+            } catch (...) {
+                preview = L"[Text]";
+            }
+        } else {
+            preview = L"[" + formatName + L"]";
+        }
+        
+        // Skip thumbnail generation for text - it's not needed and can cause crashes
+        if (fmt != CF_TEXT && fmt != CF_UNICODETEXT && fmt != CF_OEMTEXT) {
+            try {
+                GenerateThumbnail();
+            } catch (...) {
+                // Ignore thumbnail errors
+            }
+        }
     }
     
     // Add additional format
@@ -130,6 +204,7 @@ private:
     std::wstring searchText;
     std::vector<int> filteredIndices;  // Indices of items matching search
     bool isPasting;
+    bool isProcessingClipboard;  // Prevent re-entrant clipboard processing
     HWND previousFocusWindow;
     int hoveredItemIndex;
     int selectedIndex;  // Currently selected item index (in filtered list)
@@ -139,7 +214,7 @@ private:
     static const UINT WM_TRAYICON = WM_USER + 1;
     static const UINT WM_CLIPBOARD_HOTKEY = WM_USER + 2;
     static const UINT WM_PROCESS_CLIPBOARD = WM_USER + 3;
-    static const int MAX_ITEMS = 1000;
+    static const int MAX_ITEMS = 100; // Reduced from 1000 to prevent memory issues
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
 };
