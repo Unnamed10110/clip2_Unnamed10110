@@ -638,6 +638,9 @@ bool ClipboardManager::Initialize() {
     wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
     lastSequenceNumber = GetClipboardSequenceNumber();
     
+    // Register for clipboard update notifications (instant notification when clipboard changes)
+    AddClipboardFormatListener(hwndMain);
+    
     return true;
 }
 
@@ -671,8 +674,8 @@ void ClipboardManager::Run() {
             DispatchMessage(&msg);
         }
         
-        // Monitor clipboard changes (non-blocking, just checks sequence)
-        MonitorClipboard();
+        // Sleep briefly to avoid busy-waiting
+        Sleep(10);
     }
 }
 
@@ -682,6 +685,11 @@ void ClipboardManager::Stop() {
     RemoveTrayIcon();
     UninstallKeyboardHook();
     UnregisterHotkey();
+    
+    // Unregister clipboard listener
+    if (hwndMain) {
+        RemoveClipboardFormatListener(hwndMain);
+    }
     
     // Clean shutdown
     if (hwndPreview) {
@@ -780,6 +788,20 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             mgr->HideListWindow();
         } else {
             mgr->ShowListWindow();
+        }
+        return 0;
+    
+    case WM_CLIPBOARDUPDATE:
+        // Clipboard changed - instant notification from Windows
+        if (!mgr->isPasting) {
+            // Play sound immediately when clipboard changes
+            mgr->PlayClickSound();
+            
+            // Update sequence number
+            mgr->lastSequenceNumber = GetClipboardSequenceNumber();
+            
+            // Post message to process clipboard asynchronously
+            PostMessage(hwnd, WM_PROCESS_CLIPBOARD, 0, 0);
         }
         return 0;
         
@@ -1926,27 +1948,6 @@ void ClipboardManager::PasteItem(int index) {
     }
 }
 
-void ClipboardManager::MonitorClipboard() {
-    // Don't monitor clipboard changes if we're currently pasting
-    if (isPasting) {
-        return;
-    }
-    
-    UINT currentSequence = GetClipboardSequenceNumber();
-    
-    if (currentSequence != lastSequenceNumber) {
-        lastSequenceNumber = currentSequence;
-        
-        // Play sound immediately when clipboard change is detected
-        // This gives instant feedback to the user
-        PlayClickSound();
-        
-        // Post a delayed message to process clipboard asynchronously
-        // This prevents interfering with the copy operation
-        PostMessage(hwndMain, WM_PROCESS_CLIPBOARD, 0, 0);
-    }
-}
-
 void ClipboardManager::ProcessClipboard() {
     // Prevent re-entrant calls
     if (isProcessingClipboard) {
@@ -2239,12 +2240,6 @@ void ClipboardManager::ProcessClipboard() {
                             // Update filter if list is visible
                             if (listVisible) {
                                 FilterItems();
-                            }
-                            
-                            // Play sound again after successful processing
-                            // (Also plays immediately in MonitorClipboard() for instant feedback)
-                            PlayClickSound();
-                            if (listVisible) {
                                 UpdateListWindow();
                             }
                         } catch (...) {
@@ -2275,106 +2270,31 @@ void ClipboardManager::ProcessClipboard() {
 }
 
 void ClipboardManager::PlayClickSound() {
-    // Try to play click.mp3 from embedded resource first, fallback to file if resource not found
+    // Simple, fast, reliable sound playback using mciSendString
+    // This plays the MP3 file from the executable directory
     
-    std::wstring soundPath;
-    bool useTempFile = false;
-    wchar_t tempFile[MAX_PATH] = {0};
+    static std::wstring soundPath;
+    static bool initialized = false;
     
-    // Try to find the resource (resource ID 101)
-    HRSRC hRes = FindResource(GetModuleHandle(nullptr), MAKEINTRESOURCE(101), RT_RCDATA);
-    if (hRes) {
-        // Load the resource
-        HGLOBAL hResData = LoadResource(GetModuleHandle(nullptr), hRes);
-        if (hResData) {
-            // Lock the resource to get pointer to data
-            void* pResData = LockResource(hResData);
-            DWORD resSize = SizeofResource(GetModuleHandle(nullptr), hRes);
-            
-            if (pResData && resSize > 0) {
-                // Get temporary file path with .mp3 extension
-                wchar_t tempPath[MAX_PATH];
-                GetTempPathW(MAX_PATH, tempPath);
-                GetTempFileNameW(tempPath, L"clip2", 0, tempFile);
-                
-                // Change extension to .mp3
-                wchar_t* lastDot = wcsrchr(tempFile, L'.');
-                if (lastDot) {
-                    wcscpy_s(lastDot, MAX_PATH - (lastDot - tempFile), L".mp3");
-                } else {
-                    wcscat_s(tempFile, MAX_PATH, L".mp3");
-                }
-                
-                // Write resource data to temporary file
-                HANDLE hFile = CreateFileW(tempFile, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    DWORD bytesWritten;
-                    if (WriteFile(hFile, pResData, resSize, &bytesWritten, nullptr)) {
-                        CloseHandle(hFile);
-                        soundPath = tempFile;
-                        useTempFile = true;
-                    } else {
-                        CloseHandle(hFile);
-                        DeleteFileW(tempFile);
-                    }
-                }
-                
-                // Clean up
-                UnlockResource(pResData);
-            }
-            FreeResource(hResData);
-        }
-    }
-    
-    // Fallback: try to read from file in executable directory
-    if (!useTempFile) {
+    if (!initialized) {
+        initialized = true;
+        // Get executable directory once
         wchar_t exePath[MAX_PATH];
-        GetModuleFileNameW(GetModuleHandle(nullptr), exePath, MAX_PATH);
-        
-        // Get directory path
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
         wchar_t* lastSlash = wcsrchr(exePath, L'\\');
-        if (lastSlash) {
-            *(lastSlash + 1) = L'\0';
-        }
-        
-        std::wstring filePath = std::wstring(exePath) + L"click.mp3";
-        
-        // Verify file exists
-        DWORD fileAttr = GetFileAttributesW(filePath.c_str());
-        if (fileAttr != INVALID_FILE_ATTRIBUTES && !(fileAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-            soundPath = filePath;
-        }
+        if (lastSlash) *(lastSlash + 1) = L'\0';
+        soundPath = std::wstring(exePath) + L"click.mp3";
     }
     
-    // Play the sound
-    if (!soundPath.empty()) {
-        // Close any existing instance first (in case previous play is still active)
-        mciSendString(L"close clickSound", nullptr, 0, nullptr);
-        
-        // Use MCI to play MP3 file asynchronously
-        // Try with mpegvideo type first (for MP3)
-        std::wstring mciCommand = L"open \"" + soundPath + L"\" type mpegvideo alias clickSound";
-        MCIERROR mciError = mciSendString(mciCommand.c_str(), nullptr, 0, nullptr);
-        
-        if (mciError != 0) {
-            // If mpegvideo fails, try mpegvideoaudio or mpeg
-            mciCommand = L"open \"" + soundPath + L"\" type mpegvideoaudio alias clickSound";
-            mciError = mciSendString(mciCommand.c_str(), nullptr, 0, nullptr);
-        }
-        
-        if (mciError == 0) {
-            // Play the sound asynchronously (non-blocking)
-            // The sound will play with notification priority (same as Windows notifications)
-            mciSendString(L"play clickSound", nullptr, 0, nullptr);
-        } else {
-            // If MCI fails, try using mciSendCommand with MPEG type
-            // Alternative approach: try opening without specifying type (let MCI auto-detect)
-            mciCommand = L"open \"" + soundPath + L"\" alias clickSound";
-            mciError = mciSendString(mciCommand.c_str(), nullptr, 0, nullptr);
-            if (mciError == 0) {
-                mciSendString(L"play clickSound", nullptr, 0, nullptr);
-            }
-        }
+    // Stop any previous playback
+    mciSendString(L"stop clicksnd", nullptr, 0, nullptr);
+    mciSendString(L"close clicksnd", nullptr, 0, nullptr);
+    
+    // Open with MPEGVideo device type (required for MP3)
+    std::wstring openCmd = L"open \"" + soundPath + L"\" type MPEGVideo alias clicksnd";
+    if (mciSendString(openCmd.c_str(), nullptr, 0, nullptr) == 0) {
+        // Play asynchronously
+        mciSendString(L"play clicksnd", nullptr, 0, nullptr);
     }
 }
 

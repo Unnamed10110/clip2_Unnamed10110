@@ -179,7 +179,6 @@ private:
     void HidePreviewWindow();
     int GetItemAtPosition(int x, int y);
     void PasteItem(int index);
-    void MonitorClipboard();
     void ProcessClipboard();
     void PlayClickSound();
     void ClearClipboardHistory();
