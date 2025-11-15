@@ -2,11 +2,6 @@
 
 A modern clipboard manager for Windows with OLED theme and advanced features.
 
-## Developer Information
-
-- **Developer**: Unnamed10110
-- **Email**: trojan.v6@gmail.com
-- **Alternative Email**: sergiobritos10110@gmail.com
 
 ## Features
 
@@ -146,6 +141,12 @@ The executable will be created as `clip2.exe`.
 - Reduced preview bitmap complexity
 - Minimized GDI object creation and destruction
 - Efficient filtering and search operations
+
+## Developer Information
+
+- **Developer**: Unnamed10110
+- **Email**: trojan.v6@gmail.com
+- **Alternative Email**: sergiobritos10110@gmail.com
 
 ## License
 
