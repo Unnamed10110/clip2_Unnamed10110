@@ -2012,6 +2012,17 @@ void ClipboardManager::ProcessClipboard() {
                 std::vector<BYTE> data;
                 UINT storageFormat = primaryFormat;
                 
+                // Check if primary format is handle-based
+                bool isPrimaryHandleBased = (
+                    primaryFormat == CF_BITMAP ||
+                    primaryFormat == CF_PALETTE ||
+                    primaryFormat == CF_METAFILEPICT ||
+                    primaryFormat == CF_ENHMETAFILE ||
+                    primaryFormat == 0x0082 ||  // CF_DSPBITMAP
+                    primaryFormat == 0x008E ||  // CF_DSPENHMETAFILE
+                    primaryFormat == 0x0083     // CF_DSPMETAFILEPICT
+                );
+                
                 // CF_BITMAP is handle-based, not memory-based - convert to DIB
                 if (primaryFormat == CF_BITMAP) {
                     HBITMAP hBitmap = (HBITMAP)GetClipboardData(CF_BITMAP);
@@ -2022,12 +2033,19 @@ void ClipboardManager::ProcessClipboard() {
                         } else {
                             // Conversion failed, skip this item
                             CloseClipboard();
+                            isProcessingClipboard = false;
                             return;
                         }
                     } else {
                         CloseClipboard();
+                        isProcessingClipboard = false;
                         return;
                     }
+                } else if (isPrimaryHandleBased) {
+                    // Other handle-based formats - skip them as we can't easily convert
+                    CloseClipboard();
+                    isProcessingClipboard = false;
+                    return;
                 } else {
                     // Get primary format data (for memory-based formats)
                     try {
@@ -2045,23 +2063,28 @@ void ClipboardManager::ProcessClipboard() {
                                         // If memcpy fails, unlock and abort
                                         GlobalUnlock(hMem);
                                         CloseClipboard();
+                                        isProcessingClipboard = false;
                                         return;
                                     }
                                 } else {
                                     CloseClipboard();
+                                    isProcessingClipboard = false;
                                     return;
                                 }
                             } else {
                                 CloseClipboard();
+                                isProcessingClipboard = false;
                                 return;
                             }
                         } else {
                             CloseClipboard();
+                            isProcessingClipboard = false;
                             return;
                         }
                     } catch (...) {
                         // Error accessing clipboard data, abort
                         CloseClipboard();
+                        isProcessingClipboard = false;
                         return;
                     }
                 }
@@ -2075,24 +2098,29 @@ void ClipboardManager::ProcessClipboard() {
                             item = std::make_unique<ClipboardItem>(primaryFormat, data);
                             if (!item) {
                                 CloseClipboard();
+                                isProcessingClipboard = false;
                                 return;
                             }
                         } else {
                             // Data too large or invalid, skip
                             CloseClipboard();
+                            isProcessingClipboard = false;
                             return;
                         }
                     } catch (const std::bad_alloc&) {
                         // Out of memory, skip this item
                         CloseClipboard();
+                        isProcessingClipboard = false;
                         return;
                     } catch (const std::exception&) {
                         // Standard exception, skip this item
                         CloseClipboard();
+                        isProcessingClipboard = false;
                         return;
                     } catch (...) {
                         // Any other error creating item, abort
                         CloseClipboard();
+                        isProcessingClipboard = false;
                         return;
                     }
                     
@@ -2111,37 +2139,76 @@ void ClipboardManager::ProcessClipboard() {
                     UINT format = EnumClipboardFormats(0);
                     while (format != 0 && formatCount < MAX_FORMATS_PER_ITEM) {
                         // Skip CF_BITMAP (we already converted it) and already stored primary format
-                        if (format != primaryFormat && format != CF_BITMAP) {
+                        // CRITICAL: Skip handle-based formats that can't be treated as HGLOBAL
+                        // These formats cause crashes when we try to GlobalSize/GlobalLock them
+                        bool isHandleBasedFormat = (
+                            format == CF_BITMAP ||
+                            format == CF_PALETTE ||
+                            format == CF_METAFILEPICT ||
+                            format == CF_ENHMETAFILE ||
+                            format == 0x0082 ||  // CF_DSPBITMAP
+                            format == 0x008E ||  // CF_DSPENHMETAFILE  
+                            format == 0x0083     // CF_DSPMETAFILEPICT
+                        );
+                        
+                        if (format != primaryFormat && !isHandleBasedFormat) {
                             try {
-                                HGLOBAL hFormatMem = GetClipboardData(format);
-                                if (hFormatMem) {
-                                    SIZE_T formatSize = GlobalSize(hFormatMem);
+                                // Use GetClipboardData to get handle
+                                HANDLE hFormatData = GetClipboardData(format);
+                                if (hFormatData) {
+                                    // Try to get size - this will fail for handle-based formats
+                                    SIZE_T formatSize = 0;
+                                    try {
+                                        formatSize = GlobalSize((HGLOBAL)hFormatData);
+                                    } catch (...) {
+                                        // GlobalSize failed, skip this format
+                                        format = EnumClipboardFormats(format);
+                                        continue;
+                                    }
+                                    
                                     // CRITICAL: Very strict limits to prevent crashes
                                     if (formatSize > 0 && formatSize < 5 * 1024 * 1024 && // Max 5MB per format
                                         totalFormatSize + formatSize < MAX_FORMAT_SIZE_PER_ITEM) {
-                                        void* pFormatMem = GlobalLock(hFormatMem);
+                                        void* pFormatMem = nullptr;
+                                        try {
+                                            pFormatMem = GlobalLock((HGLOBAL)hFormatData);
+                                        } catch (...) {
+                                            // GlobalLock failed, skip this format
+                                            format = EnumClipboardFormats(format);
+                                            continue;
+                                        }
+                                        
                                         if (pFormatMem) {
                                             try {
                                                 std::vector<BYTE> formatData(formatSize);
                                                 memcpy(formatData.data(), pFormatMem, formatSize);
-                                                GlobalUnlock(hFormatMem);
+                                                GlobalUnlock((HGLOBAL)hFormatData);
                                                 item->AddFormat(format, formatData);
                                                 totalFormatSize += formatSize;
                                                 formatCount++;
                                             } catch (...) {
                                                 // If memcpy fails, unlock and skip this format
-                                                GlobalUnlock(hFormatMem);
-                                                break; // Stop trying more formats
+                                                try {
+                                                    GlobalUnlock((HGLOBAL)hFormatData);
+                                                } catch (...) {
+                                                    // Ignore unlock errors
+                                                }
+                                                // Continue to next format instead of breaking
                                             }
                                         }
                                     }
                                 }
                             } catch (...) {
-                                // Skip this format if there's any error
-                                break; // Stop on error
+                                // Skip this format if there's any error - continue to next format
                             }
                         }
-                        format = EnumClipboardFormats(format);
+                        
+                        // Get next format - wrapped in try-catch to handle Excel's weird formats
+                        try {
+                            format = EnumClipboardFormats(format);
+                        } catch (...) {
+                            break; // Stop enumeration if EnumClipboardFormats crashes
+                        }
                     }
                     
                     // Check if this is a duplicate of the last item
@@ -2257,15 +2324,24 @@ void ClipboardManager::ProcessClipboard() {
             isProcessingClipboard = false;
             return;
         } catch (...) {
-            // Error occurred, ensure clipboard is closed
+            // Error occurred, ensure clipboard is closed and reset flag
             // Note: CloseClipboard can be called even if clipboard wasn't opened
-            CloseClipboard();
+            try {
+                CloseClipboard();
+            } catch (...) {
+                // Ignore errors closing clipboard
+            }
+            isProcessingClipboard = false;
         }
     }
     
     // Finished all retries, ensure clipboard is closed and reset flag
     // Note: CloseClipboard can be called even if clipboard wasn't opened
-    CloseClipboard();
+    try {
+        CloseClipboard();
+    } catch (...) {
+        // Ignore errors closing clipboard
+    }
     isProcessingClipboard = false;
 }
 
