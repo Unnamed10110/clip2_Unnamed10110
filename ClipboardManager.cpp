@@ -429,6 +429,46 @@ void ClipboardItem::GenerateThumbnail() {
                         SelectObject(hdcThumb, oldThumb);
                         thumbnail = hThumb;
                         hThumb = nullptr; // Don't delete, we're using it
+                        
+                        // Generate larger preview bitmap for hover preview (max 500x500 for quality)
+                        const int previewMaxSize = 500;
+                        HDC hdcPreview = CreateCompatibleDC(hdcScreen);
+                        if (hdcPreview) {
+                            float previewScale = std::min((float)previewMaxSize / srcW, (float)previewMaxSize / srcH);
+                            int previewW = (int)(srcW * previewScale);
+                            int previewH = (int)(srcH * previewScale);
+                            
+                            // Limit to reasonable size to prevent memory issues
+                            if (previewW > 0 && previewH > 0 && previewW <= 1000 && previewH <= 1000) {
+                                HBITMAP hPreview = CreateCompatibleBitmap(hdcScreen, previewW, previewH);
+                                if (hPreview) {
+                                    HGDIOBJ oldPreview = SelectObject(hdcPreview, hPreview);
+                                    
+                                    // Fill background - Black OLED theme
+                                    RECT bgRect = {0, 0, previewW, previewH};
+                                    FillRect(hdcPreview, &bgRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+                                    
+                                    // Stretch original bitmap to preview size with high quality
+                                    hdcSrc = CreateCompatibleDC(hdcScreen);
+                                    if (hdcSrc) {
+                                        oldSrc = SelectObject(hdcSrc, hBitmap);
+                                        SetStretchBltMode(hdcPreview, HALFTONE);
+                                        StretchBlt(hdcPreview, 0, 0, previewW, previewH, hdcSrc, 0, 0, srcW, srcH, SRCCOPY);
+                                        SelectObject(hdcSrc, oldSrc);
+                                        DeleteDC(hdcSrc);
+                                    }
+                                    
+                                    SelectObject(hdcPreview, oldPreview);
+                                    
+                                    // Delete old preview bitmap if it exists
+                                    if (previewBitmap) {
+                                        DeleteObject(previewBitmap);
+                                    }
+                                    previewBitmap = hPreview;
+                                }
+                            }
+                            DeleteDC(hdcPreview);
+                        }
                     } else {
                         SelectObject(hdcThumb, oldThumb);
                         DeleteObject(hThumb);
@@ -487,8 +527,10 @@ void ClipboardItem::GenerateThumbnail() {
 }
 
 HBITMAP ClipboardItem::GetPreviewBitmap() {
-    // DISABLED: Preview bitmap generation causes memory issues
-    // Just return thumbnail to prevent crashes
+    // Return larger preview bitmap if available, otherwise fall back to thumbnail
+    if (previewBitmap) {
+        return previewBitmap;
+    }
     return thumbnail;
 }
 
@@ -612,19 +654,21 @@ bool ClipboardManager::Initialize() {
     }
     
     // Create preview window (initially hidden) with rounded borders
+    // Larger size (400x400) to better show image previews
+    const int PREVIEW_WINDOW_SIZE = 400;
     hwndPreview = CreateWindowEx(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
         L"ClipboardManagerPreviewClass",
         L"Preview",
         WS_POPUP, // Removed WS_BORDER - we'll draw rounded border ourselves
         CW_USEDEFAULT, CW_USEDEFAULT,
-        300, 300,
+        PREVIEW_WINDOW_SIZE, PREVIEW_WINDOW_SIZE,
         nullptr, nullptr, GetModuleHandle(nullptr), nullptr
     );
     
     if (hwndPreview) {
         // Set rounded window region for preview window
-        HRGN hPreviewRgn = CreateRoundRectRgn(0, 0, 301, 301, 15, 15);
+        HRGN hPreviewRgn = CreateRoundRectRgn(0, 0, PREVIEW_WINDOW_SIZE + 1, PREVIEW_WINDOW_SIZE + 1, 15, 15);
         SetWindowRgn(hwndPreview, hPreviewRgn, TRUE);
         DeleteObject(hPreviewRgn);
         
@@ -794,14 +838,21 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
     case WM_CLIPBOARDUPDATE:
         // Clipboard changed - instant notification from Windows
         if (!mgr->isPasting) {
-            // Play sound immediately when clipboard changes
-            mgr->PlayClickSound();
+            // Get current sequence number
+            DWORD currentSequence = GetClipboardSequenceNumber();
             
-            // Update sequence number
-            mgr->lastSequenceNumber = GetClipboardSequenceNumber();
-            
-            // Post message to process clipboard asynchronously
-            PostMessage(hwnd, WM_PROCESS_CLIPBOARD, 0, 0);
+            // If this matches the sequence number we set when pasting, ignore it
+            // This prevents re-adding items we just pasted
+            if (currentSequence != mgr->lastSequenceNumber) {
+                // Play sound immediately when clipboard changes
+                mgr->PlayClickSound();
+                
+                // Update sequence number
+                mgr->lastSequenceNumber = currentSequence;
+                
+                // Post message to process clipboard asynchronously
+                PostMessage(hwnd, WM_PROCESS_CLIPBOARD, 0, 0);
+            }
         }
         return 0;
         
@@ -887,17 +938,23 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                         BITMAP bm;
                         GetObject(previewBmp, sizeof(BITMAP), &bm);
                         
-                        // Scale to fit preview window (max 350x350)
-                        int maxSize = 350;
+                        // Scale to fit preview window - use full available space with padding for border
+                        int padding = 10; // Padding for rounded border
+                        int maxW = rect.right - rect.left - (padding * 2);
+                        int maxH = rect.bottom - rect.top - (padding * 2);
                         int srcW = bm.bmWidth;
                         int srcH = bm.bmHeight;
-                        float scale = std::min((float)maxSize / srcW, (float)maxSize / srcH);
+                        
+                        // Calculate scale to fit within available space while maintaining aspect ratio
+                        float scale = std::min((float)maxW / srcW, (float)maxH / srcH);
                         int dstW = (int)(srcW * scale);
                         int dstH = (int)(srcH * scale);
-                        int offsetX = (rect.right - dstW) / 2;
-                        int offsetY = (rect.bottom - dstH) / 2;
                         
-                        // Use better scaling
+                        // Center the image in the preview window
+                        int offsetX = padding + (maxW - dstW) / 2;
+                        int offsetY = padding + (maxH - dstH) / 2;
+                        
+                        // Use better scaling for quality
                         SetStretchBltMode(hdc, HALFTONE);
                         StretchBlt(hdc, offsetX, offsetY, dstW, dstH, hdcMem, 0, 0, srcW, srcH, SRCCOPY);
                         
@@ -1730,19 +1787,26 @@ void ClipboardManager::ShowPreviewWindow(int itemIndex, int mouseX, int mouseY) 
     }
     
     // Calculate preview size based on image
-    int previewWidth = 300;
-    int previewHeight = 300;
+    // Base size matches the window creation size
+    const int BASE_PREVIEW_SIZE = 400;
+    int previewWidth = BASE_PREVIEW_SIZE;
+    int previewHeight = BASE_PREVIEW_SIZE;
     
     HBITMAP previewBmp = item->GetPreviewBitmap();
     if (previewBmp) {
         BITMAP bm;
         GetObject(previewBmp, sizeof(BITMAP), &bm);
-        int maxSize = 350;
+        // Use larger max size for better preview quality
+        int maxSize = BASE_PREVIEW_SIZE - 20; // Account for padding
         float scale = std::min((float)maxSize / bm.bmWidth, (float)maxSize / bm.bmHeight);
-        previewWidth = (int)(bm.bmWidth * scale) + 20;
+        previewWidth = (int)(bm.bmWidth * scale) + 20; // Add padding for border
         previewHeight = (int)(bm.bmHeight * scale) + 20;
-        previewWidth = std::min(previewWidth, 450);
-        previewHeight = std::min(previewHeight, 450);
+        // Cap at reasonable max to prevent huge windows
+        previewWidth = std::min(previewWidth, 600);
+        previewHeight = std::min(previewHeight, 600);
+        // Ensure minimum size
+        previewWidth = std::max(previewWidth, 200);
+        previewHeight = std::max(previewHeight, 200);
     }
     
     // Position preview window near mouse cursor (offset to avoid covering cursor)
@@ -1761,6 +1825,12 @@ void ClipboardManager::ShowPreviewWindow(int itemIndex, int mouseX, int mouseY) 
     }
     
     SetWindowPos(hwndPreview, HWND_TOPMOST, previewX, previewY, previewWidth, previewHeight, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    
+    // Update rounded region to match new window size
+    HRGN hPreviewRgn = CreateRoundRectRgn(0, 0, previewWidth + 1, previewHeight + 1, 15, 15);
+    SetWindowRgn(hwndPreview, hPreviewRgn, TRUE);
+    DeleteObject(hPreviewRgn);
+    
     InvalidateRect(hwndPreview, nullptr, TRUE);
     UpdateWindow(hwndPreview);
 }
@@ -1821,9 +1891,6 @@ void ClipboardManager::PasteItem(int index) {
     
     // Set flag to ignore clipboard changes we're about to make
     isPasting = true;
-    
-    // Update sequence number to prevent detecting our own clipboard change
-    lastSequenceNumber = GetClipboardSequenceNumber();
     
     // Small delay to ensure clipboard is ready
     Sleep(10);
@@ -1919,7 +1986,7 @@ void ClipboardManager::PasteItem(int index) {
         CloseClipboard();
         
         if (success) {
-            // Update sequence number after setting clipboard
+            // Update sequence number AFTER setting clipboard - this is the sequence number of our paste
             lastSequenceNumber = GetClipboardSequenceNumber();
             
             // Restore focus to previous window before pasting
@@ -1938,8 +2005,9 @@ void ClipboardManager::PasteItem(int index) {
             keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
             keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
             
-            // Clear flag after a short delay to allow paste to complete
-            Sleep(100);
+            // Keep isPasting flag true longer to prevent re-adding the pasted item
+            // The clipboard sequence number check will also help
+            Sleep(200);
         }
         
         isPasting = false;
@@ -2090,16 +2158,24 @@ void ClipboardManager::ProcessClipboard() {
                 }
                 
                 if (!data.empty()) {
-                    // Create clipboard item with primary format (or converted format)
+                    // Create clipboard item with storage format (which may be different from primary if converted)
+                    // Use storageFormat instead of primaryFormat so the item knows it's DIB data, not CF_BITMAP
                     std::unique_ptr<ClipboardItem> item;
                     try {
                         // Validate data size before creating item
                         if (data.size() > 0 && data.size() < 200 * 1024 * 1024) { // Limit to 200MB
-                            item = std::make_unique<ClipboardItem>(primaryFormat, data);
+                            // Use storageFormat so converted CF_BITMAP->CF_DIB items are created with CF_DIB format
+                            item = std::make_unique<ClipboardItem>(storageFormat, data);
                             if (!item) {
                                 CloseClipboard();
                                 isProcessingClipboard = false;
                                 return;
+                            }
+                            
+                            // If we converted CF_BITMAP to DIB, also store the original format for compatibility
+                            if (primaryFormat == CF_BITMAP && storageFormat == CF_DIB) {
+                                // The item is already created with CF_DIB format and data
+                                // No need to add it again, it's already there
                             }
                         } else {
                             // Data too large or invalid, skip
@@ -2122,11 +2198,6 @@ void ClipboardManager::ProcessClipboard() {
                         CloseClipboard();
                         isProcessingClipboard = false;
                         return;
-                    }
-                    
-                    // If we converted CF_BITMAP to DIB, store it as DIB
-                    if (primaryFormat == CF_BITMAP && storageFormat == CF_DIB) {
-                        item->AddFormat(CF_DIB, data);
                     }
                     
                     // Store ALL available formats to preserve formatting
