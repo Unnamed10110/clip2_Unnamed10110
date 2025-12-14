@@ -3,6 +3,8 @@
 #include <iomanip>
 #include <fstream>
 #include <algorithm>
+#include <cwctype>
+#include <cstring>
 #include <shlobj.h>
 #include <mmsystem.h>
 #include <commctrl.h>
@@ -536,9 +538,12 @@ HBITMAP ClipboardItem::GetPreviewBitmap() {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager() 
-    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), isPasting(false), isProcessingClipboard(false), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), originalSearchEditProc(nullptr) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), isPasting(false), isProcessingClipboard(false), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
+    // Default hotkey: Ctrl+NumPadDot
+    hotkeyConfig.modifiers = MOD_CONTROL;
+    hotkeyConfig.vkCode = VK_DECIMAL;
 }
 
 ClipboardManager::~ClipboardManager() {
@@ -677,6 +682,10 @@ bool ClipboardManager::Initialize() {
     }
     
     CreateTrayIcon();
+    
+    // Load hotkey configuration from registry
+    LoadHotkeyConfig();
+    
     InstallKeyboardHook();
     
     wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
@@ -777,6 +786,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             // Add "Start with Windows" option with checkmark
             bool startupEnabled = mgr->IsStartupWithWindows();
             AppendMenu(hMenu, startupEnabled ? (MF_STRING | MF_CHECKED) : MF_STRING, 3, L"Start with Windows");
+            AppendMenu(hMenu, MF_STRING, 4, L"Settings");
             AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenu(hMenu, MF_STRING, 2, L"Exit");
             
@@ -797,6 +807,9 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             } else if (cmd == 3) {
                 // Toggle startup with Windows
                 mgr->SetStartupWithWindows(!startupEnabled);
+            } else if (cmd == 4) {
+                // Show settings dialog
+                mgr->ShowSettingsDialog();
             }
             
             DestroyMenu(hMenu);
@@ -1058,9 +1071,16 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int actualIndex = mgr->filteredIndices[i];
             const auto& item = mgr->clipboardHistory[actualIndex];
             
-            // Draw item background - Dark gray for items, bright red for selected
+            // Draw item background - Dark gray for items, bright red for selected, orange for multi-selected
             RECT itemRect = {5, yPos, rect.right - 5, yPos + itemHeight - 2};
-            if (i == mgr->selectedIndex && mgr->selectedIndex >= 0) {
+            bool isMultiSelected = mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
+            
+            if (isMultiSelected) {
+                // Highlight multi-selected item - Orange
+                HBRUSH multiSelectedBrush = CreateSolidBrush(RGB(255, 165, 0));
+                FillRect(hdc, &itemRect, multiSelectedBrush);
+                DeleteObject(multiSelectedBrush);
+            } else if (i == mgr->selectedIndex && mgr->selectedIndex >= 0) {
                 // Highlight selected item - Bright red
                 HBRUSH selectedBrush = CreateSolidBrush(RGB(255, 0, 0));
                 FillRect(hdc, &itemRect, selectedBrush);
@@ -1166,8 +1186,12 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     mgr->UpdateListWindow();
                 }
             } else {
-                // No number input - paste selected item
-                if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                // Check if multiple items are selected for multi-paste
+                if (!mgr->multiSelectedIndices.empty()) {
+                    mgr->PasteMultipleItems();
+                    mgr->HideListWindow();
+                } else if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                    // No number input - paste selected item
                     mgr->PasteItem(mgr->selectedIndex);
                     mgr->HideListWindow();
                 }
@@ -1212,14 +1236,49 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             mgr->HideListWindow();
             return 0;
         }
+        // Handle Delete key to remove selected item
+        if (wParam == VK_DELETE) {
+            // Only delete if search box doesn't have focus
+            HWND focusedWindow = GetFocus();
+            if (focusedWindow != mgr->hwndSearch && mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                mgr->DeleteItem(mgr->selectedIndex);
+                return 0;
+            }
+        }
         // Navigate with arrow keys (only if search box doesn't have focus)
         {
             HWND focusedWindow = GetFocus();
             if (focusedWindow != mgr->hwndSearch) {
+                bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                
                 if (wParam == VK_UP) {
                     // Move selection up
                     if (mgr->selectedIndex > 0) {
-                        mgr->selectedIndex--;
+                        int newIndex = mgr->selectedIndex - 1;
+                        
+                        if (isShiftPressed) {
+                            // Shift+Up: Extend multi-selection
+                            if (mgr->multiSelectAnchor < 0) {
+                                // Start new range selection from current position
+                                mgr->multiSelectAnchor = mgr->selectedIndex;
+                                mgr->multiSelectedIndices.clear();
+                                mgr->multiSelectedIndices.insert(mgr->selectedIndex);
+                            }
+                            // Extend selection to new index
+                            int startIdx = std::min(mgr->multiSelectAnchor, newIndex);
+                            int endIdx = std::max(mgr->multiSelectAnchor, newIndex);
+                            mgr->multiSelectedIndices.clear();
+                            for (int idx = startIdx; idx <= endIdx; idx++) {
+                                mgr->multiSelectedIndices.insert(idx);
+                            }
+                            mgr->selectedIndex = newIndex;
+                        } else {
+                            // Regular Up: Clear multi-selection and move single selection
+                            mgr->ClearMultiSelection();
+                            mgr->multiSelectAnchor = -1;
+                            mgr->selectedIndex = newIndex;
+                        }
+                        
                         // Ensure selected item is visible
                         if (mgr->selectedIndex < mgr->scrollOffset) {
                             mgr->scrollOffset = mgr->selectedIndex;
@@ -1232,7 +1291,31 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     // Move selection down
                     int maxIndex = (int)mgr->filteredIndices.size() - 1;
                     if (mgr->selectedIndex < maxIndex) {
-                        mgr->selectedIndex++;
+                        int newIndex = mgr->selectedIndex + 1;
+                        
+                        if (isShiftPressed) {
+                            // Shift+Down: Extend multi-selection
+                            if (mgr->multiSelectAnchor < 0) {
+                                // Start new range selection from current position
+                                mgr->multiSelectAnchor = mgr->selectedIndex;
+                                mgr->multiSelectedIndices.clear();
+                                mgr->multiSelectedIndices.insert(mgr->selectedIndex);
+                            }
+                            // Extend selection to new index
+                            int startIdx = std::min(mgr->multiSelectAnchor, newIndex);
+                            int endIdx = std::max(mgr->multiSelectAnchor, newIndex);
+                            mgr->multiSelectedIndices.clear();
+                            for (int idx = startIdx; idx <= endIdx; idx++) {
+                                mgr->multiSelectedIndices.insert(idx);
+                            }
+                            mgr->selectedIndex = newIndex;
+                        } else {
+                            // Regular Down: Clear multi-selection and move single selection
+                            mgr->ClearMultiSelection();
+                            mgr->multiSelectAnchor = -1;
+                            mgr->selectedIndex = newIndex;
+                        }
+                        
                         // Ensure selected item is visible
                         int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
                         if (mgr->selectedIndex >= mgr->scrollOffset + mgr->itemsPerPage) {
@@ -1248,31 +1331,85 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             }
         }
         if (wParam == VK_PRIOR) { // Page Up
-            mgr->scrollOffset = std::max(0, mgr->scrollOffset - mgr->itemsPerPage);
-            // Update selection to first visible item
-            mgr->selectedIndex = mgr->scrollOffset;
+            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            int newIndex = std::max(0, mgr->scrollOffset - mgr->itemsPerPage);
+            mgr->scrollOffset = newIndex;
+            
+            if (isShiftPressed && mgr->multiSelectAnchor >= 0) {
+                // Extend multi-selection
+                int startIdx = std::min(mgr->multiSelectAnchor, newIndex);
+                int endIdx = std::max(mgr->multiSelectAnchor, newIndex);
+                mgr->multiSelectedIndices.clear();
+                for (int idx = startIdx; idx <= endIdx; idx++) {
+                    mgr->multiSelectedIndices.insert(idx);
+                }
+            } else if (!isShiftPressed) {
+                mgr->ClearMultiSelection();
+            }
+            mgr->selectedIndex = newIndex;
             mgr->UpdateListWindow();
             return 0;
         }
         if (wParam == VK_NEXT) { // Page Down
+            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
-            mgr->scrollOffset = std::min(maxScroll, mgr->scrollOffset + mgr->itemsPerPage);
-            // Update selection to first visible item
-            mgr->selectedIndex = mgr->scrollOffset;
+            int newIndex = std::min(maxScroll, mgr->scrollOffset + mgr->itemsPerPage);
+            mgr->scrollOffset = newIndex;
+            
+            if (isShiftPressed && mgr->multiSelectAnchor >= 0) {
+                // Extend multi-selection
+                int startIdx = std::min(mgr->multiSelectAnchor, newIndex);
+                int endIdx = std::max(mgr->multiSelectAnchor, newIndex);
+                mgr->multiSelectedIndices.clear();
+                for (int idx = startIdx; idx <= endIdx; idx++) {
+                    mgr->multiSelectedIndices.insert(idx);
+                }
+            } else if (!isShiftPressed) {
+                mgr->ClearMultiSelection();
+            }
+            mgr->selectedIndex = newIndex;
             mgr->UpdateListWindow();
             return 0;
         }
         if (wParam == VK_HOME) {
+            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             mgr->scrollOffset = 0;
-            mgr->selectedIndex = 0;
+            int newIndex = 0;
+            
+            if (isShiftPressed && mgr->multiSelectAnchor >= 0) {
+                // Extend multi-selection to start
+                int startIdx = 0;
+                int endIdx = std::max(mgr->multiSelectAnchor, mgr->selectedIndex);
+                mgr->multiSelectedIndices.clear();
+                for (int idx = startIdx; idx <= endIdx; idx++) {
+                    mgr->multiSelectedIndices.insert(idx);
+                }
+            } else if (!isShiftPressed) {
+                mgr->ClearMultiSelection();
+            }
+            mgr->selectedIndex = newIndex;
             mgr->UpdateListWindow();
             return 0;
         }
         if (wParam == VK_END) {
+            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
             mgr->scrollOffset = maxScroll;
             int maxIndex = (int)mgr->filteredIndices.size() - 1;
-            mgr->selectedIndex = maxIndex >= 0 ? maxIndex : 0;
+            int newIndex = maxIndex >= 0 ? maxIndex : 0;
+            
+            if (isShiftPressed && mgr->multiSelectAnchor >= 0) {
+                // Extend multi-selection to end
+                int startIdx = std::min(mgr->multiSelectAnchor, mgr->selectedIndex);
+                int endIdx = newIndex;
+                mgr->multiSelectedIndices.clear();
+                for (int idx = startIdx; idx <= endIdx; idx++) {
+                    mgr->multiSelectedIndices.insert(idx);
+                }
+            } else if (!isShiftPressed) {
+                mgr->ClearMultiSelection();
+            }
+            mgr->selectedIndex = newIndex;
             mgr->UpdateListWindow();
             return 0;
         }
@@ -1374,6 +1511,32 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         mgr->hoveredItemIndex = -1;
         break;
         
+    case WM_LBUTTONDOWN:
+        {
+            // Handle Ctrl+Click for multi-selection
+            bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            POINT pt;
+            pt.x = LOWORD(lParam);
+            pt.y = HIWORD(lParam);
+            
+            int clickedIndex = mgr->GetItemAtPosition(pt.x, pt.y);
+            
+            if (clickedIndex >= 0 && clickedIndex < (int)mgr->filteredIndices.size()) {
+                if (isCtrlPressed) {
+                    // Ctrl+Click: Toggle multi-selection
+                    mgr->ToggleMultiSelect(clickedIndex);
+                    mgr->selectedIndex = clickedIndex; // Also update single selection
+                    mgr->multiSelectAnchor = -1; // Clear anchor when using Ctrl+Click
+                } else {
+                    // Regular click: Clear multi-selection and select single item
+                    mgr->ClearMultiSelection();
+                    mgr->selectedIndex = clickedIndex;
+                    mgr->UpdateListWindow();
+                }
+            }
+            break;
+        }
+        
     case WM_LBUTTONDBLCLK:
         {
             // Double-click to paste item
@@ -1385,7 +1548,12 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int clickedIndex = mgr->GetItemAtPosition(pt.x, pt.y);
             
             if (clickedIndex >= 0 && clickedIndex < (int)mgr->filteredIndices.size()) {
-                mgr->PasteItem(clickedIndex);
+                // Check if multiple items are selected
+                if (!mgr->multiSelectedIndices.empty()) {
+                    mgr->PasteMultipleItems();
+                } else {
+                    mgr->PasteItem(clickedIndex);
+                }
                 mgr->numberInput.clear();
                 mgr->HidePreviewWindow();
                 mgr->HideListWindow();
@@ -1417,9 +1585,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         {
             // Show context menu on right-click
             POINT pt;
+            POINT clientPt;
             if (uMsg == WM_RBUTTONDOWN) {
                 pt.x = LOWORD(lParam);
                 pt.y = HIWORD(lParam);
+                clientPt = pt;
                 ClientToScreen(hwnd, &pt);
             } else {
                 pt.x = LOWORD(lParam);
@@ -1430,11 +1600,53 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     GetClientRect(hwnd, &rect);
                     pt.x = rect.right / 2;
                     pt.y = rect.bottom / 2;
+                    clientPt.x = pt.x;
+                    clientPt.y = pt.y;
                     ClientToScreen(hwnd, &pt);
+                } else {
+                    clientPt = pt;
+                    ScreenToClient(hwnd, &clientPt);
                 }
             }
             
+            // Check if right-click was on an item
+            int clickedItemIndex = mgr->GetItemAtPosition(clientPt.x, clientPt.y);
+            // If no item was clicked but menu was triggered by keyboard (Shift+F10), use selected item
+            if (clickedItemIndex < 0 && uMsg == WM_CONTEXTMENU) {
+                clickedItemIndex = mgr->selectedIndex;
+            }
+            
             HMENU hMenu = CreatePopupMenu();
+            
+            // Check if clicked item is a text item
+            bool isText = false;
+            if (clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+                int actualIndex = mgr->filteredIndices[clickedItemIndex];
+                isText = mgr->IsTextItem(actualIndex);
+            }
+            
+            // Add transformation menu for text items
+            if (isText && clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+                HMENU hTransformMenu = CreatePopupMenu();
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_UPPERCASE, L"Uppercase");
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_LOWERCASE, L"Lowercase");
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_TITLE_CASE, L"Title Case");
+                AppendMenu(hTransformMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_REMOVE_LINE_BREAKS, L"Remove Line Breaks");
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_TRIM_WHITESPACE, L"Trim Whitespace");
+                AppendMenu(hTransformMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_PLAIN_TEXT, L"Plain Text (Remove Formatting)");
+                
+                AppendMenu(hMenu, MF_STRING | MF_POPUP, (UINT_PTR)hTransformMenu, L"Transform Text");
+                AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+            }
+            
+            // Add "Delete" option if an item was clicked or selected
+            if (clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+                AppendMenu(hMenu, MF_STRING, 101, L"Delete");
+                AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+            }
+            
             AppendMenu(hMenu, MF_STRING, 100, L"Clear List");
             
             SetForegroundWindow(hwnd);
@@ -1448,6 +1660,12 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             
             if (cmd == 100) {
                 mgr->ClearClipboardHistory();
+            } else if (cmd == 101 && clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+                // Delete the clicked/selected item
+                mgr->DeleteItem(clickedItemIndex);
+            } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_PLAIN_TEXT && clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+                // Apply text transformation
+                mgr->TransformTextItem(clickedItemIndex, cmd);
             }
             
             DestroyMenu(hMenu);
@@ -1661,20 +1879,35 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
     if (nCode >= HC_ACTION && mgr != nullptr && mgr->hwndMain != nullptr) {
         KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
         
-        // Check if Ctrl is pressed
-        bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool isExtended = (pKeyboard->flags & LLKHF_EXTENDED) != 0;
+        // Check for configured hotkey modifiers
+        bool hasCtrl = (mgr->hotkeyConfig.modifiers & MOD_CONTROL) != 0;
+        bool hasAlt = (mgr->hotkeyConfig.modifiers & MOD_ALT) != 0;
+        bool hasShift = (mgr->hotkeyConfig.modifiers & MOD_SHIFT) != 0;
+        bool hasWin = (mgr->hotkeyConfig.modifiers & MOD_WIN) != 0;
         
-        // Detect Ctrl+NumPadDot key down
-        // VK_DECIMAL (0x6E) is the NumPad decimal point
-        // The extended flag helps distinguish NumPad keys
-        if (wParam == WM_KEYDOWN && isCtrlPressed) {
-            // Check for NumPad decimal point (either by VK_DECIMAL or extended flag with 0x6E)
-            if (pKeyboard->vkCode == VK_DECIMAL || (pKeyboard->vkCode == 0x6E && isExtended)) {
-                // Post message to main window to toggle list
-                PostMessage(mgr->hwndMain, WM_CLIPBOARD_HOTKEY, 0, 0);
-                return 1; // Consume the key so it doesn't propagate
-            }
+        bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool isAltPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+        
+        // Check if all required modifiers are pressed
+        bool modifiersMatch = true;
+        if (hasCtrl && !isCtrlPressed) modifiersMatch = false;
+        if (hasAlt && !isAltPressed) modifiersMatch = false;
+        if (hasShift && !isShiftPressed) modifiersMatch = false;
+        if (hasWin && !isWinPressed) modifiersMatch = false;
+        
+        // Also check that unwanted modifiers are NOT pressed (strict matching)
+        if ((!hasCtrl && isCtrlPressed) || (!hasAlt && isAltPressed) || 
+            (!hasShift && isShiftPressed) || (!hasWin && isWinPressed)) {
+            modifiersMatch = false;
+        }
+        
+        // Check if the configured key is pressed
+        if (wParam == WM_KEYDOWN && modifiersMatch && pKeyboard->vkCode == mgr->hotkeyConfig.vkCode) {
+            // Post message to main window to toggle list
+            PostMessage(mgr->hwndMain, WM_CLIPBOARD_HOTKEY, 0, 0);
+            return 1; // Consume the key so it doesn't propagate
         }
     }
     
@@ -1709,6 +1942,7 @@ void ClipboardManager::ShowListWindow() {
     } else {
         selectedIndex = -1;
     }
+    ClearMultiSelection(); // Clear multi-selection when showing list
     // Show search box
     if (hwndSearch) {
         ShowWindow(hwndSearch, SW_SHOW);
@@ -2014,6 +2248,143 @@ void ClipboardManager::PasteItem(int index) {
     } else {
         isPasting = false;
     }
+}
+
+void ClipboardManager::PasteMultipleItems() {
+    if (multiSelectedIndices.empty()) {
+        return;
+    }
+    
+    // Sort indices to paste in order (top to bottom)
+    std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
+    std::sort(sortedIndices.begin(), sortedIndices.end());
+    
+    // Restore focus to previous window before pasting
+    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+        SetForegroundWindow(previousFocusWindow);
+        SetFocus(previousFocusWindow);
+        Sleep(100); // Give window more time to receive focus
+    }
+    
+    // Paste each item sequentially
+    for (size_t i = 0; i < sortedIndices.size(); i++) {
+        int filteredIndex = sortedIndices[i];
+        
+        // Set flag to ignore clipboard changes we're about to make
+        isPasting = true;
+        
+        // Ensure clipboard is available (retry logic)
+        bool clipboardReady = false;
+        int retries = 0;
+        while (!clipboardReady && retries < 10) {
+            if (OpenClipboard(hwndMain)) {
+                clipboardReady = true;
+            } else {
+                Sleep(10);
+                retries++;
+            }
+        }
+        
+        if (clipboardReady) {
+            EmptyClipboard();
+            
+            int actualIndex = filteredIndices[filteredIndex];
+            if (actualIndex >= 0 && actualIndex < (int)clipboardHistory.size()) {
+                const auto& item = clipboardHistory[actualIndex];
+                
+                // Paste with ALL original formats (same as PasteItem)
+                bool success = false;
+                bool firstFormat = true;
+                for (const auto& formatPair : item->formats) {
+                    UINT fmt = formatPair.first;
+                    const std::vector<BYTE>& formatData = formatPair.second;
+                    
+                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, formatData.size());
+                    if (hMem) {
+                        void* pMem = GlobalLock(hMem);
+                        if (pMem) {
+                            memcpy(pMem, formatData.data(), formatData.size());
+                            GlobalUnlock(hMem);
+                            
+                            // SetClipboardData takes ownership of hMem on success
+                            if (SetClipboardData(fmt, hMem)) {
+                                if (firstFormat) {
+                                    success = true;
+                                    firstFormat = false;
+                                }
+                                // Note: hMem is now owned by the clipboard, don't free it
+                            } else {
+                                // Only free if SetClipboardData failed
+                                GlobalFree(hMem);
+                            }
+                        } else {
+                            GlobalFree(hMem);
+                        }
+                    }
+                }
+                
+                if (success) {
+                    // Update sequence number AFTER setting clipboard
+                    lastSequenceNumber = GetClipboardSequenceNumber();
+                    
+                    CloseClipboard();
+                    
+                    // Ensure focus is on target window before pasting (especially important for first item)
+                    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+                        SetForegroundWindow(previousFocusWindow);
+                        SetFocus(previousFocusWindow);
+                        Sleep(100); // Give window time to receive focus
+                    }
+                    
+                    // Longer delay before pasting to ensure clipboard is ready (especially for first item)
+                    if (i == 0) {
+                        Sleep(150); // Extra delay for first item
+                    } else {
+                        Sleep(100);
+                    }
+                    
+                    // Simulate paste (Ctrl+V)
+                    keybd_event(VK_CONTROL, 0, 0, 0);
+                    keybd_event('V', 0, 0, 0);
+                    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+                    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+                    
+                    // Delay between pastes to allow application to process
+                    Sleep(250);
+                } else {
+                    CloseClipboard();
+                }
+            } else {
+                CloseClipboard();
+            }
+        }
+        
+        isPasting = false;
+    }
+    
+    // Clear multi-selection after pasting
+    ClearMultiSelection();
+}
+
+void ClipboardManager::ToggleMultiSelect(int filteredIndex) {
+    if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) {
+        return;
+    }
+    
+    // Toggle selection
+    if (multiSelectedIndices.find(filteredIndex) != multiSelectedIndices.end()) {
+        multiSelectedIndices.erase(filteredIndex);
+    } else {
+        multiSelectedIndices.insert(filteredIndex);
+    }
+    
+    UpdateListWindow();
+}
+
+void ClipboardManager::ClearMultiSelection() {
+    multiSelectedIndices.clear();
+    multiSelectAnchor = -1;
+    UpdateListWindow();
 }
 
 void ClipboardManager::ProcessClipboard() {
@@ -2445,6 +2816,273 @@ void ClipboardManager::PlayClickSound() {
     }
 }
 
+void ClipboardManager::DeleteItem(int filteredIndex) {
+    // Validate filtered index
+    if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) {
+        return;
+    }
+    
+    // Get the actual index in clipboardHistory
+    int actualIndex = filteredIndices[filteredIndex];
+    
+    // Validate actual index
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) {
+        return;
+    }
+    
+    // Remove the item from clipboardHistory
+    clipboardHistory.erase(clipboardHistory.begin() + actualIndex);
+    
+    // Rebuild filteredIndices - adjust all indices that were after the deleted item
+    // and filter again to account for the removed item
+    FilterItems();
+    
+    // Update UI state
+    if (filteredIndices.empty()) {
+        selectedIndex = -1;
+        scrollOffset = 0;
+    } else {
+        // Adjust selectedIndex if necessary
+        if (selectedIndex >= (int)filteredIndices.size()) {
+            selectedIndex = (int)filteredIndices.size() - 1;
+        }
+        if (selectedIndex < 0 && !filteredIndices.empty()) {
+            selectedIndex = 0;
+        }
+        
+        // Adjust scroll offset if necessary
+        int maxScroll = std::max(0, (int)filteredIndices.size() - itemsPerPage);
+        if (scrollOffset > maxScroll) {
+            scrollOffset = maxScroll;
+        }
+    }
+    
+    hoveredItemIndex = -1;
+    HidePreviewWindow();
+    
+    // Update the display
+    UpdateListWindow();
+}
+
+bool ClipboardManager::IsTextItem(int actualIndex) {
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) {
+        return false;
+    }
+    
+    const auto& item = clipboardHistory[actualIndex];
+    // Check if item has text formats
+    return (item->format == CF_TEXT || item->format == CF_UNICODETEXT || item->format == CF_OEMTEXT ||
+            item->GetFormatData(CF_TEXT) != nullptr || 
+            item->GetFormatData(CF_UNICODETEXT) != nullptr ||
+            item->GetFormatData(CF_OEMTEXT) != nullptr);
+}
+
+void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
+    // Validate filtered index
+    if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) {
+        return;
+    }
+    
+    int actualIndex = filteredIndices[filteredIndex];
+    if (!IsTextItem(actualIndex)) {
+        return; // Not a text item
+    }
+    
+    const auto& item = clipboardHistory[actualIndex];
+    
+    // Extract text - prefer Unicode text
+    std::wstring text;
+    const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+    if (textData && textData->size() >= sizeof(wchar_t)) {
+        size_t len = textData->size() / sizeof(wchar_t);
+        if (len > 0) {
+            const wchar_t* textPtr = (const wchar_t*)textData->data();
+            // Handle null-terminated string - find null terminator or use full length
+            size_t actualLen = len;
+            for (size_t i = 0; i < len; i++) {
+                if (textPtr[i] == L'\0') {
+                    actualLen = i;
+                    break;
+                }
+            }
+            if (actualLen > 0) {
+                text = std::wstring(textPtr, actualLen);
+            }
+        }
+    } else {
+        // Try ANSI text
+        textData = item->GetFormatData(CF_TEXT);
+        if (textData && textData->size() > 0) {
+            size_t len = textData->size();
+            const char* ansiText = (const char*)textData->data();
+            // Find null terminator
+            size_t actualLen = len;
+            for (size_t i = 0; i < len; i++) {
+                if (ansiText[i] == '\0') {
+                    actualLen = i;
+                    break;
+                }
+            }
+            if (actualLen > 0) {
+                std::string ansiStr(ansiText, actualLen);
+                int wideLen = MultiByteToWideChar(CP_ACP, 0, ansiStr.c_str(), (int)ansiStr.length(), nullptr, 0);
+                if (wideLen > 0) {
+                    text.resize(wideLen);
+                    MultiByteToWideChar(CP_ACP, 0, ansiStr.c_str(), (int)ansiStr.length(), &text[0], wideLen);
+                }
+            }
+        } else {
+            // Try OEM text
+            textData = item->GetFormatData(CF_OEMTEXT);
+            if (textData && textData->size() > 0) {
+                size_t len = textData->size();
+                const char* oemText = (const char*)textData->data();
+                // Find null terminator
+                size_t actualLen = len;
+                for (size_t i = 0; i < len; i++) {
+                    if (oemText[i] == '\0') {
+                        actualLen = i;
+                        break;
+                    }
+                }
+                if (actualLen > 0) {
+                    std::string oemStr(oemText, actualLen);
+                    int wideLen = MultiByteToWideChar(CP_OEMCP, 0, oemStr.c_str(), (int)oemStr.length(), nullptr, 0);
+                    if (wideLen > 0) {
+                        text.resize(wideLen);
+                        MultiByteToWideChar(CP_OEMCP, 0, oemStr.c_str(), (int)oemStr.length(), &text[0], wideLen);
+                    }
+                }
+            }
+        }
+    }
+    
+    if (text.empty()) {
+        return; // No text found
+    }
+    
+    // Apply transformation
+    std::wstring transformedText = text;
+    
+    switch (transformType) {
+        case TRANSFORM_UPPERCASE: {
+            std::transform(transformedText.begin(), transformedText.end(), transformedText.begin(), ::towupper);
+            break;
+        }
+        case TRANSFORM_LOWERCASE: {
+            std::transform(transformedText.begin(), transformedText.end(), transformedText.begin(), ::towlower);
+            break;
+        }
+        case TRANSFORM_TITLE_CASE: {
+            bool newWord = true;
+            for (size_t i = 0; i < transformedText.length(); i++) {
+                if (iswspace(transformedText[i]) || iswpunct(transformedText[i])) {
+                    newWord = true;
+                } else if (newWord) {
+                    transformedText[i] = towupper(transformedText[i]);
+                    newWord = false;
+                } else {
+                    transformedText[i] = towlower(transformedText[i]);
+                }
+            }
+            break;
+        }
+        case TRANSFORM_REMOVE_LINE_BREAKS: {
+            std::wstring result;
+            result.reserve(transformedText.length());
+            for (wchar_t c : transformedText) {
+                if (c != L'\r' && c != L'\n') {
+                    result += c;
+                } else {
+                    // Replace with space if previous character isn't already a space
+                    if (!result.empty() && result.back() != L' ') {
+                        result += L' ';
+                    }
+                }
+            }
+            transformedText = result;
+            break;
+        }
+        case TRANSFORM_TRIM_WHITESPACE: {
+            // Trim leading whitespace
+            size_t start = transformedText.find_first_not_of(L" \t\r\n");
+            if (start != std::wstring::npos) {
+                transformedText = transformedText.substr(start);
+            } else {
+                transformedText.clear();
+            }
+            // Trim trailing whitespace
+            size_t end = transformedText.find_last_not_of(L" \t\r\n");
+            if (end != std::wstring::npos) {
+                transformedText = transformedText.substr(0, end + 1);
+            } else {
+                transformedText.clear();
+            }
+            break;
+        }
+        case TRANSFORM_PLAIN_TEXT: {
+            // Same as TRANSFORM_PLAIN_TEXT - just use the text as-is (already extracted)
+            // This transformation removes formatting by only keeping plain text
+            break;
+        }
+        default:
+            return; // Unknown transformation type
+    }
+    
+    // Update the item with transformed text
+    // Remove all text formats and add only Unicode text
+    clipboardHistory[actualIndex]->formats.erase(CF_TEXT);
+    clipboardHistory[actualIndex]->formats.erase(CF_OEMTEXT);
+    clipboardHistory[actualIndex]->formats.erase(CF_UNICODETEXT);
+    
+    // Add transformed text as Unicode
+    size_t dataSize = (transformedText.length() + 1) * sizeof(wchar_t);
+    std::vector<BYTE> unicodeData(dataSize);
+    wchar_t* textPtr = (wchar_t*)unicodeData.data();
+    wcscpy_s(textPtr, transformedText.length() + 1, transformedText.c_str());
+    
+    clipboardHistory[actualIndex]->formats[CF_UNICODETEXT] = unicodeData;
+    clipboardHistory[actualIndex]->format = CF_UNICODETEXT;
+    
+    // Update preview
+    clipboardHistory[actualIndex]->preview = transformedText.length() > 50 
+        ? transformedText.substr(0, 50) + L"..." 
+        : transformedText;
+    
+    // Copy transformed text to clipboard
+    isPasting = true;
+    Sleep(10);
+    
+    if (OpenClipboard(hwndMain)) {
+        EmptyClipboard();
+        
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
+        if (hMem) {
+            wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
+            if (pMem) {
+                wcscpy_s(pMem, transformedText.length() + 1, transformedText.c_str());
+                GlobalUnlock(hMem);
+                
+                if (SetClipboardData(CF_UNICODETEXT, hMem)) {
+                    lastSequenceNumber = GetClipboardSequenceNumber();
+                } else {
+                    GlobalFree(hMem);
+                }
+            } else {
+                GlobalFree(hMem);
+            }
+        }
+        
+        CloseClipboard();
+    }
+    
+    isPasting = false;
+    
+    // Update the display
+    FilterItems(); // Rebuild filtered indices in case search is active
+    UpdateListWindow();
+}
+
 void ClipboardManager::ClearClipboardHistory() {
     // Clear all items - destructors will clean up bitmaps and memory
     clipboardHistory.clear();
@@ -2468,6 +3106,7 @@ void ClipboardManager::ClearClipboardHistory() {
 
 void ClipboardManager::FilterItems() {
     filteredIndices.clear();
+    ClearMultiSelection(); // Clear multi-selection when filtering
     
     if (searchText.empty()) {
         // No filter - show all items
@@ -2581,6 +3220,180 @@ bool ClipboardManager::IsStartupWithWindows() {
     }
     
     return false;
+}
+
+void ClipboardManager::LoadHotkeyConfig() {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\clip2",
+        0,
+        KEY_READ,
+        &hKey
+    );
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD modifiers = 0;
+        DWORD vkCode = 0;
+        DWORD dataSize = sizeof(DWORD);
+        DWORD type = REG_DWORD;
+        
+        // Read modifiers
+        result = RegQueryValueExW(
+            hKey,
+            L"HotkeyModifiers",
+            nullptr,
+            &type,
+            (LPBYTE)&modifiers,
+            &dataSize
+        );
+        
+        if (result == ERROR_SUCCESS && type == REG_DWORD) {
+            hotkeyConfig.modifiers = modifiers;
+        }
+        
+        // Read vkCode
+        dataSize = sizeof(DWORD);
+        result = RegQueryValueExW(
+            hKey,
+            L"HotkeyVkCode",
+            nullptr,
+            &type,
+            (LPBYTE)&vkCode,
+            &dataSize
+        );
+        
+        if (result == ERROR_SUCCESS && type == REG_DWORD) {
+            hotkeyConfig.vkCode = vkCode;
+        }
+        
+        RegCloseKey(hKey);
+    }
+}
+
+void ClipboardManager::SaveHotkeyConfig() {
+    HKEY hKey;
+    LONG result = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\clip2",
+        0,
+        nullptr,
+        REG_OPTION_NON_VOLATILE,
+        KEY_WRITE,
+        nullptr,
+        &hKey,
+        nullptr
+    );
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD modifiers = hotkeyConfig.modifiers;
+        DWORD vkCode = hotkeyConfig.vkCode;
+        
+        RegSetValueExW(
+            hKey,
+            L"HotkeyModifiers",
+            0,
+            REG_DWORD,
+            (BYTE*)&modifiers,
+            sizeof(DWORD)
+        );
+        
+        RegSetValueExW(
+            hKey,
+            L"HotkeyVkCode",
+            0,
+            REG_DWORD,
+            (BYTE*)&vkCode,
+            sizeof(DWORD)
+        );
+        
+        RegCloseKey(hKey);
+    }
+}
+
+void ClipboardManager::ShowSettingsDialog() {
+    // Show current hotkey and allow basic configuration
+    std::wstring hotkeyText = L"Current hotkey: ";
+    if (hotkeyConfig.modifiers & MOD_CONTROL) hotkeyText += L"Ctrl+";
+    if (hotkeyConfig.modifiers & MOD_ALT) hotkeyText += L"Alt+";
+    if (hotkeyConfig.modifiers & MOD_SHIFT) hotkeyText += L"Shift+";
+    if (hotkeyConfig.modifiers & MOD_WIN) hotkeyText += L"Win+";
+    
+    // Get key name
+    wchar_t keyName[256] = {0};
+    UINT scanCode = MapVirtualKeyW(hotkeyConfig.vkCode, MAPVK_VK_TO_VSC);
+    if (scanCode != 0) {
+        LONG lParam = (scanCode << 16);
+        // Add extended key flag if needed (for numpad keys)
+        if (hotkeyConfig.vkCode == VK_DECIMAL || hotkeyConfig.vkCode == VK_NUMPAD0 || 
+            (hotkeyConfig.vkCode >= VK_NUMPAD1 && hotkeyConfig.vkCode <= VK_NUMPAD9)) {
+            lParam |= (1 << 24); // Extended key flag
+        }
+        if (GetKeyNameTextW(lParam, keyName, 256)) {
+            hotkeyText += keyName;
+        } else {
+            hotkeyText += L"Key " + std::to_wstring(hotkeyConfig.vkCode);
+        }
+    } else {
+        hotkeyText += L"Key " + std::to_wstring(hotkeyConfig.vkCode);
+    }
+    
+    hotkeyText += L"\n\nPress a key combination now to set it as the new hotkey.\n";
+    hotkeyText += L"Click OK, then press your desired key combination within 3 seconds.\n";
+    hotkeyText += L"Supported modifiers: Ctrl, Alt, Shift, Win";
+    
+    int result = MessageBox(hwndMain, hotkeyText.c_str(), L"clip2 Settings - Hotkey Configuration", MB_OKCANCEL | MB_ICONINFORMATION);
+    
+    if (result == IDOK) {
+        // Wait for user to press a key combination
+        MessageBox(hwndMain, L"Please press your desired hotkey combination now...", L"clip2 Settings", MB_OK | MB_ICONINFORMATION);
+        
+        // Simple hotkey capture - wait for key press
+        // Note: This is a simplified implementation
+        // In a full implementation, you'd use a hook or dialog with proper key capture
+        
+        // For now, show message that user can configure via registry
+        std::wstring configText = L"Hotkey configuration via dialog is coming soon.\n\n";
+        configText += L"For now, you can configure the hotkey by editing the registry:\n\n";
+        configText += L"Location: HKEY_CURRENT_USER\\Software\\clip2\n\n";
+        configText += L"Values:\n";
+        configText += L"  HotkeyModifiers (DWORD):\n";
+        configText += L"    MOD_CONTROL = 2\n";
+        configText += L"    MOD_ALT = 1\n";
+        configText += L"    MOD_SHIFT = 4\n";
+        configText += L"    MOD_WIN = 8\n";
+        configText += L"    Combine with + (e.g., MOD_CONTROL | MOD_SHIFT = 6)\n\n";
+        configText += L"  HotkeyVkCode (DWORD): Virtual key code\n";
+        configText += L"    Examples:\n";
+        configText += L"      VK_DECIMAL (NumPad .) = 110\n";
+        configText += L"      VK_F1 = 112\n";
+        configText += L"      'V' = 0x56\n";
+        configText += L"      Space = 0x20\n\n";
+        configText += L"After editing, restart clip2 for changes to take effect.";
+        
+        MessageBox(hwndMain, configText.c_str(), L"clip2 Settings", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    ClipboardManager* mgr = instance;
+    
+    switch (uMsg) {
+    case WM_CLOSE:
+        if (mgr && mgr->hwndSettings == hwnd) {
+            mgr->hwndSettings = nullptr;
+        }
+        DestroyWindow(hwnd);
+        return 0;
+        
+    case WM_DESTROY:
+        if (mgr && mgr->hwndSettings == hwnd) {
+            mgr->hwndSettings = nullptr;
+        }
+        return 0;
+    }
+    
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {

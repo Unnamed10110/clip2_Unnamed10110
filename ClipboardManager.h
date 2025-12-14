@@ -17,6 +17,7 @@
 #include <memory>
 #include <chrono>
 #include <map>
+#include <set>
 
 struct ClipboardItem {
     UINT format;  // Primary format (for display/compatibility)
@@ -161,6 +162,7 @@ private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK ListWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SearchEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK SettingsDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static ClipboardManager* instance;
     
     void CreateTrayIcon();
@@ -179,12 +181,26 @@ private:
     void HidePreviewWindow();
     int GetItemAtPosition(int x, int y);
     void PasteItem(int index);
+    void PasteMultipleItems();
+    void ToggleMultiSelect(int filteredIndex);
+    void ClearMultiSelection();
+    void DeleteItem(int filteredIndex);
+    void TransformTextItem(int filteredIndex, int transformType);
+    bool IsTextItem(int actualIndex);
     void ProcessClipboard();
     void PlayClickSound();
     void ClearClipboardHistory();
     void FilterItems();
     void SetStartupWithWindows(bool enable);
     bool IsStartupWithWindows();
+    void LoadHotkeyConfig();
+    void SaveHotkeyConfig();
+    void ShowSettingsDialog();
+    
+    struct HotkeyConfig {
+        UINT modifiers;  // MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN
+        UINT vkCode;     // Virtual key code
+    };
     
     HWND hwndMain;
     HWND hwndList;
@@ -202,12 +218,16 @@ private:
     std::wstring numberInput;
     std::wstring searchText;
     std::vector<int> filteredIndices;  // Indices of items matching search
+    std::set<int> multiSelectedIndices;  // Indices of items selected for multi-paste (filtered indices)
     bool isPasting;
     bool isProcessingClipboard;  // Prevent re-entrant clipboard processing
     HWND previousFocusWindow;
     int hoveredItemIndex;
     int selectedIndex;  // Currently selected item index (in filtered list)
+    int multiSelectAnchor;  // Anchor index for Shift+Arrow multi-selection (-1 if no anchor)
     WNDPROC originalSearchEditProc;  // Original window procedure for search edit control
+    HotkeyConfig hotkeyConfig;  // Current hotkey configuration
+    HWND hwndSettings;  // Settings dialog window
     static const UINT WM_MOUSELEAVE_CUSTOM = WM_USER + 4;
     
     static const UINT WM_TRAYICON = WM_USER + 1;
@@ -216,5 +236,15 @@ private:
     static const int MAX_ITEMS = 100; // Reduced from 1000 to prevent memory issues
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
+    
+    // Text transformation types
+    enum TextTransform {
+        TRANSFORM_UPPERCASE = 200,
+        TRANSFORM_LOWERCASE = 201,
+        TRANSFORM_TITLE_CASE = 202,
+        TRANSFORM_REMOVE_LINE_BREAKS = 203,
+        TRANSFORM_TRIM_WHITESPACE = 204,
+        TRANSFORM_PLAIN_TEXT = 205  // Remove formatting, keep only plain text
+    };
 };
 
