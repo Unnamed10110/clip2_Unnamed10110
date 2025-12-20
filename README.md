@@ -1,6 +1,6 @@
 # clip2
 
-A modern clipboard manager for Windows with OLED theme and advanced features.
+A minimalistic and superfast clipboard manager for Windows with OLED theme and useful features.
 
 
 ## Features
@@ -19,6 +19,12 @@ A modern clipboard manager for Windows with OLED theme and advanced features.
 - ✅ **Plain Text Mode**: Hold Ctrl while pasting for plain text
 - ✅ **Start with Windows**: Option to auto-start with Windows session
 - ✅ **Duplicate Prevention**: Automatically skips identical consecutive copies
+- ✅ **Delete Items**: Remove specific items from history without clearing everything
+- ✅ **Multi-Paste**: Select and paste multiple items at once, each on a new line
+- ✅ **Text Transformations**: Transform text items (uppercase, lowercase, title case, remove formatting, etc.)
+- ✅ **Customizable Hotkeys**: Change the default hotkey through Settings menu
+- ✅ **Movable Window**: Drag the list window to position it anywhere on screen
+- ✅ **Smart Paste Detection**: Prevents pasted items from being re-added to history
 - ✅ **Stability**: Robust error handling prevents crashes with large or complex clipboard data
 - ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
 
@@ -77,7 +83,19 @@ The executable will be created as `clip2.exe`.
 6. **System tray menu**: Right-click the tray icon for options
    - **Show Clipboard**: Show the clipboard list
    - **Start with Windows**: Toggle auto-start with Windows (checkmark indicates enabled)
+   - **Settings**: Configure hotkeys and other settings
    - **Exit**: Close the application
+
+7. **Delete items**: Press **Delete** key or right-click → **Delete** to remove specific items from history
+
+8. **Multi-paste**: Select multiple items with **Ctrl+Click** or **Shift+Arrow keys**, then press **Enter** to paste them sequentially (each item on a new line)
+
+9. **Text transformations**: Right-click on text items → **Transform Text** for options:
+   - Uppercase / Lowercase / Title Case
+   - Remove line breaks / Trim whitespace
+   - Remove formatting (paste as plain text)
+
+10. **Move window**: Click and drag the title bar or empty areas to move the list window
 
 ## Technical Details
 
@@ -110,7 +128,17 @@ The executable will be created as `clip2.exe`.
 - **Sound not playing**: Ensure `click.mp3` is in the same directory as `clip2.exe` (or embedded as resource)
 - **Performance issues**: The application uses minimal resources; if issues occur, check system resources
 
-## Recent Improvements & Fixes
+## Changelog
+
+### Recent Features (Latest)
+- ✅ **Delete individual items**: Delete key or right-click context menu to remove specific items
+- ✅ **Multi-paste mode**: Select multiple items (Ctrl+Click or Shift+Arrow) and paste them sequentially with newlines
+- ✅ **Text transformations**: Right-click menu for text manipulation (uppercase, lowercase, title case, remove line breaks, trim whitespace, remove formatting)
+- ✅ **Customizable hotkeys**: Settings menu to change the toggle hotkey (default: Ctrl+NumPadDot)
+- ✅ **Movable window**: Drag the list window by clicking on the title bar or empty areas
+- ✅ **Smart paste detection**: Prevents pasted items from being re-added to clipboard history
+
+### Recent Improvements & Fixes
 
 ### Stability Enhancements
 - ✅ **Fixed crashes with multiple images**: Properly handles CF_BITMAP format conversion to DIB

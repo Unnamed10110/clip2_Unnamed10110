@@ -538,7 +538,7 @@ HBITMAP ClipboardItem::GetPreviewBitmap() {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager() 
-    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), isPasting(false), isProcessingClipboard(false), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     // Default hotkey: Ctrl+NumPadDot
@@ -1003,6 +1003,51 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     }
     
     switch (uMsg) {
+    case WM_NCHITTEST: {
+        // Allow window to be dragged by returning HTCAPTION for most areas
+        // This makes the borderless window movable
+        LRESULT hit = DefWindowProc(hwnd, uMsg, wParam, lParam);
+        
+        // If the default proc says it's on the client area, check if it's on an interactive element
+        if (hit == HTCLIENT) {
+            POINT pt = {LOWORD(lParam), HIWORD(lParam)};
+            ScreenToClient(hwnd, &pt);
+            
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            
+            // Check if click is on the title area (top 30 pixels) - allow dragging
+            if (pt.y < 30) {
+                return HTCAPTION;
+            }
+            
+            // Check if click is on the search box area (y: 30-60) - don't allow dragging
+            if (mgr->hwndSearch && IsWindowVisible(mgr->hwndSearch)) {
+                if (pt.y >= 30 && pt.y <= 60) {
+                    return HTCLIENT; // Let search box handle it
+                }
+            }
+            
+            // Check if click is on an item - let item handle it (for selection, paste, etc.)
+            int itemHeight = 50;
+            int yPos = 60; // Start below title (30) and search box (30)
+            int startIndex = mgr->scrollOffset;
+            int endIndex = std::min(startIndex + mgr->itemsPerPage, (int)mgr->filteredIndices.size());
+            
+            for (int i = startIndex; i < endIndex; i++) {
+                RECT itemRect = {5, yPos, rect.right - 5, yPos + itemHeight - 2};
+                if (PtInRect(&itemRect, pt)) {
+                    return HTCLIENT; // Let item handle it
+                }
+                yPos += itemHeight;
+            }
+            
+            // If not on any interactive element, allow dragging
+            return HTCAPTION;
+        }
+        
+        return hit;
+    }
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -2220,6 +2265,32 @@ void ClipboardManager::PasteItem(int index) {
         CloseClipboard();
         
         if (success) {
+            // Store the text we're about to paste so we can ignore it if it's copied back
+            // Extract text from the item for comparison
+            if (!pasteAsPlainText) {
+                // For full format paste, extract text from CF_UNICODETEXT if available
+                const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+                if (textData && textData->size() >= sizeof(wchar_t)) {
+                    size_t len = textData->size() / sizeof(wchar_t);
+                    if (len > 0) {
+                        const wchar_t* textPtr = (const wchar_t*)textData->data();
+                        size_t actualLen = len;
+                        for (size_t j = 0; j < len; j++) {
+                            if (textPtr[j] == L'\0') {
+                                actualLen = j;
+                                break;
+                            }
+                        }
+                        if (actualLen > 0) {
+                            lastPastedText = std::wstring(textPtr, actualLen);
+                        }
+                    }
+                } else {
+                    // Fallback to preview text
+                    lastPastedText = item->preview;
+                }
+            }
+            
             // Update sequence number AFTER setting clipboard - this is the sequence number of our paste
             lastSequenceNumber = GetClipboardSequenceNumber();
             
@@ -2240,11 +2311,13 @@ void ClipboardManager::PasteItem(int index) {
             keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
             
             // Keep isPasting flag true longer to prevent re-adding the pasted item
-            // The clipboard sequence number check will also help
-            Sleep(200);
+            // Some applications copy the pasted content back to clipboard, so we need to wait
+            Sleep(500); // Increased delay to ignore clipboard updates from paste operation
+            
+            isPasting = false;
+        } else {
+            isPasting = false;
         }
-        
-        isPasting = false;
     } else {
         isPasting = false;
     }
@@ -2259,19 +2332,82 @@ void ClipboardManager::PasteMultipleItems() {
     std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
     std::sort(sortedIndices.begin(), sortedIndices.end());
     
-    // Restore focus to previous window before pasting
-    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
-        SetForegroundWindow(previousFocusWindow);
-        SetFocus(previousFocusWindow);
-        Sleep(100); // Give window more time to receive focus
-    }
+    // Combine all text items into a single string with newlines
+    std::wstring combinedText;
+    bool hasTextItems = false;
     
-    // Paste each item sequentially
     for (size_t i = 0; i < sortedIndices.size(); i++) {
         int filteredIndex = sortedIndices[i];
-        
+        int actualIndex = filteredIndices[filteredIndex];
+        if (actualIndex >= 0 && actualIndex < (int)clipboardHistory.size()) {
+            const auto& item = clipboardHistory[actualIndex];
+            
+            // Extract text from the item
+            std::wstring itemText;
+            const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+            if (textData && textData->size() >= sizeof(wchar_t)) {
+                size_t len = textData->size() / sizeof(wchar_t);
+                if (len > 0) {
+                    const wchar_t* textPtr = (const wchar_t*)textData->data();
+                    // Find actual length (up to null terminator)
+                    size_t actualLen = len;
+                    for (size_t j = 0; j < len; j++) {
+                        if (textPtr[j] == L'\0') {
+                            actualLen = j;
+                            break;
+                        }
+                    }
+                    if (actualLen > 0) {
+                        itemText = std::wstring(textPtr, actualLen);
+                        hasTextItems = true;
+                    }
+                }
+            } else {
+                // Try ANSI text
+                textData = item->GetFormatData(CF_TEXT);
+                if (textData && textData->size() > 0) {
+                    const char* ansiText = (const char*)textData->data();
+                    size_t len = textData->size();
+                    size_t actualLen = len;
+                    for (size_t j = 0; j < len; j++) {
+                        if (ansiText[j] == '\0') {
+                            actualLen = j;
+                            break;
+                        }
+                    }
+                    if (actualLen > 0) {
+                        std::string ansiStr(ansiText, actualLen);
+                        int wideLen = MultiByteToWideChar(CP_ACP, 0, ansiStr.c_str(), (int)ansiStr.length(), nullptr, 0);
+                        if (wideLen > 0) {
+                            itemText.resize(wideLen);
+                            MultiByteToWideChar(CP_ACP, 0, ansiStr.c_str(), (int)ansiStr.length(), &itemText[0], wideLen);
+                            hasTextItems = true;
+                        }
+                    }
+                }
+            }
+            
+            if (!itemText.empty()) {
+                combinedText += itemText;
+                // Add newline after each item except the last
+                if (i < sortedIndices.size() - 1) {
+                    combinedText += L"\n";
+                }
+            }
+        }
+    }
+    
+    // If we have combined text, paste it as a single operation
+    if (hasTextItems && !combinedText.empty()) {
         // Set flag to ignore clipboard changes we're about to make
         isPasting = true;
+        
+        // Restore focus to previous window before pasting
+        if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+            SetForegroundWindow(previousFocusWindow);
+            SetFocus(previousFocusWindow);
+            Sleep(150); // Give window time to receive focus
+        }
         
         // Ensure clipboard is available (retry logic)
         bool clipboardReady = false;
@@ -2288,78 +2424,53 @@ void ClipboardManager::PasteMultipleItems() {
         if (clipboardReady) {
             EmptyClipboard();
             
-            int actualIndex = filteredIndices[filteredIndex];
-            if (actualIndex >= 0 && actualIndex < (int)clipboardHistory.size()) {
-                const auto& item = clipboardHistory[actualIndex];
-                
-                // Paste with ALL original formats (same as PasteItem)
-                bool success = false;
-                bool firstFormat = true;
-                for (const auto& formatPair : item->formats) {
-                    UINT fmt = formatPair.first;
-                    const std::vector<BYTE>& formatData = formatPair.second;
+            // Set as Unicode text
+            size_t dataSize = (combinedText.length() + 1) * sizeof(wchar_t);
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
+            if (hMem) {
+                wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
+                if (pMem) {
+                    wcscpy_s(pMem, combinedText.length() + 1, combinedText.c_str());
+                    GlobalUnlock(hMem);
                     
-                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, formatData.size());
-                    if (hMem) {
-                        void* pMem = GlobalLock(hMem);
-                        if (pMem) {
-                            memcpy(pMem, formatData.data(), formatData.size());
-                            GlobalUnlock(hMem);
-                            
-                            // SetClipboardData takes ownership of hMem on success
-                            if (SetClipboardData(fmt, hMem)) {
-                                if (firstFormat) {
-                                    success = true;
-                                    firstFormat = false;
-                                }
-                                // Note: hMem is now owned by the clipboard, don't free it
-                            } else {
-                                // Only free if SetClipboardData failed
-                                GlobalFree(hMem);
-                            }
-                        } else {
-                            GlobalFree(hMem);
-                        }
-                    }
-                }
-                
-                if (success) {
-                    // Update sequence number AFTER setting clipboard
-                    lastSequenceNumber = GetClipboardSequenceNumber();
-                    
-                    CloseClipboard();
-                    
-                    // Ensure focus is on target window before pasting (especially important for first item)
-                    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
-                        SetForegroundWindow(previousFocusWindow);
-                        SetFocus(previousFocusWindow);
-                        Sleep(100); // Give window time to receive focus
-                    }
-                    
-                    // Longer delay before pasting to ensure clipboard is ready (especially for first item)
-                    if (i == 0) {
-                        Sleep(150); // Extra delay for first item
+                        if (SetClipboardData(CF_UNICODETEXT, hMem)) {
+                        // Store the text we're about to paste so we can ignore it if it's copied back
+                        lastPastedText = combinedText;
+                        
+                        // Update sequence number AFTER setting clipboard
+                        lastSequenceNumber = GetClipboardSequenceNumber();
+                        
+                        CloseClipboard();
+                        
+                        // Small delay before pasting
+                        Sleep(150);
+                        
+                        // Simulate paste (Ctrl+V) - single paste for all items
+                        keybd_event(VK_CONTROL, 0, 0, 0);
+                        keybd_event('V', 0, 0, 0);
+                        keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+                        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+                        
+                        // Keep isPasting flag true longer to prevent re-adding the pasted item
+                        // Some applications copy the pasted content back to clipboard, so we need to wait
+                        Sleep(500); // Increased delay to ignore clipboard updates from paste operation
+                        
+                        isPasting = false;
                     } else {
-                        Sleep(100);
+                        GlobalFree(hMem);
+                        CloseClipboard();
                     }
-                    
-                    // Simulate paste (Ctrl+V)
-                    keybd_event(VK_CONTROL, 0, 0, 0);
-                    keybd_event('V', 0, 0, 0);
-                    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
-                    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-                    
-                    // Delay between pastes to allow application to process
-                    Sleep(250);
                 } else {
+                    GlobalFree(hMem);
                     CloseClipboard();
                 }
             } else {
                 CloseClipboard();
+                isPasting = false;
             }
+        } else {
+            isPasting = false;
         }
-        
-        isPasting = false;
     }
     
     // Clear multi-selection after pasting
@@ -2653,6 +2764,37 @@ void ClipboardManager::ProcessClipboard() {
                         }
                     }
                     
+                    // Check if this matches the text we just pasted (multi-paste combined text)
+                    bool isPastPaste = false;
+                    if (!lastPastedText.empty() && item && item->format == CF_UNICODETEXT) {
+                        try {
+                            const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+                            if (textData && textData->size() >= sizeof(wchar_t)) {
+                                size_t len = textData->size() / sizeof(wchar_t);
+                                if (len > 0) {
+                                    const wchar_t* textPtr = (const wchar_t*)textData->data();
+                                    size_t actualLen = len;
+                                    for (size_t j = 0; j < len; j++) {
+                                        if (textPtr[j] == L'\0') {
+                                            actualLen = j;
+                                            break;
+                                        }
+                                    }
+                                    if (actualLen > 0) {
+                                        std::wstring clipboardText(textPtr, actualLen);
+                                        if (clipboardText == lastPastedText) {
+                                            isPastPaste = true;
+                                            // Clear lastPastedText after matching to allow future pastes
+                                            lastPastedText.clear();
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (...) {
+                            // Error comparing, treat as not matching
+                        }
+                    }
+                    
                     // Check if this is a duplicate of the last item
                     bool isDuplicate = false;
                     if (!clipboardHistory.empty() && item) {
@@ -2724,8 +2866,8 @@ void ClipboardManager::ProcessClipboard() {
                         }
                     }
                     
-                    // Only add if not a duplicate
-                    if (!isDuplicate && item) {
+                    // Only add if not a duplicate and not something we just pasted
+                    if (!isDuplicate && !isPastPaste && item) {
                         try {
                             // Add to front of list (most recent first)
                             clipboardHistory.insert(

@@ -221,6 +221,7 @@ private:
     std::set<int> multiSelectedIndices;  // Indices of items selected for multi-paste (filtered indices)
     bool isPasting;
     bool isProcessingClipboard;  // Prevent re-entrant clipboard processing
+    std::wstring lastPastedText;  // Store last pasted text to ignore it if it's copied back
     HWND previousFocusWindow;
     int hoveredItemIndex;
     int selectedIndex;  // Currently selected item index (in filtered list)
