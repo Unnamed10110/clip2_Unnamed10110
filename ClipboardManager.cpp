@@ -932,8 +932,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     // Draw background - Black OLED theme
                     FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
                     
-                    // Draw rounded border - Bright red
-                    HPEN hPreviewBorderPen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
+                    // Draw rounded border - White
+                    HPEN hPreviewBorderPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
                     HPEN hOldPreviewPen = (HPEN)SelectObject(hdc, hPreviewBorderPen);
                     HBRUSH hOldPreviewBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
                     RoundRect(hdc, 1, 1, rect.right - 1, rect.bottom - 1, 15, 15);
@@ -973,17 +973,17 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                         
                         DeleteDC(hdcMem);
                     } else if (item->isImage || item->isVideo) {
-                        // Draw placeholder - Darker colors for OLED theme
+                        // Draw placeholder - Black background
                         RECT centerRect = rect;
                         centerRect.left += 50;
                         centerRect.top += 50;
                         centerRect.right -= 50;
                         centerRect.bottom -= 50;
-                        HBRUSH brush = CreateSolidBrush(item->isVideo ? RGB(80, 40, 40) : RGB(40, 60, 80));
+                        HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
                         FillRect(hdc, &centerRect, brush);
                         DeleteObject(brush);
                         
-                        SetTextColor(hdc, RGB(200, 200, 200));
+                        SetTextColor(hdc, RGB(255, 255, 255));
                         SetBkMode(hdc, TRANSPARENT);
                         std::wstring text = item->isVideo ? L"Video Preview" : L"Image Preview";
                         DrawText(hdc, text.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1058,8 +1058,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         // Draw background - Black OLED theme
         FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
         
-        // Draw rounded border - Bright red
-        HPEN hBorderPen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
+        // Draw rounded border - White
+        HPEN hBorderPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
         HPEN hOldPen = (HPEN)SelectObject(hdc, hBorderPen);
         HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
         RoundRect(hdc, 1, 1, rect.right - 1, rect.bottom - 1, 15, 15);
@@ -1067,8 +1067,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         SelectObject(hdc, hOldPen);
         DeleteObject(hBorderPen);
         
-        // Draw title - Light gray text on black
-        SetTextColor(hdc, RGB(220, 220, 220));
+        // Draw title - White text on black
+        SetTextColor(hdc, RGB(255, 255, 255));
         SetBkMode(hdc, TRANSPARENT);
         RECT titleRect = rect;
         titleRect.bottom = 30;
@@ -1079,10 +1079,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         DrawText(hdc, titleText.c_str(), -1, &titleRect, 
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         
-        // Draw search box border (if visible) - Bright red
+        // Draw search box border (if visible) - White
         if (mgr->hwndSearch && IsWindowVisible(mgr->hwndSearch)) {
             RECT searchRect = {5, 30, WINDOW_WIDTH - 5, 55};
-            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(255, 0, 0));
+            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
             HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
             HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
             RoundRect(hdc, searchRect.left, searchRect.top, searchRect.right, searchRect.bottom, 5, 5);
@@ -1116,23 +1116,19 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int actualIndex = mgr->filteredIndices[i];
             const auto& item = mgr->clipboardHistory[actualIndex];
             
-            // Draw item background - Dark gray for items, bright red for selected, orange for multi-selected
+            // Draw item background - Pure black for items, white for selected/multi-selected
             RECT itemRect = {5, yPos, rect.right - 5, yPos + itemHeight - 2};
             bool isMultiSelected = mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
+            bool isSelected = (i == mgr->selectedIndex && mgr->selectedIndex >= 0);
             
-            if (isMultiSelected) {
-                // Highlight multi-selected item - Orange
-                HBRUSH multiSelectedBrush = CreateSolidBrush(RGB(255, 165, 0));
-                FillRect(hdc, &itemRect, multiSelectedBrush);
-                DeleteObject(multiSelectedBrush);
-            } else if (i == mgr->selectedIndex && mgr->selectedIndex >= 0) {
-                // Highlight selected item - Bright red
-                HBRUSH selectedBrush = CreateSolidBrush(RGB(255, 0, 0));
+            if (isMultiSelected || isSelected) {
+                // Highlight selected/multi-selected item - White background
+                HBRUSH selectedBrush = CreateSolidBrush(RGB(255, 255, 255));
                 FillRect(hdc, &itemRect, selectedBrush);
                 DeleteObject(selectedBrush);
             } else {
-                // Regular item - Dark gray
-                HBRUSH itemBrush = CreateSolidBrush(RGB(20, 20, 20));
+                // Regular item - Pure black
+                HBRUSH itemBrush = CreateSolidBrush(RGB(0, 0, 0));
                 FillRect(hdc, &itemRect, itemBrush);
                 DeleteObject(itemBrush);
             }
@@ -1148,36 +1144,36 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 DeleteDC(hdcMem);
                 leftOffset += thumbSize + 10;
             } else if (item->isImage || item->isVideo) {
-                // Draw placeholder icon for images/videos without thumbnail
+                // Draw placeholder icon for images/videos without thumbnail - White
                 RECT iconRect = {leftOffset + 5, yPos + 5, leftOffset + 45, yPos + 45};
-                HBRUSH iconBrush = CreateSolidBrush(item->isVideo ? RGB(200, 100, 100) : RGB(100, 150, 200));
+                HBRUSH iconBrush = CreateSolidBrush(RGB(255, 255, 255));
                 FillRect(hdc, &iconRect, iconBrush);
                 DeleteObject(iconBrush);
                 leftOffset += 50;
             }
             
-            // Draw number with highlight (use filtered position, not actual index) - Bright red
+            // Draw number with highlight (use filtered position, not actual index) - White on black, black on white
             std::wstring num = std::to_wstring(i + 1) + L".";
             RECT numRect = itemRect;
             numRect.left += leftOffset;
             numRect.right = numRect.left + 35;
-            SetTextColor(hdc, RGB(255, 0, 0));
+            SetTextColor(hdc, (isMultiSelected || isSelected) ? RGB(0, 0, 0) : RGB(255, 255, 255));
             SetBkMode(hdc, TRANSPARENT);
             DrawText(hdc, num.c_str(), -1, &numRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             
-            // Draw preview - White text
+            // Draw preview - White text on black, black text on white
             RECT previewRect = itemRect;
             previewRect.left += leftOffset + 40;
             previewRect.right -= 180;
-            SetTextColor(hdc, RGB(255, 255, 255));
+            SetTextColor(hdc, (isMultiSelected || isSelected) ? RGB(0, 0, 0) : RGB(255, 255, 255));
             DrawText(hdc, item->preview.c_str(), -1, &previewRect, 
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             
-            // Draw format info - Medium gray
+            // Draw format info - White text on black, black text on white
             std::wstring info = item->formatName + L" - " + item->fileType;
             RECT infoRect = itemRect;
             infoRect.left = infoRect.right - 175;
-            SetTextColor(hdc, RGB(150, 150, 150));
+            SetTextColor(hdc, (isMultiSelected || isSelected) ? RGB(0, 0, 0) : RGB(255, 255, 255));
             
             // Format date
             auto time_t = std::chrono::system_clock::to_time_t(item->timestamp);
@@ -1188,9 +1184,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             DrawText(hdc, info.c_str(), -1, &infoRect, 
                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             
-            // Draw separator line - Dark gray
+            // Draw separator line - White
             if (i < endIndex - 1) {
-                HPEN hPen = CreatePen(PS_SOLID, 1, RGB(40, 40, 40));
+                HPEN hPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
                 HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
                 MoveToEx(hdc, itemRect.left, itemRect.bottom - 1, nullptr);
                 LineTo(hdc, itemRect.right, itemRect.bottom - 1);
@@ -1751,9 +1747,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             // Style the search edit control with dark theme
             HDC hdcEdit = (HDC)wParam;
             SetTextColor(hdcEdit, RGB(255, 255, 255)); // White text
-            SetBkColor(hdcEdit, RGB(20, 20, 20)); // Dark gray background
+            SetBkColor(hdcEdit, RGB(0, 0, 0)); // Pure black background
             // Return a brush handle for the background
-            static HBRUSH hDarkBrush = CreateSolidBrush(RGB(20, 20, 20));
+            static HBRUSH hDarkBrush = CreateSolidBrush(RGB(0, 0, 0));
             return (LRESULT)hDarkBrush;
         }
     
@@ -3192,6 +3188,9 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
         : transformedText;
     
     // Copy transformed text to clipboard
+    // Store the transformed text so we can ignore it if it's copied back
+    lastPastedText = transformedText;
+    
     isPasting = true;
     Sleep(10);
     
@@ -3218,11 +3217,14 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
         CloseClipboard();
     }
     
+    // Keep isPasting flag true longer to prevent re-adding the transformed item
+    Sleep(500); // Delay to ignore clipboard updates from transform operation
+    
     isPasting = false;
     
-    // Update the display
+    // Update the display to show the transformed preview
     FilterItems(); // Rebuild filtered indices in case search is active
-    UpdateListWindow();
+    UpdateListWindow(); // Refresh the UI to show updated preview
 }
 
 void ClipboardManager::ClearClipboardHistory() {
