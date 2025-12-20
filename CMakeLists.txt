@@ -19,7 +19,7 @@ if(WIN32)
         ClipboardManager.cpp
         ClipboardManager.h
         ${RESOURCE_FILE}
-        misc02.ico
+        ico2.ico
         click.mp3
     )
     

@@ -11,7 +11,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Hotkey Access**: Press **Ctrl+NumPadDot** to show/hide the clipboard list
 - ✅ **Quick Paste**: Press **1-9** or type number + Enter to paste items from the list
 - ✅ **Visual Feedback**: Click sound plays when items are copied
-- ✅ **System Tray Icon**: Always visible when running (uses misc02.ico)
+- ✅ **System Tray Icon**: Always visible when running (uses ico2.ico)
 - ✅ **Modern OLED Theme**: Black background with bright red accents and rounded borders
 - ✅ **Search Functionality**: Filter clipboard history with Ctrl+F
 - ✅ **Image/Video Thumbnails**: Visual previews for images and videos
@@ -118,12 +118,12 @@ The executable will be created as `clip2.exe`.
 
 - Windows API libraries: `user32`, `gdi32`, `shell32`, `winmm`, `comctl32`, `shlwapi`, `ole32`
 - C++17 standard
-- misc02.ico icon file (included)
+- ico2.ico icon file (included)
 - click.mp3 sound file (embedded as resource, with file fallback)
 
 ## Troubleshooting
 
-- **Icon not showing**: Ensure `misc02.ico` is in the same directory or compiled as a resource
+- **Icon not showing**: Ensure `ico2.ico` is in the same directory or compiled as a resource
 - **Hotkey not working**: Ensure NumLock is enabled or try the extended key combination
 - **Sound not playing**: Ensure `click.mp3` is in the same directory as `clip2.exe` (or embedded as resource)
 - **Performance issues**: The application uses minimal resources; if issues occur, check system resources

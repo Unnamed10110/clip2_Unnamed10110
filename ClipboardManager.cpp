@@ -1868,7 +1868,7 @@ void ClipboardManager::CreateTrayIcon() {
         // Fallback: try loading from file
         hIcon = (HICON)LoadImage(
             GetModuleHandle(nullptr),
-            L"misc02.ico",
+            L"ico2.ico",
             IMAGE_ICON,
             GetSystemMetrics(SM_CXSMICON),
             GetSystemMetrics(SM_CYSMICON),

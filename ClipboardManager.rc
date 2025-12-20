@@ -1,5 +1,5 @@
 #include <windows.h>
 
-1 ICON "misc02.ico"
+1 ICON "ico2.ico"
 101 RCDATA "click.mp3"
 
