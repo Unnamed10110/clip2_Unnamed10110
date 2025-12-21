@@ -162,6 +162,11 @@ The executable will be created as `clip2.exe`.
 - Safe bounds checking for text and binary data
 - Proper cleanup in all error paths (clipboard, GDI resources, COM objects)
 - Prevention of buffer overruns and invalid memory access
+- **Robust clipboard failure handling**:
+  - Retry logic: up to 5 retries with exponential backoff (50ms, 100ms, 150ms, etc.)
+  - Quick retries: 10 quick attempts (5ms delays) before giving up
+  - Graceful degradation: if clipboard can't be opened, skips that item and continues
+  - Prevents crashes from temporary clipboard locks or unavailability
 
 ### Performance Optimizations
 - Streamlined clipboard format storage and retrieval
