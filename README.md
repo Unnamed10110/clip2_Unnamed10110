@@ -26,7 +26,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Movable Window**: Drag the list window to position it anywhere on screen
 - ✅ **Smart Paste Detection**: Prevents pasted items from being re-added to history
 - ✅ **Snippets/Templates**: Predefined text templates with placeholders; supports Rich Text (RTF)
-- ✅ **Clipboard Persistence**: History saved to disk; survives app restarts (up to 50 text items)
+- ✅ **Clipboard Persistence**: History saved to disk; survives app restarts (up to 300 items)
 - ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
 - ✅ **Snippets Overlay**: Switch between clipboard and snippets view with SS (press S twice)
 
@@ -113,21 +113,21 @@ The executable will be created as `clip2.exe`.
 
 ## Technical Details
 
-- **Maximum History**: 100 items (optimized for stability)
+- **Maximum History**: 300 items
 - **Supported Formats**: Text, Unicode text, Rich Text Format (RTF), HTML, images (bitmap, DIB, DIBV5), files, and more
 - **Format Preservation**: All clipboard formats are preserved when pasting (bold, colors, sizes, etc.)
 - **Memory Limits**: 
   - Max 5 formats per item
   - Max 5MB per individual format
   - Max 10MB total per clipboard item
-  - Aggressive cleanup when exceeding 50 items
+  - Cleanup when exceeding 300 items
 - **Hotkey**: Ctrl+NumPadDot (low-level keyboard hook for reliable detection)
 - **Update Frequency**: Asynchronous clipboard monitoring with retry logic
 - **Duplicate Detection**: Prevents adding identical consecutive items by comparing all formats and data
 - **Sound**: Embedded click.mp3 plays on copy (fallback to file in exe directory); MCI warm-up ensures first copy plays sound
 - **Navigation**: Arrow keys, Page Up/Down, Home/End for list navigation
 - **Auto-hide**: List automatically hides when focus moves to another window
-- **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat` (binary format; up to 50 text items; load on startup, save on exit)
+- **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat` (binary format; up to 300 text items; load on startup, save on exit)
 - **Snippets storage**: Registry `HKEY_CURRENT_USER\Software\clip2\Snippets`
 - **Search**: Full-text search up to 500KB per item; finds matches across line breaks
 
@@ -148,7 +148,7 @@ The executable will be created as `clip2.exe`.
 ## Changelog
 
 ### Recent Features (Latest)
-- ✅ **Clipboard persistence**: History saved to `%APPDATA%\clip2\history.dat`; survives app restarts (up to 50 text items)
+- ✅ **Clipboard persistence**: History saved to `%APPDATA%\clip2\history.dat`; survives app restarts (up to 300 items)
 - ✅ **Snippets overlay**: Press **SS** (S twice) to switch between clipboard and snippets; single-click to paste snippets
 - ✅ **Rich Text snippets**: Manage Snippets uses Rich Edit; RTF content pasted with formatting preserved
 - ✅ **\*set shortcut**: Type `*set` + Enter in snippets overlay to open Manage Snippets
@@ -177,7 +177,7 @@ The executable will be created as `clip2.exe`.
 - Limited to 5 formats per clipboard item (down from unlimited)
 - Max 5MB per individual format (down from 100MB)
 - Max 10MB total per clipboard item
-- Automatic cleanup when history exceeds 50 items
+- Automatic cleanup when history exceeds 300 items
 - Forced memory deallocation on history clear
 - Simplified preview generation to prevent resource exhaustion
 

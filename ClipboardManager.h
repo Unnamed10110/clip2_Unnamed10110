@@ -262,7 +262,7 @@ private:
     static const UINT WM_TRAYICON = WM_USER + 1;
     static const UINT WM_CLIPBOARD_HOTKEY = WM_USER + 2;
     static const UINT WM_PROCESS_CLIPBOARD = WM_USER + 3;
-    static const int MAX_ITEMS = 100; // Reduced from 1000 to prevent memory issues
+    static const int MAX_ITEMS = 300;
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
     

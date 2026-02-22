@@ -3163,16 +3163,8 @@ void ClipboardManager::ProcessClipboard() {
                                 std::move(item)
                             );
                             
-                            // Limit to MAX_ITEMS - aggressively clean up old items to prevent memory leaks
-                            while (clipboardHistory.size() >= MAX_ITEMS) {
-                                // Remove oldest item (at the back) - destructor will clean up bitmaps
-                                clipboardHistory.pop_back();
-                            }
-                            
-                            // Also limit memory usage - simplified calculation to prevent crashes
-                            // If we have more than 50 items, remove oldest until we're at 50
-                            const int MEMORY_SAFE_LIMIT = 50;
-                            while (clipboardHistory.size() > MEMORY_SAFE_LIMIT) {
+                            // Limit to MAX_ITEMS
+                            while (clipboardHistory.size() > (size_t)MAX_ITEMS) {
                                 clipboardHistory.pop_back();
                             }
                             
@@ -3565,7 +3557,7 @@ void ClipboardManager::LoadClipboardHistory() {
         DWORD version, count;
         if (!ReadFile(h, &version, 4, &read, nullptr) || read != 4 || version != 1) { CloseHandle(h); return; }
         if (!ReadFile(h, &count, 4, &read, nullptr) || read != 4) { CloseHandle(h); return; }
-        count = std::min(count, (DWORD)50);
+        count = std::min(count, (DWORD)300);
         for (DWORD i = 0; i < count; i++) {
             DWORD fmt, size;
             if (!ReadFile(h, &fmt, 4, &read, nullptr) || read != 4) break;
@@ -3603,7 +3595,7 @@ void ClipboardManager::SaveClipboardHistory() {
         WriteFile(h, "CLP2", 4, &written, nullptr);
         DWORD version = 1;
         WriteFile(h, &version, 4, &written, nullptr);
-        size_t toSave = std::min(clipboardHistory.size(), (size_t)50);
+        size_t toSave = std::min(clipboardHistory.size(), (size_t)300);
         DWORD count = (DWORD)toSave;
         WriteFile(h, &count, 4, &written, nullptr);
         for (size_t i = 0; i < toSave; i++) {
