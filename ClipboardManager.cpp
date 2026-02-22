@@ -1,6 +1,7 @@
 #include "ClipboardManager.h"
 #include <sstream>
 #include <iomanip>
+#include <ctime>
 #include <fstream>
 #include <algorithm>
 #include <cwctype>
@@ -11,12 +12,53 @@
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <objbase.h>
+#include <richedit.h>
+#ifndef MSFTEDIT_CLASS
+#define MSFTEDIT_CLASS L"RichEdit50W"
+#endif
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
 
+// AS/400 5250 terminal theme (phosphor green on black)
+namespace Theme5250 {
+    const COLORREF BG        = RGB(0, 0, 0);
+    const COLORREF TXT       = RGB(0, 255, 102);   // phosphor green
+    const COLORREF SEL_BG    = RGB(0, 255, 102);   // reverse video
+    const COLORREF SEL_FG    = RGB(0, 0, 0);       // text on selection
+    const COLORREF BORDER    = RGB(0, 200, 80);
+    const COLORREF DIM       = RGB(0, 128, 40);    // dividers, dimmer elements
+}
+
 ClipboardManager* ClipboardManager::instance = nullptr;
+
+// Rich Edit stream callbacks for RTF
+struct StreamCookie {
+    const char* data;
+    size_t pos;
+    size_t size;
+    std::string* outStr;
+};
+static DWORD CALLBACK RichEditStreamInCallback(DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* pcb) {
+    StreamCookie* c = (StreamCookie*)cookie;
+    size_t remain = c->size - c->pos;
+    size_t toCopy = (size_t)cb < remain ? (size_t)cb : remain;
+    memcpy(buf, c->data + c->pos, toCopy);
+    c->pos += toCopy;
+    *pcb = (LONG)toCopy;
+    return 0;
+}
+static DWORD CALLBACK RichEditStreamOutCallback(DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* pcb) {
+    StreamCookie* c = (StreamCookie*)cookie;
+    if (c->outStr) c->outStr->append((char*)buf, (size_t)cb);
+    *pcb = cb;
+    return 0;
+}
+static bool IsRtfContent(const std::wstring& s) {
+    if (s.size() < 5) return false;
+    return (s[0] == L'{' && s[1] == L'\\' && (s[2] == L'r' || s[2] == L'R') && (s[3] == L't' || s[3] == L'T') && (s[4] == L'f' || s[4] == L'F'));
+}
 
 // ClipboardItem methods
 std::wstring ClipboardItem::GetFormatName(UINT fmt) {
@@ -536,9 +578,40 @@ HBITMAP ClipboardItem::GetPreviewBitmap() {
     return thumbnail;
 }
 
+std::wstring ClipboardItem::GetFullSearchableText() const {
+    const size_t maxSearchBytes = 500000;  // Limit for performance
+    const std::vector<BYTE>* udata = GetFormatData(CF_UNICODETEXT);
+    if (udata && !udata->empty() && udata->size() <= maxSearchBytes) {
+        size_t len = udata->size() / sizeof(wchar_t);
+        if (len > 0) {
+            const wchar_t* p = (const wchar_t*)udata->data();
+            return std::wstring(p, len);
+        }
+    }
+    const std::vector<BYTE>* adata = GetFormatData(CF_TEXT);
+    if (adata && !adata->empty() && adata->size() <= maxSearchBytes) {
+        int wlen = MultiByteToWideChar(CP_ACP, 0, (const char*)adata->data(), (int)adata->size(), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring result(wlen, 0);
+            MultiByteToWideChar(CP_ACP, 0, (const char*)adata->data(), (int)adata->size(), &result[0], wlen);
+            return result;
+        }
+    }
+    const std::vector<BYTE>* oemdata = GetFormatData(CF_OEMTEXT);
+    if (oemdata && !oemdata->empty() && oemdata->size() <= maxSearchBytes) {
+        int wlen = MultiByteToWideChar(CP_OEMCP, 0, (const char*)oemdata->data(), (int)oemdata->size(), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring result(wlen, 0);
+            MultiByteToWideChar(CP_OEMCP, 0, (const char*)oemdata->data(), (int)oemdata->size(), &result[0], wlen);
+            return result;
+        }
+    }
+    return L"";
+}
+
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager() 
-    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     // Default hotkey: Ctrl+NumPadDot
@@ -579,7 +652,7 @@ bool ClipboardManager::Initialize() {
     wcList.lpszClassName = L"ClipboardManagerListClass";
     wcList.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wcList.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcList.hbrBackground = CreateSolidBrush(RGB(0, 0, 0)); // Black OLED background
+    wcList.hbrBackground = CreateSolidBrush(Theme5250::BG);
     wcList.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     
     if (!RegisterClass(&wcList)) {
@@ -593,7 +666,7 @@ bool ClipboardManager::Initialize() {
     wcPreview.lpszClassName = L"ClipboardManagerPreviewClass";
     wcPreview.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wcPreview.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcPreview.hbrBackground = CreateSolidBrush(RGB(0, 0, 0)); // Black OLED background
+    wcPreview.hbrBackground = CreateSolidBrush(Theme5250::BG);
     wcPreview.style = CS_HREDRAW | CS_VREDRAW;
     
     RegisterClass(&wcPreview);
@@ -630,8 +703,8 @@ bool ClipboardManager::Initialize() {
         return false;
     }
     
-    // Set rounded window region for rounded borders
-    HRGN hRgn = CreateRoundRectRgn(0, 0, WINDOW_WIDTH + 1, WINDOW_HEIGHT + 1, 15, 15);
+    // Set window region - sharp corners for 5250 terminal look
+    HRGN hRgn = CreateRectRgn(0, 0, WINDOW_WIDTH + 1, WINDOW_HEIGHT + 1);
     SetWindowRgn(hwndList, hRgn, TRUE);
     DeleteObject(hRgn);
     
@@ -651,7 +724,9 @@ bool ClipboardManager::Initialize() {
     );
     
     if (hwndSearch) {
-        // Set placeholder text hint
+        static HFONT hSearchFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        SendMessage(hwndSearch, WM_SETFONT, (WPARAM)hSearchFont, TRUE);
         SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
         // Subclass the edit control to handle Enter key
         originalSearchEditProc = (WNDPROC)SetWindowLongPtr(hwndSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
@@ -672,8 +747,8 @@ bool ClipboardManager::Initialize() {
     );
     
     if (hwndPreview) {
-        // Set rounded window region for preview window
-        HRGN hPreviewRgn = CreateRoundRectRgn(0, 0, PREVIEW_WINDOW_SIZE + 1, PREVIEW_WINDOW_SIZE + 1, 15, 15);
+        // Set window region for preview - sharp corners for 5250 terminal look
+        HRGN hPreviewRgn = CreateRectRgn(0, 0, PREVIEW_WINDOW_SIZE + 1, PREVIEW_WINDOW_SIZE + 1);
         SetWindowRgn(hwndPreview, hPreviewRgn, TRUE);
         DeleteObject(hPreviewRgn);
         
@@ -686,6 +761,12 @@ bool ClipboardManager::Initialize() {
     // Load hotkey configuration from registry
     LoadHotkeyConfig();
     
+    // Load snippets from registry
+    LoadSnippets();
+    
+    // Load persisted clipboard history
+    LoadClipboardHistory();
+    
     InstallKeyboardHook();
     
     wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
@@ -693,6 +774,9 @@ bool ClipboardManager::Initialize() {
     
     // Register for clipboard update notifications (instant notification when clipboard changes)
     AddClipboardFormatListener(hwndMain);
+    
+    // Warm up MCI so first copy plays sound (cold MCI often fails on first use)
+    WarmUpClickSound();
     
     return true;
 }
@@ -734,6 +818,7 @@ void ClipboardManager::Run() {
 
 void ClipboardManager::Stop() {
     isRunning = false;
+    SaveClipboardHistory();
     HideListWindow();
     RemoveTrayIcon();
     UninstallKeyboardHook();
@@ -777,12 +862,25 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
     switch (uMsg) {
     case WM_TRAYICON:
         if (LOWORD(lParam) == WM_RBUTTONUP) {
+            mgr->previousFocusWindow = GetForegroundWindow();  // Save for snippet paste target
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
             AppendMenu(hMenu, MF_STRING, 1, L"Show Clipboard");
             AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
-            
+            // Snippets submenu
+            if (!mgr->snippets.empty()) {
+                HMENU hSnippetsMenu = CreatePopupMenu();
+                for (size_t i = 0; i < mgr->snippets.size(); i++) {
+                    AppendMenuW(hSnippetsMenu, MF_STRING, (UINT_PTR)(100 + i), mgr->snippets[i].name.c_str());
+                }
+                AppendMenu(hSnippetsMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenu(hSnippetsMenu, MF_STRING, 5, L"Manage Snippets...");
+                AppendMenu(hMenu, MF_STRING | MF_POPUP, (UINT_PTR)hSnippetsMenu, L"Snippets");
+            } else {
+                AppendMenu(hMenu, MF_STRING, 5, L"Snippets...");
+            }
+            AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             // Add "Start with Windows" option with checkmark
             bool startupEnabled = mgr->IsStartupWithWindows();
             AppendMenu(hMenu, startupEnabled ? (MF_STRING | MF_CHECKED) : MF_STRING, 3, L"Start with Windows");
@@ -810,6 +908,10 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             } else if (cmd == 4) {
                 // Show settings dialog
                 mgr->ShowSettingsDialog();
+            } else if (cmd == 5) {
+                mgr->ShowSnippetsManagerDialog();
+            } else if (cmd >= 100 && cmd < 100 + (int)mgr->snippets.size()) {
+                mgr->PasteSnippet(cmd - 100);
             }
             
             DestroyMenu(hMenu);
@@ -929,14 +1031,14 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     int actualIndex = mgr->filteredIndices[mgr->hoveredItemIndex];
                     const auto& item = mgr->clipboardHistory[actualIndex];
                     
-                    // Draw background - Black OLED theme
+                    // Draw background - 5250 black
                     FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
                     
-                    // Draw rounded border - White
-                    HPEN hPreviewBorderPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+                    // Draw border - 5250 green
+                    HPEN hPreviewBorderPen = CreatePen(PS_SOLID, 2, Theme5250::BORDER);
                     HPEN hOldPreviewPen = (HPEN)SelectObject(hdc, hPreviewBorderPen);
                     HBRUSH hOldPreviewBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                    RoundRect(hdc, 1, 1, rect.right - 1, rect.bottom - 1, 15, 15);
+                    Rectangle(hdc, 1, 1, rect.right - 1, rect.bottom - 1);
                     SelectObject(hdc, hOldPreviewBrush);
                     SelectObject(hdc, hOldPreviewPen);
                     DeleteObject(hPreviewBorderPen);
@@ -979,11 +1081,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                         centerRect.top += 50;
                         centerRect.right -= 50;
                         centerRect.bottom -= 50;
-                        HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
+                        HBRUSH brush = CreateSolidBrush(Theme5250::BG);
                         FillRect(hdc, &centerRect, brush);
                         DeleteObject(brush);
                         
-                        SetTextColor(hdc, RGB(255, 255, 255));
+                        SetTextColor(hdc, Theme5250::TXT);
                         SetBkMode(hdc, TRANSPARENT);
                         std::wstring text = item->isVideo ? L"Video Preview" : L"Image Preview";
                         DrawText(hdc, text.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1030,9 +1132,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             
             // Check if click is on an item - let item handle it (for selection, paste, etc.)
             int itemHeight = 50;
-            int yPos = 60; // Start below title (30) and search box (30)
+            int yPos = 60;
             int startIndex = mgr->scrollOffset;
-            int endIndex = std::min(startIndex + mgr->itemsPerPage, (int)mgr->filteredIndices.size());
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
+            int endIndex = std::min(startIndex + mgr->itemsPerPage, listSize);
             
             for (int i = startIndex; i < endIndex; i++) {
                 RECT itemRect = {5, yPos, rect.right - 5, yPos + itemHeight - 2};
@@ -1055,45 +1158,64 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         RECT rect;
         GetClientRect(hwnd, &rect);
         
-        // Draw background - Black OLED theme
+        // Draw background - 5250 black
         FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
         
-        // Draw rounded border - White
-        HPEN hBorderPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+        // Use monospace font for terminal look
+        static HFONT hFont5250 = nullptr;
+        if (!hFont5250) {
+            hFont5250 = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN,
+                L"Consolas");
+        }
+        HGDIOBJ hOldFont = SelectObject(hdc, hFont5250);
+        
+        // Draw border - 5250 green (sharper corners for terminal look)
+        HPEN hBorderPen = CreatePen(PS_SOLID, 2, Theme5250::BORDER);
         HPEN hOldPen = (HPEN)SelectObject(hdc, hBorderPen);
         HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        RoundRect(hdc, 1, 1, rect.right - 1, rect.bottom - 1, 15, 15);
+        Rectangle(hdc, 1, 1, rect.right - 1, rect.bottom - 1);
         SelectObject(hdc, hOldBrush);
         SelectObject(hdc, hOldPen);
         DeleteObject(hBorderPen);
         
-        // Draw title - White text on black
-        SetTextColor(hdc, RGB(255, 255, 255));
+        // Draw title - 5250 phosphor green
+        SetTextColor(hdc, Theme5250::TXT);
         SetBkMode(hdc, TRANSPARENT);
         RECT titleRect = rect;
         titleRect.bottom = 30;
-        std::wstring titleText = L"clip2 (Ctrl+NumPadDot to hide, Type number + Enter to paste)";
-        if (!mgr->numberInput.empty()) {
-            titleText += L" [" + mgr->numberInput + L"]";
+        if (mgr->snippetsMode) {
+            std::wstring titleText = L"clip2 Snippets (ss to switch back, Ctrl+F search, number+Enter to paste)";
+            DrawText(hdc, titleText.c_str(), -1, &titleRect, 
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            RECT line1Rect = titleRect;
+            line1Rect.bottom = 18;
+            std::wstring line1 = L"clip2 Clipboard";
+            if (!mgr->numberInput.empty()) line1 += L" [" + mgr->numberInput + L"]";
+            DrawText(hdc, line1.c_str(), -1, &line1Rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            RECT hintRect = titleRect;
+            hintRect.top = 16;
+            hintRect.bottom = 30;
+            DrawText(hdc, L"Press SS twice to open Snippets overlay", -1, &hintRect, 
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        DrawText(hdc, titleText.c_str(), -1, &titleRect, 
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         
-        // Draw search box border (if visible) - White
+        // Draw search box border (if visible) - 5250 green
         if (mgr->hwndSearch && IsWindowVisible(mgr->hwndSearch)) {
             RECT searchRect = {5, 30, WINDOW_WIDTH - 5, 55};
-            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+            HPEN hPen = CreatePen(PS_SOLID, 1, Theme5250::BORDER);
             HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
             HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            RoundRect(hdc, searchRect.left, searchRect.top, searchRect.right, searchRect.bottom, 5, 5);
+            Rectangle(hdc, searchRect.left, searchRect.top, searchRect.right, searchRect.bottom);
             SelectObject(hdc, hOldBrush);
             SelectObject(hdc, hOldPen);
             DeleteObject(hPen);
         }
         
-        // Calculate scroll info (no visible scrollbar, but we still track scrolling)
+        // Calculate scroll info
         int itemHeight = 50;
-        int totalItems = (int)mgr->filteredIndices.size();
+        int totalItems = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
         int visibleHeight = rect.bottom - rect.top - 60; // Subtract title height (30) and search box height (30)
         mgr->itemsPerPage = visibleHeight / itemHeight;
         int maxScroll = std::max(0, totalItems - mgr->itemsPerPage);
@@ -1107,33 +1229,80 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         }
         
         // Draw items (only visible ones)
-        int yPos = 60; // Start below title (30) and search box (30)
+        int yPos = 60;
         int startIndex = mgr->scrollOffset;
         int endIndex = std::min(startIndex + mgr->itemsPerPage, totalItems);
         
+        if (mgr->snippetsMode) {
+            for (int i = startIndex; i < endIndex && yPos + itemHeight <= rect.bottom - 10; i++) {
+                if (i >= (int)mgr->filteredSnippetIndices.size()) break;
+                int actualIndex = mgr->filteredSnippetIndices[i];
+                const auto& snip = mgr->snippets[actualIndex];
+                
+                RECT itemRect = {5, yPos, rect.right - 5, yPos + itemHeight - 2};
+                bool isSelected = (i == mgr->selectedIndex && mgr->selectedIndex >= 0);
+                
+                if (isSelected) {
+                    HBRUSH selectedBrush = CreateSolidBrush(Theme5250::SEL_BG);
+                    FillRect(hdc, &itemRect, selectedBrush);
+                    DeleteObject(selectedBrush);
+                } else {
+                    HBRUSH itemBrush = CreateSolidBrush(Theme5250::BG);
+                    FillRect(hdc, &itemRect, itemBrush);
+                    DeleteObject(itemBrush);
+                }
+                
+                int leftOffset = 5;
+                std::wstring num = std::to_wstring(i + 1) + L".";
+                RECT numRect = itemRect;
+                numRect.left += leftOffset;
+                numRect.right = numRect.left + 35;
+                SetTextColor(hdc, isSelected ? Theme5250::SEL_FG : Theme5250::TXT);
+                SetBkMode(hdc, TRANSPARENT);
+                DrawText(hdc, num.c_str(), -1, &numRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                
+                RECT previewRect = itemRect;
+                previewRect.left += leftOffset + 40;
+                previewRect.right -= 10;
+                std::wstring preview = snip.name;
+                std::wstring dispContent = snip.contentPlain.empty() ? snip.content : snip.contentPlain;
+                if (!dispContent.empty()) {
+                    std::wstring contentPreview = dispContent.length() > 50 ? dispContent.substr(0, 47) + L"..." : dispContent;
+                    preview += L" - " + contentPreview;
+                }
+                SetTextColor(hdc, isSelected ? Theme5250::SEL_FG : Theme5250::TXT);
+                DrawText(hdc, preview.c_str(), -1, &previewRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                
+                if (i < endIndex - 1) {
+                    HPEN hPen = CreatePen(PS_SOLID, 1, Theme5250::DIM);
+                    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+                    MoveToEx(hdc, itemRect.left, itemRect.bottom - 1, nullptr);
+                    LineTo(hdc, itemRect.right, itemRect.bottom - 1);
+                    SelectObject(hdc, hOldPen);
+                    DeleteObject(hPen);
+                }
+                yPos += itemHeight;
+            }
+        } else {
         for (int i = startIndex; i < endIndex && yPos + itemHeight <= rect.bottom - 10; i++) {
             if (i >= (int)mgr->filteredIndices.size()) break;
             int actualIndex = mgr->filteredIndices[i];
             const auto& item = mgr->clipboardHistory[actualIndex];
             
-            // Draw item background - Pure black for items, white for selected/multi-selected
             RECT itemRect = {5, yPos, rect.right - 5, yPos + itemHeight - 2};
             bool isMultiSelected = mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
             bool isSelected = (i == mgr->selectedIndex && mgr->selectedIndex >= 0);
             
             if (isMultiSelected || isSelected) {
-                // Highlight selected/multi-selected item - White background
-                HBRUSH selectedBrush = CreateSolidBrush(RGB(255, 255, 255));
+                HBRUSH selectedBrush = CreateSolidBrush(Theme5250::SEL_BG);
                 FillRect(hdc, &itemRect, selectedBrush);
                 DeleteObject(selectedBrush);
             } else {
-                // Regular item - Pure black
-                HBRUSH itemBrush = CreateSolidBrush(RGB(0, 0, 0));
+                HBRUSH itemBrush = CreateSolidBrush(Theme5250::BG);
                 FillRect(hdc, &itemRect, itemBrush);
                 DeleteObject(itemBrush);
             }
             
-            // Draw thumbnail if available (for images/videos)
             int leftOffset = 5;
             if (item->thumbnail) {
                 HDC hdcMem = CreateCompatibleDC(hdc);
@@ -1144,28 +1313,28 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 DeleteDC(hdcMem);
                 leftOffset += thumbSize + 10;
             } else if (item->isImage || item->isVideo) {
-                // Draw placeholder icon for images/videos without thumbnail - White
+                // Draw placeholder icon for images/videos without thumbnail - 5250 green
                 RECT iconRect = {leftOffset + 5, yPos + 5, leftOffset + 45, yPos + 45};
-                HBRUSH iconBrush = CreateSolidBrush(RGB(255, 255, 255));
+                HBRUSH iconBrush = CreateSolidBrush(Theme5250::DIM);
                 FillRect(hdc, &iconRect, iconBrush);
                 DeleteObject(iconBrush);
                 leftOffset += 50;
             }
             
-            // Draw number with highlight (use filtered position, not actual index) - White on black, black on white
+            // Draw number - 5250 reverse video when selected
             std::wstring num = std::to_wstring(i + 1) + L".";
             RECT numRect = itemRect;
             numRect.left += leftOffset;
             numRect.right = numRect.left + 35;
-            SetTextColor(hdc, (isMultiSelected || isSelected) ? RGB(0, 0, 0) : RGB(255, 255, 255));
+            SetTextColor(hdc, (isMultiSelected || isSelected) ? Theme5250::SEL_FG : Theme5250::TXT);
             SetBkMode(hdc, TRANSPARENT);
             DrawText(hdc, num.c_str(), -1, &numRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             
-            // Draw preview - White text on black, black text on white
+            // Draw preview - 5250 theme
             RECT previewRect = itemRect;
             previewRect.left += leftOffset + 40;
             previewRect.right -= 180;
-            SetTextColor(hdc, (isMultiSelected || isSelected) ? RGB(0, 0, 0) : RGB(255, 255, 255));
+            SetTextColor(hdc, (isMultiSelected || isSelected) ? Theme5250::SEL_FG : Theme5250::TXT);
             DrawText(hdc, item->preview.c_str(), -1, &previewRect, 
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             
@@ -1173,7 +1342,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             std::wstring info = item->formatName + L" - " + item->fileType;
             RECT infoRect = itemRect;
             infoRect.left = infoRect.right - 175;
-            SetTextColor(hdc, (isMultiSelected || isSelected) ? RGB(0, 0, 0) : RGB(255, 255, 255));
+            SetTextColor(hdc, (isMultiSelected || isSelected) ? Theme5250::SEL_FG : Theme5250::TXT);
             
             // Format date
             auto time_t = std::chrono::system_clock::to_time_t(item->timestamp);
@@ -1184,9 +1353,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             DrawText(hdc, info.c_str(), -1, &infoRect, 
                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             
-            // Draw separator line - White
             if (i < endIndex - 1) {
-                HPEN hPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+                HPEN hPen = CreatePen(PS_SOLID, 1, Theme5250::DIM);
                 HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
                 MoveToEx(hdc, itemRect.left, itemRect.bottom - 1, nullptr);
                 LineTo(hdc, itemRect.right, itemRect.bottom - 1);
@@ -1196,67 +1364,123 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             
             yPos += itemHeight;
         }
+        }
         
+        SelectObject(hdc, hOldFont);
         EndPaint(hwnd, &ps);
         return 0;
     }
     
-    case WM_KEYDOWN:
+    case WM_KEYDOWN: {
+        // Detect "ss" (double-S) to toggle snippets mode - only when list has focus (not search)
+        HWND focusedWindow = GetFocus();
+        if (focusedWindow != mgr->hwndSearch && (wParam == 'S' || wParam == 's')) {
+            DWORD now = GetTickCount();
+            if (now - mgr->lastSKeyTime < 500 && mgr->lastSKeyTime != 0) {
+                mgr->lastSKeyTime = 0;
+                mgr->snippetsMode = !mgr->snippetsMode;
+                mgr->numberInput.clear();
+                mgr->scrollOffset = 0;
+                if (mgr->snippetsMode) {
+                    mgr->searchText.clear();
+                    mgr->ignoreNextSChar = true;  // Discard the second 's' that would otherwise appear in search
+                    if (mgr->hwndSearch) {
+                        SetWindowText(mgr->hwndSearch, L"");
+                        SetFocus(mgr->hwndSearch);
+                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Type name, Enter to paste");
+                    }
+                    mgr->FilterSnippets();
+                } else {
+                    mgr->FilterItems();
+                    if (mgr->hwndSearch) {
+                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
+                    }
+                }
+                return 0;
+            }
+            mgr->lastSKeyTime = now;
+            return 0;  // Consume first 'S' to avoid beep
+        } else if (wParam != 'S' && wParam != 's') {
+            mgr->lastSKeyTime = 0;
+        }
         // Handle Enter key first
         if (wParam == VK_RETURN) {
-            // Enter pressed - paste the selected item or item at typed number
-            // Note: Enter in search box is handled by SearchEditProc
-            if (!mgr->numberInput.empty()) {
-                // Number input takes priority
-                try {
-                    int itemNumber = std::stoi(mgr->numberInput);
-                    // Convert from 1-based to 0-based filtered index
-                    int index = itemNumber - 1;
-                    if (index >= 0 && index < (int)mgr->filteredIndices.size()) {
-                        mgr->PasteItem(index);
-                        mgr->numberInput.clear();
-                        mgr->HideListWindow();
-                    } else {
-                        // Invalid number, clear input
+            if (mgr->snippetsMode) {
+                if (!mgr->numberInput.empty()) {
+                    try {
+                        int itemNumber = std::stoi(mgr->numberInput);
+                        int index = itemNumber - 1;
+                        if (index >= 0 && index < (int)mgr->filteredSnippetIndices.size()) {
+                            mgr->PasteSnippet(mgr->filteredSnippetIndices[index]);
+                            mgr->numberInput.clear();
+                            mgr->HideListWindow();
+                        } else {
+                            mgr->numberInput.clear();
+                            mgr->UpdateListWindow();
+                        }
+                    } catch (...) {
                         mgr->numberInput.clear();
                         mgr->UpdateListWindow();
                     }
-                } catch (...) {
-                    // Invalid number format, clear input
-                    mgr->numberInput.clear();
-                    mgr->UpdateListWindow();
+                } else if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredSnippetIndices.size()) {
+                    mgr->PasteSnippet(mgr->filteredSnippetIndices[mgr->selectedIndex]);
+                    mgr->HideListWindow();
                 }
             } else {
-                // Check if multiple items are selected for multi-paste
-                if (!mgr->multiSelectedIndices.empty()) {
-                    mgr->PasteMultipleItems();
-                    mgr->HideListWindow();
-                } else if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
-                    // No number input - paste selected item
-                    mgr->PasteItem(mgr->selectedIndex);
-                    mgr->HideListWindow();
+                // Clipboard mode
+                if (!mgr->numberInput.empty()) {
+                    try {
+                        int itemNumber = std::stoi(mgr->numberInput);
+                        int index = itemNumber - 1;
+                        if (index >= 0 && index < (int)mgr->filteredIndices.size()) {
+                            mgr->PasteItem(index);
+                            mgr->numberInput.clear();
+                            mgr->HideListWindow();
+                        } else {
+                            mgr->numberInput.clear();
+                            mgr->UpdateListWindow();
+                        }
+                    } catch (...) {
+                        mgr->numberInput.clear();
+                        mgr->UpdateListWindow();
+                    }
+                } else {
+                    if (!mgr->multiSelectedIndices.empty()) {
+                        mgr->PasteMultipleItems();
+                        mgr->HideListWindow();
+                    } else if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                        mgr->PasteItem(mgr->selectedIndex);
+                        mgr->HideListWindow();
+                    }
                 }
             }
             return 0;
         }
-        // Handle Backspace
-        if (wParam == VK_BACK) {
-            // Backspace - remove last digit
+        // Handle Backspace (clipboard mode only - snippets mode forwards to search)
+        if (wParam == VK_BACK && !mgr->snippetsMode) {
             if (!mgr->numberInput.empty()) {
                 mgr->numberInput.pop_back();
                 mgr->UpdateListWindow();
             }
             return 0;
         }
-        // Quick paste for single digits 1-9 only if no number input is being typed
-        // Use virtual key codes VK_0 through VK_9 (0x30-0x39)
-        if (wParam >= 0x31 && wParam <= 0x39 && mgr->numberInput.empty()) {
-            int index = (wParam - 0x31); // VK_1 (0x31) = item 0, VK_2 (0x32) = item 1, etc.
+        // Quick paste for single digits 1-9 (clipboard mode only; snippets mode uses search + Enter)
+        if (!mgr->snippetsMode && wParam >= 0x31 && wParam <= 0x39 && mgr->numberInput.empty()) {
+            int index = (wParam - 0x31);
             if (index < (int)mgr->filteredIndices.size()) {
                 mgr->PasteItem(index);
                 mgr->HideListWindow();
             }
             return 0;
+        }
+        // In snippets mode: forward Backspace to search box (printable keys go via WM_CHAR)
+        if (mgr->snippetsMode && mgr->hwndSearch) {
+            HWND focusedWindow = GetFocus();
+            if (focusedWindow != mgr->hwndSearch && wParam == VK_BACK) {
+                SetFocus(mgr->hwndSearch);
+                PostMessage(mgr->hwndSearch, WM_KEYDOWN, VK_BACK, lParam);
+                return 0;
+            }
         }
         // Handle Ctrl+F to focus search
         if (wParam == 'F' && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
@@ -1277,9 +1501,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             mgr->HideListWindow();
             return 0;
         }
-        // Handle Delete key to remove selected item
-        if (wParam == VK_DELETE) {
-            // Only delete if search box doesn't have focus
+        // Handle Delete key - only in clipboard mode
+        if (wParam == VK_DELETE && !mgr->snippetsMode) {
             HWND focusedWindow = GetFocus();
             if (focusedWindow != mgr->hwndSearch && mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
                 mgr->DeleteItem(mgr->selectedIndex);
@@ -1290,7 +1513,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         {
             HWND focusedWindow = GetFocus();
             if (focusedWindow != mgr->hwndSearch) {
+                int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
                 bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                if (mgr->snippetsMode) isShiftPressed = false;  // No multi-select for snippets
                 
                 if (wParam == VK_UP) {
                     // Move selection up
@@ -1329,8 +1554,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     return 0;
                 }
                 if (wParam == VK_DOWN) {
-                    // Move selection down
-                    int maxIndex = (int)mgr->filteredIndices.size() - 1;
+                    int maxIndex = listSize - 1;
                     if (mgr->selectedIndex < maxIndex) {
                         int newIndex = mgr->selectedIndex + 1;
                         
@@ -1357,8 +1581,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                             mgr->selectedIndex = newIndex;
                         }
                         
-                        // Ensure selected item is visible
-                        int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
+                        int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
                         if (mgr->selectedIndex >= mgr->scrollOffset + mgr->itemsPerPage) {
                             mgr->scrollOffset = mgr->selectedIndex - mgr->itemsPerPage + 1;
                             if (mgr->scrollOffset > maxScroll) {
@@ -1371,8 +1594,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 }
             }
         }
-        if (wParam == VK_PRIOR) { // Page Up
-            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (wParam == VK_PRIOR) {
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
+            bool isShiftPressed = mgr->snippetsMode ? false : ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
             int newIndex = std::max(0, mgr->scrollOffset - mgr->itemsPerPage);
             mgr->scrollOffset = newIndex;
             
@@ -1391,9 +1615,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             mgr->UpdateListWindow();
             return 0;
         }
-        if (wParam == VK_NEXT) { // Page Down
-            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
+        if (wParam == VK_NEXT) {
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
+            bool isShiftPressed = mgr->snippetsMode ? false : ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+            int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
             int newIndex = std::min(maxScroll, mgr->scrollOffset + mgr->itemsPerPage);
             mgr->scrollOffset = newIndex;
             
@@ -1413,7 +1638,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             return 0;
         }
         if (wParam == VK_HOME) {
-            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool isShiftPressed = mgr->snippetsMode ? false : ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
             mgr->scrollOffset = 0;
             int newIndex = 0;
             
@@ -1433,10 +1658,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             return 0;
         }
         if (wParam == VK_END) {
-            bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
+            bool isShiftPressed = mgr->snippetsMode ? false : ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+            int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
             mgr->scrollOffset = maxScroll;
-            int maxIndex = (int)mgr->filteredIndices.size() - 1;
+            int maxIndex = listSize - 1;
             int newIndex = maxIndex >= 0 ? maxIndex : 0;
             
             if (isShiftPressed && mgr->multiSelectAnchor >= 0) {
@@ -1455,11 +1681,25 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             return 0;
         }
         break;
+    }
         
     case WM_CHAR:
-        // Handle numeric input (this is called after WM_KEYDOWN)
+        // In snippets mode: all typing goes to search box - show what user writes, Enter pastes match
+        if (mgr->snippetsMode && mgr->hwndSearch) {
+            if (mgr->ignoreNextSChar && (wParam == 's' || wParam == 'S')) {
+                mgr->ignoreNextSChar = false;
+                return 0;  // Consume the second 's' from "ss" - don't add to search
+            }
+            mgr->ignoreNextSChar = false;
+            HWND focusedWindow = GetFocus();
+            if (focusedWindow != mgr->hwndSearch) {
+                SetFocus(mgr->hwndSearch);
+            }
+            PostMessage(mgr->hwndSearch, WM_CHAR, wParam, lParam);
+            return 0;
+        }
+        // Clipboard mode: numeric input for quick paste
         if (wParam >= '0' && wParam <= '9') {
-            // Limit to 4 digits (enough for 1000 items)
             if (mgr->numberInput.length() < 4) {
                 mgr->numberInput += (wchar_t)wParam;
                 mgr->UpdateListWindow();
@@ -1470,9 +1710,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
     case WM_VSCROLL:
         {
-            // Handle scrollbar messages (even though scrollbar is hidden)
-            // This allows programmatic scrolling if needed
-            int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
+            int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
             int oldOffset = mgr->scrollOffset;
             
             switch (LOWORD(wParam)) {
@@ -1520,7 +1759,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             
             int itemIndex = mgr->GetItemAtPosition(pt.x, pt.y);
             
-            if (itemIndex >= 0 && itemIndex < (int)mgr->filteredIndices.size()) {
+            if (mgr->snippetsMode) {
+                mgr->HidePreviewWindow();
+            } else if (itemIndex >= 0 && itemIndex < (int)mgr->filteredIndices.size()) {
                 int actualIndex = mgr->filteredIndices[itemIndex];
                 const auto& item = mgr->clipboardHistory[actualIndex];
                 if (item->isImage || item->isVideo) {
@@ -1554,25 +1795,27 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
     case WM_LBUTTONDOWN:
         {
-            // Handle Ctrl+Click for multi-selection
-            bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             POINT pt;
             pt.x = LOWORD(lParam);
             pt.y = HIWORD(lParam);
-            
             int clickedIndex = mgr->GetItemAtPosition(pt.x, pt.y);
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
             
-            if (clickedIndex >= 0 && clickedIndex < (int)mgr->filteredIndices.size()) {
-                if (isCtrlPressed) {
-                    // Ctrl+Click: Toggle multi-selection
-                    mgr->ToggleMultiSelect(clickedIndex);
-                    mgr->selectedIndex = clickedIndex; // Also update single selection
-                    mgr->multiSelectAnchor = -1; // Clear anchor when using Ctrl+Click
+            if (clickedIndex >= 0 && clickedIndex < listSize) {
+                if (mgr->snippetsMode) {
+                    mgr->PasteSnippet(mgr->filteredSnippetIndices[clickedIndex]);
+                    mgr->HideListWindow();
                 } else {
-                    // Regular click: Clear multi-selection and select single item
-                    mgr->ClearMultiSelection();
-                    mgr->selectedIndex = clickedIndex;
-                    mgr->UpdateListWindow();
+                    bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                    if (isCtrlPressed) {
+                        mgr->ToggleMultiSelect(clickedIndex);
+                        mgr->selectedIndex = clickedIndex;
+                        mgr->multiSelectAnchor = -1;
+                    } else {
+                        mgr->ClearMultiSelection();
+                        mgr->selectedIndex = clickedIndex;
+                        mgr->UpdateListWindow();
+                    }
                 }
             }
             break;
@@ -1580,17 +1823,16 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
     case WM_LBUTTONDBLCLK:
         {
-            // Double-click to paste item
             POINT pt;
             pt.x = LOWORD(lParam);
             pt.y = HIWORD(lParam);
-            
-            // Calculate which item was clicked
             int clickedIndex = mgr->GetItemAtPosition(pt.x, pt.y);
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
             
-            if (clickedIndex >= 0 && clickedIndex < (int)mgr->filteredIndices.size()) {
-                // Check if multiple items are selected
-                if (!mgr->multiSelectedIndices.empty()) {
+            if (clickedIndex >= 0 && clickedIndex < listSize) {
+                if (mgr->snippetsMode) {
+                    mgr->PasteSnippet(mgr->filteredSnippetIndices[clickedIndex]);
+                } else if (!mgr->multiSelectedIndices.empty()) {
                     mgr->PasteMultipleItems();
                 } else {
                     mgr->PasteItem(clickedIndex);
@@ -1605,7 +1847,6 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     case WM_COMMAND:
         // Handle search edit control text change
         if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == mgr->hwndSearch) {
-            // Get text from search box
             int length = GetWindowTextLength(mgr->hwndSearch);
             if (length > 0) {
                 wchar_t* buffer = new wchar_t[length + 1];
@@ -1615,8 +1856,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             } else {
                 mgr->searchText.clear();
             }
-            // Filter items based on search text
-            mgr->FilterItems();
+            if (mgr->snippetsMode) {
+                mgr->FilterSnippets();
+            } else {
+                mgr->FilterItems();
+            }
             return 0;
         }
         break;
@@ -1650,24 +1894,30 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 }
             }
             
-            // Check if right-click was on an item
             int clickedItemIndex = mgr->GetItemAtPosition(clientPt.x, clientPt.y);
-            // If no item was clicked but menu was triggered by keyboard (Shift+F10), use selected item
             if (clickedItemIndex < 0 && uMsg == WM_CONTEXTMENU) {
                 clickedItemIndex = mgr->selectedIndex;
             }
             
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
             HMENU hMenu = CreatePopupMenu();
             
-            // Check if clicked item is a text item
+            if (mgr->snippetsMode) {
+                if (clickedItemIndex >= 0 && clickedItemIndex < listSize) {
+                    AppendMenu(hMenu, MF_STRING, 102, L"Paste");
+                    AppendMenu(hMenu, MF_STRING, 105, L"Delete Snippet");
+                    AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+                }
+                AppendMenu(hMenu, MF_STRING, 104, L"Add Snippet...");
+                AppendMenu(hMenu, MF_STRING, 103, L"Manage Snippets...");
+            } else {
             bool isText = false;
-            if (clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+            if (clickedItemIndex >= 0 && clickedItemIndex < listSize) {
                 int actualIndex = mgr->filteredIndices[clickedItemIndex];
                 isText = mgr->IsTextItem(actualIndex);
             }
             
-            // Add transformation menu for text items
-            if (isText && clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+            if (isText && clickedItemIndex >= 0 && clickedItemIndex < listSize) {
                 HMENU hTransformMenu = CreatePopupMenu();
                 AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_UPPERCASE, L"Uppercase");
                 AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_LOWERCASE, L"Lowercase");
@@ -1682,13 +1932,13 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
             
-            // Add "Delete" option if an item was clicked or selected
-            if (clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
+            if (clickedItemIndex >= 0 && clickedItemIndex < listSize) {
                 AppendMenu(hMenu, MF_STRING, 101, L"Delete");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
             
             AppendMenu(hMenu, MF_STRING, 100, L"Clear List");
+            }
             
             SetForegroundWindow(hwnd);
             
@@ -1701,11 +1951,24 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             
             if (cmd == 100) {
                 mgr->ClearClipboardHistory();
-            } else if (cmd == 101 && clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
-                // Delete the clicked/selected item
+            } else if (cmd == 101 && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->DeleteItem(clickedItemIndex);
-            } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_PLAIN_TEXT && clickedItemIndex >= 0 && clickedItemIndex < (int)mgr->filteredIndices.size()) {
-                // Apply text transformation
+            } else if (cmd == 102 && clickedItemIndex >= 0 && clickedItemIndex < listSize && mgr->snippetsMode) {
+                mgr->PasteSnippet(mgr->filteredSnippetIndices[clickedItemIndex]);
+                mgr->HideListWindow();
+            } else if (cmd == 103 && mgr->snippetsMode) {
+                mgr->ShowSnippetsManagerDialog();
+            } else if (cmd == 104 && mgr->snippetsMode) {
+                mgr->ShowSnippetsManagerDialog();
+            } else if (cmd == 105 && clickedItemIndex >= 0 && clickedItemIndex < listSize && mgr->snippetsMode) {
+                int actualIdx = mgr->filteredSnippetIndices[clickedItemIndex];
+                if (actualIdx >= 0 && actualIdx < (int)mgr->snippets.size()) {
+                    mgr->snippets.erase(mgr->snippets.begin() + actualIdx);
+                    mgr->SaveSnippets();
+                    mgr->FilterSnippets();
+                    mgr->UpdateListWindow();
+                }
+            } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_PLAIN_TEXT && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->TransformTextItem(clickedItemIndex, cmd);
             }
             
@@ -1715,8 +1978,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
     case WM_MOUSEWHEEL:
         {
+            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            int maxScroll = std::max(0, (int)mgr->filteredIndices.size() - mgr->itemsPerPage);
+            int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
             int oldOffset = mgr->scrollOffset;
             
             if (delta > 0) {
@@ -1736,7 +2000,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             // Update rounded region when window is resized
             RECT rect;
             GetClientRect(hwnd, &rect);
-            HRGN hRgn = CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, 15, 15);
+            HRGN hRgn = CreateRectRgn(0, 0, rect.right + 1, rect.bottom + 1);
             SetWindowRgn(hwnd, hRgn, TRUE);
             DeleteObject(hRgn);
             break;
@@ -1744,12 +2008,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_CTLCOLOREDIT:
         {
-            // Style the search edit control with dark theme
+            // Style the search edit control - 5250 theme
             HDC hdcEdit = (HDC)wParam;
-            SetTextColor(hdcEdit, RGB(255, 255, 255)); // White text
-            SetBkColor(hdcEdit, RGB(0, 0, 0)); // Pure black background
-            // Return a brush handle for the background
-            static HBRUSH hDarkBrush = CreateSolidBrush(RGB(0, 0, 0));
+            SetTextColor(hdcEdit, Theme5250::TXT);
+            SetBkColor(hdcEdit, Theme5250::BG);
+            static HBRUSH hDarkBrush = CreateSolidBrush(Theme5250::BG);
             return (LRESULT)hDarkBrush;
         }
     
@@ -1820,9 +2083,20 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }
     
+    // Handle Escape - close overlay from search box
+    if (uMsg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        mgr->HideListWindow();
+        return 0;
+    }
+    
+    // Handle Ctrl+F in search box - select all to start/refine search (works for both clipboard and snippets)
+    if (uMsg == WM_KEYDOWN && wParam == 'F' && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+        SendMessage(hwnd, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    
     // Handle Enter key in search box
     if (uMsg == WM_KEYDOWN && wParam == VK_RETURN) {
-        // Get current search text and update filter before pasting
         int length = GetWindowTextLength(hwnd);
         if (length > 0) {
             wchar_t* buffer = new wchar_t[length + 1];
@@ -1832,14 +2106,25 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
         } else {
             mgr->searchText.clear();
         }
-        // Update filter to ensure it's current
-        mgr->FilterItems();
-        // Paste first filtered item (always index 0)
-        if (!mgr->filteredIndices.empty()) {
-            mgr->PasteItem(0);
-            mgr->HideListWindow();
+        if (mgr->snippetsMode) {
+            if (_wcsicmp(mgr->searchText.c_str(), L"*set") == 0) {
+                mgr->HideListWindow();
+                mgr->ShowSnippetsManagerDialog();
+            } else {
+                mgr->FilterSnippets();
+                if (!mgr->filteredSnippetIndices.empty()) {
+                    mgr->PasteSnippet(mgr->filteredSnippetIndices[0]);
+                    mgr->HideListWindow();
+                }
+            }
+        } else {
+            mgr->FilterItems();
+            if (!mgr->filteredIndices.empty()) {
+                mgr->PasteItem(0);
+                mgr->HideListWindow();
+            }
         }
-        return 0;  // Consume the Enter key
+        return 0;
     }
     
     // Call original window procedure for all other messages
@@ -1975,6 +2260,8 @@ void ClipboardManager::ShowListWindow() {
     if (hwndSearch) {
         SetWindowText(hwndSearch, L"");
     }
+    // Start in clipboard mode (not snippets)
+    snippetsMode = false;
     // Initialize filtered indices (show all items initially)
     FilterItems();
     // Reset selection to first item (if any items exist)
@@ -2038,10 +2325,15 @@ int ClipboardManager::GetItemAtPosition(int x, int y) {
     
     int filteredIndex = scrollOffset + (clickedY / itemHeight);
     
-    if (filteredIndex >= 0 && filteredIndex < (int)filteredIndices.size()) {
-        return filteredIndex; // Return filtered index (will be converted to actual index in PasteItem)
+    if (snippetsMode) {
+        if (filteredIndex >= 0 && filteredIndex < (int)filteredSnippetIndices.size()) {
+            return filteredIndex;
+        }
+    } else {
+        if (filteredIndex >= 0 && filteredIndex < (int)filteredIndices.size()) {
+            return filteredIndex;
+        }
     }
-    
     return -1;
 }
 
@@ -2102,7 +2394,7 @@ void ClipboardManager::ShowPreviewWindow(int itemIndex, int mouseX, int mouseY) 
     SetWindowPos(hwndPreview, HWND_TOPMOST, previewX, previewY, previewWidth, previewHeight, SWP_SHOWWINDOW | SWP_NOACTIVATE);
     
     // Update rounded region to match new window size
-    HRGN hPreviewRgn = CreateRoundRectRgn(0, 0, previewWidth + 1, previewHeight + 1, 15, 15);
+    HRGN hPreviewRgn = CreateRectRgn(0, 0, previewWidth + 1, previewHeight + 1);
     SetWindowRgn(hwndPreview, hPreviewRgn, TRUE);
     DeleteObject(hPreviewRgn);
     
@@ -2925,31 +3217,41 @@ void ClipboardManager::ProcessClipboard() {
     isProcessingClipboard = false;
 }
 
-void ClipboardManager::PlayClickSound() {
-    // Simple, fast, reliable sound playback using mciSendString
-    // This plays the MP3 file from the executable directory
-    
-    static std::wstring soundPath;
+static std::wstring GetClickSoundPath() {
+    static std::wstring path;
     static bool initialized = false;
-    
     if (!initialized) {
         initialized = true;
-        // Get executable directory once
         wchar_t exePath[MAX_PATH];
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
         wchar_t* lastSlash = wcsrchr(exePath, L'\\');
         if (lastSlash) *(lastSlash + 1) = L'\0';
-        soundPath = std::wstring(exePath) + L"click.mp3";
+        path = std::wstring(exePath) + L"click.mp3";
+    }
+    return path;
+}
+
+void ClipboardManager::WarmUpClickSound() {
+    std::wstring soundPath = GetClickSoundPath();
+    std::wstring openCmd = L"open \"" + soundPath + L"\" type MPEGVideo alias clicksnd_warmup";
+    if (mciSendString(openCmd.c_str(), nullptr, 0, nullptr) == 0) {
+        mciSendString(L"close clicksnd_warmup", nullptr, 0, nullptr);
+    }
+}
+
+void ClipboardManager::PlayClickSound() {
+    static bool aliasOpen = false;
+    std::wstring soundPath = GetClickSoundPath();
+    
+    if (aliasOpen) {
+        mciSendString(L"stop clicksnd", nullptr, 0, nullptr);
+        mciSendString(L"close clicksnd", nullptr, 0, nullptr);
+        aliasOpen = false;
     }
     
-    // Stop any previous playback
-    mciSendString(L"stop clicksnd", nullptr, 0, nullptr);
-    mciSendString(L"close clicksnd", nullptr, 0, nullptr);
-    
-    // Open with MPEGVideo device type (required for MP3)
     std::wstring openCmd = L"open \"" + soundPath + L"\" type MPEGVideo alias clicksnd";
     if (mciSendString(openCmd.c_str(), nullptr, 0, nullptr) == 0) {
-        // Play asynchronously
+        aliasOpen = true;
         mciSendString(L"play clicksnd", nullptr, 0, nullptr);
     }
 }
@@ -3248,6 +3550,93 @@ void ClipboardManager::ClearClipboardHistory() {
     UpdateListWindow();
 }
 
+void ClipboardManager::LoadClipboardHistory() {
+    try {
+        wchar_t appData[MAX_PATH];
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) return;
+        std::wstring path = std::wstring(appData) + L"\\clip2";
+        CreateDirectoryW(path.c_str(), nullptr);
+        path += L"\\history.dat";
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+        char magic[4];
+        DWORD read;
+        if (!ReadFile(h, magic, 4, &read, nullptr) || read != 4 || memcmp(magic, "CLP2", 4) != 0) { CloseHandle(h); return; }
+        DWORD version, count;
+        if (!ReadFile(h, &version, 4, &read, nullptr) || read != 4 || version != 1) { CloseHandle(h); return; }
+        if (!ReadFile(h, &count, 4, &read, nullptr) || read != 4) { CloseHandle(h); return; }
+        count = std::min(count, (DWORD)50);
+        for (DWORD i = 0; i < count; i++) {
+            DWORD fmt, size;
+            if (!ReadFile(h, &fmt, 4, &read, nullptr) || read != 4) break;
+            if (!ReadFile(h, &size, 4, &read, nullptr) || read != 4) break;
+            if (size == 0 || size > 500000) continue;
+            if (fmt != CF_UNICODETEXT && fmt != CF_TEXT) continue;
+            std::vector<BYTE> data(size);
+            if (!ReadFile(h, data.data(), size, &read, nullptr) || read != size) break;
+            if (fmt == CF_UNICODETEXT && size >= sizeof(wchar_t)) {
+                data.push_back(0);
+                data.push_back(0);
+            } else if (fmt == CF_TEXT && size >= 1) {
+                data.push_back(0);
+            }
+            try {
+                auto item = std::make_unique<ClipboardItem>(fmt, data);
+                clipboardHistory.push_back(std::move(item));
+            } catch (...) {}
+        }
+        CloseHandle(h);
+        if (!clipboardHistory.empty()) FilterItems();
+    } catch (...) {}
+}
+
+void ClipboardManager::SaveClipboardHistory() {
+    try {
+        wchar_t appData[MAX_PATH];
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) return;
+        std::wstring path = std::wstring(appData) + L"\\clip2";
+        CreateDirectoryW(path.c_str(), nullptr);
+        path += L"\\history.dat";
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+        DWORD written;
+        WriteFile(h, "CLP2", 4, &written, nullptr);
+        DWORD version = 1;
+        WriteFile(h, &version, 4, &written, nullptr);
+        size_t toSave = std::min(clipboardHistory.size(), (size_t)50);
+        DWORD count = (DWORD)toSave;
+        WriteFile(h, &count, 4, &written, nullptr);
+        for (size_t i = 0; i < toSave; i++) {
+            const auto& item = clipboardHistory[i];
+            const std::vector<BYTE>* data = item->GetFormatData(CF_UNICODETEXT);
+            UINT fmt = CF_UNICODETEXT;
+            if (!data || data->empty()) {
+                data = item->GetFormatData(CF_TEXT);
+                fmt = CF_TEXT;
+            }
+            if (!data || data->empty()) continue;
+            size_t size = data->size();
+            if (fmt == CF_UNICODETEXT && size >= sizeof(wchar_t)) {
+                size_t len = size / sizeof(wchar_t);
+                const wchar_t* p = (const wchar_t*)data->data();
+                while (len > 0 && p[len - 1] == 0) len--;
+                size = len * sizeof(wchar_t);
+            } else if (fmt == CF_TEXT && size >= 1) {
+                size_t len = 0;
+                const char* p = (const char*)data->data();
+                while (len < size && p[len]) len++;
+                size = len;
+            }
+            if (size == 0 || size > 500000) continue;
+            DWORD ufmt = (DWORD)fmt, usize = (DWORD)size;
+            WriteFile(h, &ufmt, 4, &written, nullptr);
+            WriteFile(h, &usize, 4, &written, nullptr);
+            WriteFile(h, data->data(), (DWORD)size, &written, nullptr);
+        }
+        CloseHandle(h);
+    } catch (...) {}
+}
+
 void ClipboardManager::FilterItems() {
     filteredIndices.clear();
     ClearMultiSelection(); // Clear multi-selection when filtering
@@ -3265,13 +3654,22 @@ void ClipboardManager::FilterItems() {
         for (size_t i = 0; i < clipboardHistory.size(); i++) {
             const auto& item = clipboardHistory[i];
             
-            // Search in preview, format name, and file type
+            // Search in full text content (handles line breaks, not just first 50 chars)
+            std::wstring fullText = item->GetFullSearchableText();
+            if (!fullText.empty()) {
+                std::wstring fullLower = fullText;
+                std::transform(fullLower.begin(), fullLower.end(), fullLower.begin(), ::towlower);
+                if (fullLower.find(searchLower) != std::wstring::npos) {
+                    filteredIndices.push_back((int)i);
+                    continue;
+                }
+            }
+            
+            // Fallback: search in preview, format name, and file type (for images, files, etc.)
             std::wstring previewLower = item->preview;
             std::transform(previewLower.begin(), previewLower.end(), previewLower.begin(), ::towlower);
-            
             std::wstring formatLower = item->formatName;
             std::transform(formatLower.begin(), formatLower.end(), formatLower.begin(), ::towlower);
-            
             std::wstring fileTypeLower = item->fileType;
             std::transform(fileTypeLower.begin(), fileTypeLower.end(), fileTypeLower.begin(), ::towlower);
             
@@ -3286,6 +3684,39 @@ void ClipboardManager::FilterItems() {
     // Reset scroll offset and selection when filtering
     scrollOffset = 0;
     if (filteredIndices.empty()) {
+        selectedIndex = -1;
+    } else {
+        selectedIndex = 0;
+    }
+    UpdateListWindow();
+}
+
+void ClipboardManager::FilterSnippets() {
+    filteredSnippetIndices.clear();
+    
+    if (searchText.empty()) {
+        for (size_t i = 0; i < snippets.size(); i++) {
+            filteredSnippetIndices.push_back((int)i);
+        }
+    } else {
+        std::wstring searchLower = searchText;
+        std::transform(searchLower.begin(), searchLower.end(), searchLower.begin(), ::towlower);
+        
+        for (size_t i = 0; i < snippets.size(); i++) {
+            std::wstring nameLower = snippets[i].name;
+            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::towlower);
+            std::wstring contentLower = snippets[i].content;
+            std::transform(contentLower.begin(), contentLower.end(), contentLower.begin(), ::towlower);
+            
+            if (nameLower.find(searchLower) != std::wstring::npos ||
+                contentLower.find(searchLower) != std::wstring::npos) {
+                filteredSnippetIndices.push_back((int)i);
+            }
+        }
+    }
+    
+    scrollOffset = 0;
+    if (filteredSnippetIndices.empty()) {
         selectedIndex = -1;
     } else {
         selectedIndex = 0;
@@ -3455,6 +3886,384 @@ void ClipboardManager::SaveHotkeyConfig() {
     }
 }
 
+void ClipboardManager::LoadSnippets() {
+    snippets.clear();
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2\\Snippets", 0, KEY_READ, &hKey);
+    if (result != ERROR_SUCCESS) return;
+
+    DWORD count = 0;
+    DWORD dataSize = sizeof(DWORD);
+    DWORD type = REG_DWORD;
+    result = RegQueryValueExW(hKey, L"Count", nullptr, &type, (LPBYTE)&count, &dataSize);
+    if (result != ERROR_SUCCESS || type != REG_DWORD) { RegCloseKey(hKey); return; }
+
+    wchar_t valueName[32];
+    for (DWORD i = 0; i < count && i < 500; i++) {
+        swprintf_s(valueName, L"N%d", i);
+        wchar_t buf[65536];  // 32KB max per snippet
+        dataSize = sizeof(buf);
+        type = REG_SZ;
+        result = RegQueryValueExW(hKey, valueName, nullptr, &type, (LPBYTE)buf, &dataSize);
+        if (result == ERROR_SUCCESS && type == REG_SZ) {
+            std::wstring full(buf);
+            size_t sep1 = full.find(L'\x01');
+            if (sep1 != std::wstring::npos) {
+                Snippet s;
+                s.name = full.substr(0, sep1);
+                size_t sep2 = full.find(L'\x02', sep1 + 1);
+                if (sep2 != std::wstring::npos) {
+                    s.content = full.substr(sep1 + 1, sep2 - sep1 - 1);
+                    s.contentPlain = full.substr(sep2 + 1);
+                } else {
+                    s.content = full.substr(sep1 + 1);
+                }
+                snippets.push_back(std::move(s));
+            }
+        }
+    }
+    RegCloseKey(hKey);
+}
+
+void ClipboardManager::SaveSnippets() {
+    HKEY hKey;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2\\Snippets", 0, nullptr,
+        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr);
+    if (result != ERROR_SUCCESS) return;
+
+    DWORD count = (DWORD)snippets.size();
+    RegSetValueExW(hKey, L"Count", 0, REG_DWORD, (BYTE*)&count, sizeof(DWORD));
+
+    wchar_t valueName[32];
+    for (size_t i = 0; i < snippets.size(); i++) {
+        swprintf_s(valueName, L"N%zu", i);
+        std::wstring full = snippets[i].name + L'\x01' + snippets[i].content;
+        if (!snippets[i].contentPlain.empty()) full += L'\x02' + snippets[i].contentPlain;
+        if (full.size() < 32767) {
+            RegSetValueExW(hKey, valueName, 0, REG_SZ, (BYTE*)full.c_str(),
+                (DWORD)(full.size() + 1) * sizeof(wchar_t));
+        }
+    }
+    RegCloseKey(hKey);
+}
+
+std::wstring ClipboardManager::ExpandSnippetPlaceholders(const std::wstring& content) {
+    std::wstring result = content;
+    auto now = std::chrono::system_clock::now();
+    time_t t = std::chrono::system_clock::to_time_t(now);
+    struct tm tmBuf;
+    if (localtime_s(&tmBuf, &t) == 0) {
+        wchar_t dateBuf[64], timeBuf[64], datetimeBuf[128];
+        wcsftime(dateBuf, 64, L"%Y-%m-%d", &tmBuf);
+        wcsftime(timeBuf, 64, L"%H:%M:%S", &tmBuf);
+        wcsftime(datetimeBuf, 128, L"%Y-%m-%d %H:%M:%S", &tmBuf);
+
+        auto replace = [&result](const wchar_t* from, const std::wstring& to) {
+            size_t pos = 0;
+            while ((pos = result.find(from, pos)) != std::wstring::npos) {
+                result.replace(pos, wcslen(from), to);
+                pos += to.size();
+            }
+        };
+        replace(L"{{date}}", dateBuf);
+        replace(L"{{time}}", timeBuf);
+        replace(L"{{datetime}}", datetimeBuf);
+        replace(L"{{year}}", std::to_wstring(tmBuf.tm_year + 1900));
+        replace(L"{{month}}", std::to_wstring(tmBuf.tm_mon + 1));
+        replace(L"{{day}}", std::to_wstring(tmBuf.tm_mday));
+        replace(L"{{hour}}", std::to_wstring(tmBuf.tm_hour));
+        replace(L"{{minute}}", std::to_wstring(tmBuf.tm_min));
+        replace(L"{{second}}", std::to_wstring(tmBuf.tm_sec));
+    }
+
+    if (result.find(L"{{clipboard}}") != std::wstring::npos) {
+        std::wstring clipText;
+        if (OpenClipboard(hwndMain)) {
+            HANDLE h = GetClipboardData(CF_UNICODETEXT);
+            if (h) {
+                const wchar_t* p = (const wchar_t*)GlobalLock(h);
+                if (p) {
+                    clipText = p;
+                    GlobalUnlock(h);
+                }
+            }
+            CloseClipboard();
+        }
+        size_t pos = 0;
+        while ((pos = result.find(L"{{clipboard}}", pos)) != std::wstring::npos) {
+            result.replace(pos, 13, clipText);
+            pos += clipText.size();
+        }
+    }
+    return result;
+}
+
+void ClipboardManager::PasteSnippet(int index) {
+    if (index < 0 || index >= (int)snippets.size()) return;
+
+    const Snippet& snip = snippets[index];
+    std::wstring text = ExpandSnippetPlaceholders(snip.content);
+    std::wstring plainText = snip.contentPlain.empty() ? text : ExpandSnippetPlaceholders(snip.contentPlain);
+    if (text.empty() && plainText.empty()) return;
+
+    isPasting = true;
+    Sleep(10);
+
+    UINT cfRtf = RegisterClipboardFormatA("Rich Text Format");
+    bool isRtf = IsRtfContent(text);
+
+    if (OpenClipboard(hwndMain)) {
+        EmptyClipboard();
+        bool success = false;
+        if (isRtf && cfRtf != 0) {
+            std::string rtfBytes;
+            for (wchar_t wc : text) rtfBytes += (char)(wc & 0xFF);
+            HGLOBAL hRtf = GlobalAlloc(GMEM_MOVEABLE, rtfBytes.size() + 1);
+            if (hRtf) {
+                char* pRtf = (char*)GlobalLock(hRtf);
+                if (pRtf) {
+                    memcpy(pRtf, rtfBytes.c_str(), rtfBytes.size() + 1);
+                    GlobalUnlock(hRtf);
+                    if (SetClipboardData(cfRtf, hRtf)) success = true;
+                    else GlobalFree(hRtf);
+                } else GlobalFree(hRtf);
+            }
+        }
+        if (!plainText.empty()) {
+            size_t dataSize = (plainText.length() + 1) * sizeof(wchar_t);
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
+            if (hMem) {
+                wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
+                if (pMem) {
+                    wcscpy_s(pMem, plainText.length() + 1, plainText.c_str());
+                    GlobalUnlock(hMem);
+                    if (SetClipboardData(CF_UNICODETEXT, hMem)) success = true;
+                } else GlobalFree(hMem);
+            } else GlobalFree(hMem);
+        } else if (!success && !text.empty()) {
+            size_t dataSize = (text.length() + 1) * sizeof(wchar_t);
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
+            if (hMem) {
+                wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
+                if (pMem) {
+                    wcscpy_s(pMem, text.length() + 1, text.c_str());
+                    GlobalUnlock(hMem);
+                    if (SetClipboardData(CF_UNICODETEXT, hMem)) success = true;
+                } else GlobalFree(hMem);
+            } else GlobalFree(hMem);
+        }
+        CloseClipboard();
+        if (success || !plainText.empty() || !text.empty()) {
+            lastPastedText = plainText.empty() ? text : plainText;
+            lastSequenceNumber = GetClipboardSequenceNumber();
+            if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+                SetForegroundWindow(previousFocusWindow);
+                SetFocus(previousFocusWindow);
+                Sleep(50);
+            }
+            Sleep(50);
+            keybd_event(VK_CONTROL, 0, 0, 0);
+            keybd_event('V', 0, 0, 0);
+            keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+            keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+            Sleep(500);
+        }
+    }
+    isPasting = false;
+}
+
+void ClipboardManager::ShowSnippetsManagerDialog() {
+    if (hwndSnippetsManager && IsWindow(hwndSnippetsManager)) {
+        SetForegroundWindow(hwndSnippetsManager);
+        return;
+    }
+    static bool msfteditLoaded = false;
+    if (!msfteditLoaded) {
+        LoadLibraryW(L"Msftedit.dll");
+        msfteditLoaded = true;
+    }
+    WNDCLASS wc = {};
+    wc.lpfnWndProc = SnippetsManagerProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"Clip2SnippetsManagerClass";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClass(&wc);
+
+    hwndSnippetsManager = CreateWindowExW(0, L"Clip2SnippetsManagerClass", L"clip2 - Snippets",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        100, 100, 450, 400, hwndMain, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    if (!hwndSnippetsManager) return;
+
+    CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_BORDER,
+        10, 10, 150, 280, hwndSnippetsManager, (HMENU)1001, GetModuleHandle(nullptr), nullptr);
+
+    CreateWindowExW(0, L"STATIC", L"Name:", WS_CHILD | WS_VISIBLE, 170, 10, 260, 18,
+        hwndSnippetsManager, nullptr, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER, 170, 28, 260, 22,
+        hwndSnippetsManager, (HMENU)1002, GetModuleHandle(nullptr), nullptr);
+
+    CreateWindowExW(0, L"STATIC", L"Content:", WS_CHILD | WS_VISIBLE, 170, 58, 260, 18,
+        hwndSnippetsManager, nullptr, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_NOOLEDRAGDROP,
+        170, 76, 260, 214, hwndSnippetsManager, (HMENU)1003, GetModuleHandle(nullptr), nullptr);
+
+    CreateWindowExW(0, L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        10, 300, 70, 28, hwndSnippetsManager, (HMENU)1004, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Update", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        85, 300, 70, 28, hwndSnippetsManager, (HMENU)1005, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Delete", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        160, 300, 70, 28, hwndSnippetsManager, (HMENU)1006, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        350, 300, 70, 28, hwndSnippetsManager, (HMENU)1007, GetModuleHandle(nullptr), nullptr);
+
+    HWND hList = GetDlgItem(hwndSnippetsManager, 1001);
+    for (const auto& s : snippets) {
+        SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)s.name.c_str());
+    }
+
+    static const wchar_t* placeholderHelp = L"Placeholders: {{date}}, {{time}}, {{datetime}}, {{year}}, {{month}}, {{day}}, {{hour}}, {{minute}}, {{second}}, {{clipboard}}";
+    CreateWindowExW(0, L"STATIC", placeholderHelp, WS_CHILD | WS_VISIBLE | SS_CENTER,
+        10, 335, 410, 30, hwndSnippetsManager, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    ShowWindow(hwndSnippetsManager, SW_SHOW);
+}
+
+LRESULT CALLBACK ClipboardManager::SnippetsManagerProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    ClipboardManager* mgr = instance;
+    static int selectedIdx = -1;
+
+    switch (uMsg) {
+    case WM_CLOSE:
+        if (mgr && mgr->hwndSnippetsManager == hwnd) mgr->hwndSnippetsManager = nullptr;
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (mgr && mgr->hwndSnippetsManager == hwnd) mgr->hwndSnippetsManager = nullptr;
+        return 0;
+
+    case WM_COMMAND:
+        if (!mgr) break;
+        if (LOWORD(wParam) == 1001 && HIWORD(wParam) == LBN_SELCHANGE) {
+            HWND hList = GetDlgItem(hwnd, 1001);
+            HWND hContent = GetDlgItem(hwnd, 1003);
+            int i = (int)SendMessageW(hList, LB_GETCURSEL, 0, 0);
+            if (i >= 0 && i < (int)mgr->snippets.size()) {
+                selectedIdx = i;
+                SetDlgItemTextW(hwnd, 1002, mgr->snippets[i].name.c_str());
+                if (IsRtfContent(mgr->snippets[i].content)) {
+                    std::string rtfBytes;
+                    for (wchar_t wc : mgr->snippets[i].content) rtfBytes += (char)(wc & 0xFF);
+                    StreamCookie cookie = { rtfBytes.c_str(), 0, rtfBytes.size(), nullptr };
+                    EDITSTREAM es = { (DWORD_PTR)&cookie, 0, RichEditStreamInCallback };
+                    SendMessage(hContent, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+                } else {
+                    SetDlgItemTextW(hwnd, 1003, mgr->snippets[i].content.c_str());
+                }
+            }
+        } else if (LOWORD(wParam) == 1004) {  // Add
+            wchar_t nameBuf[256];
+            GetDlgItemTextW(hwnd, 1002, nameBuf, 256);
+            if (nameBuf[0]) {
+                HWND hContent = GetDlgItem(hwnd, 1003);
+                std::string rtfOut;
+                StreamCookie cookie = { nullptr, 0, 0, &rtfOut };
+                EDITSTREAM es = { (DWORD_PTR)&cookie, 0, RichEditStreamOutCallback };
+                SendMessage(hContent, EM_STREAMOUT, SF_RTF, (LPARAM)&es);
+                std::wstring content, contentPlain;
+                if (!rtfOut.empty() && rtfOut.size() >= 5 && rtfOut[0] == '{' && rtfOut[1] == '\\' && (rtfOut[2] == 'r' || rtfOut[2] == 'R')) {
+                    content.resize(rtfOut.size());
+                    for (size_t j = 0; j < rtfOut.size(); j++) content[j] = (wchar_t)(unsigned char)rtfOut[j];
+                    wchar_t plainBuf[32768];
+                    GetWindowTextW(hContent, plainBuf, 32768);
+                    contentPlain = plainBuf;
+                } else {
+                    wchar_t contentBuf[32768];
+                    GetWindowTextW(hContent, contentBuf, 32768);
+                    content = contentBuf;
+                }
+                if (_wcsicmp(nameBuf, L"*set") == 0) {
+                    MessageBoxW(hwnd, L"Cannot use '*set' as snippet name (reserved).", L"clip2 Snippets", MB_OK | MB_ICONWARNING);
+                } else {
+                    Snippet s;
+                    s.name = nameBuf;
+                    s.content = content;
+                    s.contentPlain = contentPlain;
+                    mgr->snippets.push_back(s);
+                    mgr->SaveSnippets();
+                    SendMessageW(GetDlgItem(hwnd, 1001), LB_ADDSTRING, 0, (LPARAM)s.name.c_str());
+                    SetDlgItemTextW(hwnd, 1002, L"");
+                    SendMessage(GetDlgItem(hwnd, 1003), WM_SETTEXT, 0, (LPARAM)L"");
+                    selectedIdx = -1;
+                }
+            }
+        } else if (LOWORD(wParam) == 1005 && selectedIdx >= 0) {  // Update
+            wchar_t nameBuf[256];
+            GetDlgItemTextW(hwnd, 1002, nameBuf, 256);
+            if (nameBuf[0] && selectedIdx < (int)mgr->snippets.size()) {
+                HWND hContent = GetDlgItem(hwnd, 1003);
+                std::string rtfOut;
+                StreamCookie cookie = { nullptr, 0, 0, &rtfOut };
+                EDITSTREAM es = { (DWORD_PTR)&cookie, 0, RichEditStreamOutCallback };
+                SendMessage(hContent, EM_STREAMOUT, SF_RTF, (LPARAM)&es);
+                std::wstring content, contentPlain;
+                if (!rtfOut.empty() && rtfOut.size() >= 5 && rtfOut[0] == '{' && rtfOut[1] == '\\' && (rtfOut[2] == 'r' || rtfOut[2] == 'R')) {
+                    content.resize(rtfOut.size());
+                    for (size_t j = 0; j < rtfOut.size(); j++) content[j] = (wchar_t)(unsigned char)rtfOut[j];
+                    wchar_t plainBuf[32768];
+                    GetWindowTextW(hContent, plainBuf, 32768);
+                    contentPlain = plainBuf;
+                } else {
+                    wchar_t contentBuf[32768];
+                    GetWindowTextW(hContent, contentBuf, 32768);
+                    content = contentBuf;
+                }
+                if (_wcsicmp(nameBuf, L"*set") == 0) {
+                    MessageBoxW(hwnd, L"Cannot use '*set' as snippet name (reserved).", L"clip2 Snippets", MB_OK | MB_ICONWARNING);
+                } else {
+                    mgr->snippets[selectedIdx].name = nameBuf;
+                    mgr->snippets[selectedIdx].content = content;
+                    mgr->snippets[selectedIdx].contentPlain = contentPlain;
+                    mgr->SaveSnippets();
+                    HWND hList = GetDlgItem(hwnd, 1001);
+                    SendMessageW(hList, LB_DELETESTRING, selectedIdx, 0);
+                    SendMessageW(hList, LB_INSERTSTRING, selectedIdx, (LPARAM)nameBuf);
+                    SendMessageW(hList, LB_SETCURSEL, selectedIdx, 0);
+                }
+            }
+        } else if (LOWORD(wParam) == 1006 && selectedIdx >= 0) {  // Delete
+            if (selectedIdx < (int)mgr->snippets.size()) {
+                mgr->snippets.erase(mgr->snippets.begin() + selectedIdx);
+                mgr->SaveSnippets();
+                SendMessageW(GetDlgItem(hwnd, 1001), LB_DELETESTRING, selectedIdx, 0);
+                SetDlgItemTextW(hwnd, 1002, L"");
+                SetDlgItemTextW(hwnd, 1003, L"");
+                selectedIdx = (selectedIdx < (int)mgr->snippets.size()) ? selectedIdx : (int)mgr->snippets.size() - 1;
+                if (selectedIdx >= 0) {
+                    SendMessageW(GetDlgItem(hwnd, 1001), LB_SETCURSEL, selectedIdx, 0);
+                    SetDlgItemTextW(hwnd, 1002, mgr->snippets[selectedIdx].name.c_str());
+                    HWND hContent = GetDlgItem(hwnd, 1003);
+                    if (IsRtfContent(mgr->snippets[selectedIdx].content)) {
+                        std::string rtfBytes;
+                        for (wchar_t wc : mgr->snippets[selectedIdx].content) rtfBytes += (char)(wc & 0xFF);
+                        StreamCookie ck = { rtfBytes.c_str(), 0, rtfBytes.size(), nullptr };
+                        EDITSTREAM eds = { (DWORD_PTR)&ck, 0, RichEditStreamInCallback };
+                        SendMessage(hContent, EM_STREAMIN, SF_RTF, (LPARAM)&eds);
+                    } else {
+                        SetWindowTextW(hContent, mgr->snippets[selectedIdx].content.c_str());
+                    }
+                }
+            }
+        } else if (LOWORD(wParam) == 1007) {  // Close
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
+        }
+        break;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
 void ClipboardManager::ShowSettingsDialog() {
     // Show current hotkey and allow basic configuration
     std::wstring hotkeyText = L"Current hotkey: ";
@@ -3540,16 +4349,33 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
+static LONG WINAPI Clip2ExceptionHandler(LPEXCEPTION_POINTERS p) {
+    wchar_t buf[256];
+    swprintf_s(buf, L"clip2 crashed (exception 0x%08lX).", (unsigned long)p->ExceptionRecord->ExceptionCode);
+    MessageBoxW(nullptr, buf, L"clip2 Error", MB_OK | MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    ClipboardManager manager;
-    
-    if (!manager.Initialize()) {
-        MessageBox(nullptr, L"Failed to initialize clip2", L"Error", MB_OK | MB_ICONERROR);
+    SetUnhandledExceptionFilter(Clip2ExceptionHandler);
+    try {
+        ClipboardManager manager;
+        
+        if (!manager.Initialize()) {
+            MessageBox(nullptr, L"Failed to initialize clip2", L"Error", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+        
+        manager.Run();
+    } catch (const std::exception& e) {
+        std::string msg = std::string("clip2 crashed: ") + e.what();
+        std::wstring wmsg(msg.begin(), msg.end());
+        MessageBoxW(nullptr, wmsg.c_str(), L"clip2 Error", MB_OK | MB_ICONERROR);
+        return 1;
+    } catch (...) {
+        MessageBox(nullptr, L"clip2 crashed with an unknown error during startup.", L"clip2 Error", MB_OK | MB_ICONERROR);
         return 1;
     }
-    
-    manager.Run();
-    
     return 0;
 }
 

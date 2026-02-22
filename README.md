@@ -12,8 +12,8 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Quick Paste**: Press **1-9** or type number + Enter to paste items from the list
 - ✅ **Visual Feedback**: Click sound plays when items are copied
 - ✅ **System Tray Icon**: Always visible when running (uses ico2.ico)
-- ✅ **Modern OLED Theme**: Black background with bright red accents and rounded borders
-- ✅ **Search Functionality**: Filter clipboard history with Ctrl+F
+- ✅ **AS/400 5250 Theme**: Phosphor green on black, monospace font, sharp corners—classic terminal emulator look
+- ✅ **Search Functionality**: Deep search across full content (Ctrl+F), including text after line breaks
 - ✅ **Image/Video Thumbnails**: Visual previews for images and videos
 - ✅ **Format Preservation**: Pastes with original formatting (bold, colors, etc.)
 - ✅ **Plain Text Mode**: Hold Ctrl while pasting for plain text
@@ -25,8 +25,10 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Customizable Hotkeys**: Change the default hotkey through Settings menu
 - ✅ **Movable Window**: Drag the list window to position it anywhere on screen
 - ✅ **Smart Paste Detection**: Prevents pasted items from being re-added to history
-- ✅ **Stability**: Robust error handling prevents crashes with large or complex clipboard data
+- ✅ **Snippets/Templates**: Predefined text templates with placeholders; supports Rich Text (RTF)
+- ✅ **Clipboard Persistence**: History saved to disk; survives app restarts (up to 50 text items)
 - ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
+- ✅ **Snippets Overlay**: Switch between clipboard and snippets view with SS (press S twice)
 
 ## Building
 
@@ -77,11 +79,14 @@ The executable will be created as `clip2.exe`.
    - Hold **Ctrl** while pasting for plain text mode
 
 4. **Search**: Press **Ctrl+F** to focus the search box and filter items
+   - Search looks through the **full content** of each item, including text after line breaks
+   - Works in both clipboard and snippets overlays
 
 5. **Hide the list**: Press **Ctrl+NumPadDot** again, **Escape**, or click outside the window
 
 6. **System tray menu**: Right-click the tray icon for options
    - **Show Clipboard**: Show the clipboard list
+   - **Snippets**: Submenu to paste predefined text templates (or **Snippets...** to manage)
    - **Start with Windows**: Toggle auto-start with Windows (checkmark indicates enabled)
    - **Settings**: Configure hotkeys and other settings
    - **Exit**: Close the application
@@ -97,6 +102,15 @@ The executable will be created as `clip2.exe`.
 
 10. **Move window**: Click and drag the title bar or empty areas to move the list window
 
+11. **Snippets/templates**:
+    - **Tray menu**: Right-click tray icon → **Snippets** → select a snippet to paste
+    - **Snippets overlay**: With the clipboard list open, press **S** twice (**SS**) to switch to snippets view; press **SS** again to switch back to clipboard
+    - Search, select (arrows/numbers), and paste snippets the same way as clipboard items
+    - **Single-click** on a snippet to paste it and close the overlay
+    - **\*set shortcut**: In snippets overlay, type `*set` and press **Enter** to open Manage Snippets (cannot be used as a snippet name)
+    - **Placeholders** (in snippet content): `{{date}}`, `{{time}}`, `{{datetime}}`, `{{year}}`, `{{month}}`, `{{day}}`, `{{hour}}`, `{{minute}}`, `{{second}}`, `{{clipboard}}`
+    - **Manage Snippets**: Add, edit, delete snippets; Rich Edit supports RTF formatting (bold, colors, etc.)
+
 ## Technical Details
 
 - **Maximum History**: 100 items (optimized for stability)
@@ -110,9 +124,12 @@ The executable will be created as `clip2.exe`.
 - **Hotkey**: Ctrl+NumPadDot (low-level keyboard hook for reliable detection)
 - **Update Frequency**: Asynchronous clipboard monitoring with retry logic
 - **Duplicate Detection**: Prevents adding identical consecutive items by comparing all formats and data
-- **Sound**: Embedded click.mp3 plays on copy (with fallback to file)
+- **Sound**: Embedded click.mp3 plays on copy (fallback to file in exe directory); MCI warm-up ensures first copy plays sound
 - **Navigation**: Arrow keys, Page Up/Down, Home/End for list navigation
 - **Auto-hide**: List automatically hides when focus moves to another window
+- **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat` (binary format; up to 50 text items; load on startup, save on exit)
+- **Snippets storage**: Registry `HKEY_CURRENT_USER\Software\clip2\Snippets`
+- **Search**: Full-text search up to 500KB per item; finds matches across line breaks
 
 ## Requirements
 
@@ -131,6 +148,11 @@ The executable will be created as `clip2.exe`.
 ## Changelog
 
 ### Recent Features (Latest)
+- ✅ **Clipboard persistence**: History saved to `%APPDATA%\clip2\history.dat`; survives app restarts (up to 50 text items)
+- ✅ **Snippets overlay**: Press **SS** (S twice) to switch between clipboard and snippets; single-click to paste snippets
+- ✅ **Rich Text snippets**: Manage Snippets uses Rich Edit; RTF content pasted with formatting preserved
+- ✅ **\*set shortcut**: Type `*set` + Enter in snippets overlay to open Manage Snippets
+- ✅ **Deep search**: Search filters by full content (including text after line breaks), not just preview
 - ✅ **Delete individual items**: Delete key or right-click context menu to remove specific items
 - ✅ **Multi-paste mode**: Select multiple items (Ctrl+Click or Shift+Arrow) and paste them sequentially with newlines
 - ✅ **Text transformations**: Right-click menu for text manipulation (uppercase, lowercase, title case, remove line breaks, trim whitespace, remove formatting)
@@ -139,6 +161,9 @@ The executable will be created as `clip2.exe`.
 - ✅ **Smart paste detection**: Prevents pasted items from being re-added to clipboard history
 
 ### Recent Improvements & Fixes
+- ✅ **First-copy sound**: MCI warm-up at startup so click sound plays on first Ctrl+C
+- ✅ **Crash reporting**: Unhandled exceptions show error dialog instead of silent exit
+- ✅ **Clipboard file I/O**: Uses Windows API (CreateFileW/ReadFile) for reliable history load/save on MinGW
 
 ### Stability Enhancements
 - ✅ **Fixed crashes with multiple images**: Properly handles CF_BITMAP format conversion to DIB

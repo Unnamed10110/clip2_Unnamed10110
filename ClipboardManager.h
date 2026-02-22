@@ -128,6 +128,9 @@ struct ClipboardItem {
         return nullptr;
     }
     
+    // Get full text content for search (handles line breaks; empty for non-text)
+    std::wstring GetFullSearchableText() const;
+    
     ~ClipboardItem() {
         if (thumbnail) {
             DeleteObject(thumbnail);
@@ -189,8 +192,12 @@ private:
     bool IsTextItem(int actualIndex);
     void ProcessClipboard();
     void PlayClickSound();
+    void WarmUpClickSound();
     void ClearClipboardHistory();
+    void LoadClipboardHistory();
+    void SaveClipboardHistory();
     void FilterItems();
+    void FilterSnippets();
     void SetStartupWithWindows(bool enable);
     bool IsStartupWithWindows();
     void LoadHotkeyConfig();
@@ -218,7 +225,11 @@ private:
     std::wstring numberInput;
     std::wstring searchText;
     std::vector<int> filteredIndices;  // Indices of items matching search
+    std::vector<int> filteredSnippetIndices;  // Indices of snippets matching search (when snippetsMode)
     std::set<int> multiSelectedIndices;  // Indices of items selected for multi-paste (filtered indices)
+    bool snippetsMode;  // When true, overlay shows snippets instead of clipboard
+    DWORD lastSKeyTime;  // For detecting "ss" double-press
+    bool ignoreNextSChar;  // Ignore next 's' to prevent stray char when entering snippets via "ss"
     bool isPasting;
     bool isProcessingClipboard;  // Prevent re-entrant clipboard processing
     std::wstring lastPastedText;  // Store last pasted text to ignore it if it's copied back
@@ -229,6 +240,23 @@ private:
     WNDPROC originalSearchEditProc;  // Original window procedure for search edit control
     HotkeyConfig hotkeyConfig;  // Current hotkey configuration
     HWND hwndSettings;  // Settings dialog window
+    struct Snippet {
+        std::wstring name;
+        std::wstring content;       // RTF or plain text
+        std::wstring contentPlain;  // Plain text fallback (for RTF snippets)
+    };
+    
+    void LoadSnippets();
+    void SaveSnippets();
+    void PasteSnippet(int index);
+    std::wstring ExpandSnippetPlaceholders(const std::wstring& content);
+    void ShowSnippetsManagerDialog();
+    
+    static LRESULT CALLBACK SnippetsManagerProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    
+    std::vector<Snippet> snippets;
+    HWND hwndSnippetsManager;
+    
     static const UINT WM_MOUSELEAVE_CUSTOM = WM_USER + 4;
     
     static const UINT WM_TRAYICON = WM_USER + 1;
