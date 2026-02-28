@@ -1386,10 +1386,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     mgr->ignoreNextSChar = true;  // Discard the second 's' that would otherwise appear in search
                     if (mgr->hwndSearch) {
                         SetWindowText(mgr->hwndSearch, L"");
-                        SetFocus(mgr->hwndSearch);
-                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Type name, Enter to paste");
+                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
                     }
                     mgr->FilterSnippets();
+                    mgr->selectedIndex = (mgr->filteredSnippetIndices.empty() ? -1 : 0);
+                    SetFocus(mgr->hwndList);  // Keep focus on list so arrow keys work
                 } else {
                     mgr->FilterItems();
                     if (mgr->hwndSearch) {
@@ -2092,6 +2093,13 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
     // Handle Ctrl+F in search box - select all to start/refine search (works for both clipboard and snippets)
     if (uMsg == WM_KEYDOWN && wParam == 'F' && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
         SendMessage(hwnd, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    
+    // In snippets mode, forward Up/Down to list so arrow keys move selection even when search has focus
+    if (uMsg == WM_KEYDOWN && mgr->snippetsMode && (wParam == VK_UP || wParam == VK_DOWN)) {
+        SetFocus(mgr->hwndList);
+        SendMessage(mgr->hwndList, WM_KEYDOWN, wParam, lParam);
         return 0;
     }
     
