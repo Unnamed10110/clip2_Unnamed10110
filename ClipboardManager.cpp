@@ -1185,7 +1185,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         RECT titleRect = rect;
         titleRect.bottom = 30;
         if (mgr->snippetsMode) {
-            std::wstring titleText = L"clip2 Snippets (ss to switch back, Ctrl+F search, number+Enter to paste)";
+            std::wstring titleText = L"clip2 Snippets (Ctrl+Left = Clipboard | Ctrl+F search, Enter to paste)";
             DrawText(hdc, titleText.c_str(), -1, &titleRect, 
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
@@ -1197,7 +1197,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             RECT hintRect = titleRect;
             hintRect.top = 16;
             hintRect.bottom = 30;
-            DrawText(hdc, L"Press SS twice to open Snippets overlay", -1, &hintRect, 
+            DrawText(hdc, L"Ctrl+Right = Snippets | Ctrl+Left = Clipboard", -1, &hintRect, 
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         
@@ -1372,37 +1372,32 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     }
     
     case WM_KEYDOWN: {
-        // Detect "ss" (double-S) to toggle snippets mode - only when list has focus (not search)
-        HWND focusedWindow = GetFocus();
-        if (focusedWindow != mgr->hwndSearch && (wParam == 'S' || wParam == 's')) {
-            DWORD now = GetTickCount();
-            if (now - mgr->lastSKeyTime < 500 && mgr->lastSKeyTime != 0) {
-                mgr->lastSKeyTime = 0;
-                mgr->snippetsMode = !mgr->snippetsMode;
+        // Ctrl+Right = Snippets mode, Ctrl+Left = Clipboard mode
+        bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrlPressed && (wParam == VK_RIGHT || wParam == VK_LEFT)) {
+            bool wantSnippets = (wParam == VK_RIGHT);
+            if (mgr->snippetsMode != wantSnippets) {
+                mgr->snippetsMode = wantSnippets;
                 mgr->numberInput.clear();
                 mgr->scrollOffset = 0;
                 if (mgr->snippetsMode) {
                     mgr->searchText.clear();
-                    mgr->ignoreNextSChar = true;  // Discard the second 's' that would otherwise appear in search
                     if (mgr->hwndSearch) {
                         SetWindowText(mgr->hwndSearch, L"");
                         SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
                     }
                     mgr->FilterSnippets();
                     mgr->selectedIndex = (mgr->filteredSnippetIndices.empty() ? -1 : 0);
-                    SetFocus(mgr->hwndList);  // Keep focus on list so arrow keys work
+                    SetFocus(mgr->hwndList);
                 } else {
                     mgr->FilterItems();
                     if (mgr->hwndSearch) {
                         SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
                     }
                 }
-                return 0;
+                mgr->UpdateListWindow();
             }
-            mgr->lastSKeyTime = now;
-            return 0;  // Consume first 'S' to avoid beep
-        } else if (wParam != 'S' && wParam != 's') {
-            mgr->lastSKeyTime = 0;
+            return 0;
         }
         // Handle Enter key first
         if (wParam == VK_RETURN) {
@@ -2093,6 +2088,13 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
     // Handle Ctrl+F in search box - select all to start/refine search (works for both clipboard and snippets)
     if (uMsg == WM_KEYDOWN && wParam == 'F' && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
         SendMessage(hwnd, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    
+    // Ctrl+Left / Ctrl+Right switch between Clipboard and Snippets (from search box too)
+    if (uMsg == WM_KEYDOWN && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (wParam == VK_LEFT || wParam == VK_RIGHT)) {
+        SetFocus(mgr->hwndList);
+        SendMessage(mgr->hwndList, WM_KEYDOWN, wParam, lParam);
         return 0;
     }
     

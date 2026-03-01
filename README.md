@@ -28,7 +28,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Snippets/Templates**: Predefined text templates with placeholders; supports Rich Text (RTF)
 - ✅ **Clipboard Persistence**: History saved to disk; survives app restarts (up to 300 items)
 - ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
-- ✅ **Snippets Overlay**: Switch between clipboard and snippets view with SS (press S twice)
+- ✅ **Snippets Overlay**: **Ctrl+Right** = Snippets, **Ctrl+Left** = Clipboard (when overlay is open)
 
 ## Building
 
@@ -104,7 +104,7 @@ The executable will be created as `clip2.exe`.
 
 11. **Snippets/templates**:
     - **Tray menu**: Right-click tray icon → **Snippets** → select a snippet to paste
-    - **Snippets overlay**: With the clipboard list open, press **S** twice (**SS**) to switch to snippets view; press **SS** again to switch back to clipboard
+    - **Snippets overlay**: With the clipboard list open, press **Ctrl+Right** to switch to snippets view; **Ctrl+Left** to switch back to clipboard
     - Search, select (arrows/numbers), and paste snippets the same way as clipboard items
     - **Single-click** on a snippet to paste it and close the overlay
     - **\*set shortcut**: In snippets overlay, type `*set` and press **Enter** to open Manage Snippets (cannot be used as a snippet name)
@@ -149,7 +149,7 @@ The executable will be created as `clip2.exe`.
 
 ### Recent Features (Latest)
 - ✅ **Clipboard persistence**: History saved to `%APPDATA%\clip2\history.dat`; survives app restarts (up to 300 items)
-- ✅ **Snippets overlay**: Press **SS** (S twice) to switch between clipboard and snippets; single-click to paste snippets
+- ✅ **Snippets overlay**: **Ctrl+Right** / **Ctrl+Left** to switch between clipboard and snippets; single-click to paste snippets
 - ✅ **Rich Text snippets**: Manage Snippets uses Rich Edit; RTF content pasted with formatting preserved
 - ✅ **\*set shortcut**: Type `*set` + Enter in snippets overlay to open Manage Snippets
 - ✅ **Deep search**: Search filters by full content (including text after line breaks), not just preview
