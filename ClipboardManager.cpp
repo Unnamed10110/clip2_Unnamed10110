@@ -611,7 +611,7 @@ std::wstring ClipboardItem::GetFullSearchableText() const {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager() 
-    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), hotkeyRegistered(false), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     // Default hotkey: Ctrl+NumPadDot
@@ -767,7 +767,11 @@ bool ClipboardManager::Initialize() {
     // Load persisted clipboard history
     LoadClipboardHistory();
     
-    InstallKeyboardHook();
+    // RegisterHotKey works with elevated apps (UIPI); hook does not. Use RegisterHotKey first.
+    hotkeyRegistered = RegisterHotkey();
+    if (!hotkeyRegistered) {
+        InstallKeyboardHook();  // Fallback when hotkey is already taken by another app
+    }
     
     wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
     lastSequenceNumber = GetClipboardSequenceNumber();
@@ -821,8 +825,8 @@ void ClipboardManager::Stop() {
     SaveClipboardHistory();
     HideListWindow();
     RemoveTrayIcon();
-    UninstallKeyboardHook();
     UnregisterHotkey();
+    UninstallKeyboardHook();
     
     // Unregister clipboard listener
     if (hwndMain) {
@@ -941,8 +945,18 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         }
         break;
         
+    case WM_HOTKEY:
+        if (wParam == 1) {
+            if (mgr->listVisible) {
+                mgr->HideListWindow();
+            } else {
+                mgr->ShowListWindow();
+            }
+            return 0;
+        }
+        break;
     case WM_CLIPBOARD_HOTKEY:
-        // Toggle list window visibility
+        // Toggle list window visibility (from keyboard hook fallback)
         if (mgr->listVisible) {
             mgr->HideListWindow();
         } else {
@@ -1338,7 +1352,26 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             DrawText(hdc, item->preview.c_str(), -1, &previewRect, 
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             
-            // Draw format info - White text on black, black text on white
+            // Color swatch for hex color values
+            COLORREF swatchColor;
+            if (ClipboardManager::TryParseHexColor(item->preview, swatchColor)) {
+                int swatchSize = 14;
+                int swatchX = previewRect.right - swatchSize - 4;
+                int swatchY = yPos + (itemHeight - swatchSize) / 2;
+                RECT swatchRect = { swatchX, swatchY, swatchX + swatchSize, swatchY + swatchSize };
+                HBRUSH hSwatchBrush = CreateSolidBrush(swatchColor);
+                FillRect(hdc, &swatchRect, hSwatchBrush);
+                DeleteObject(hSwatchBrush);
+                HPEN hSwatchPen = CreatePen(PS_SOLID, 1, Theme5250::TXT);
+                HPEN hOldSwPen = (HPEN)SelectObject(hdc, hSwatchPen);
+                HBRUSH hOldSwBr = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, swatchRect.left, swatchRect.top, swatchRect.right, swatchRect.bottom);
+                SelectObject(hdc, hOldSwBr);
+                SelectObject(hdc, hOldSwPen);
+                DeleteObject(hSwatchPen);
+            }
+            
+            // Draw format info
             std::wstring info = item->formatName + L" - " + item->fileType;
             RECT infoRect = itemRect;
             infoRect.left = infoRect.right - 175;
@@ -1923,8 +1956,19 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_TRIM_WHITESPACE, L"Trim Whitespace");
                 AppendMenu(hTransformMenu, MF_SEPARATOR, 0, nullptr);
                 AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_PLAIN_TEXT, L"Plain Text (Remove Formatting)");
+                AppendMenu(hTransformMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_JSON_PRETTIFY, L"JSON Prettify");
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_XML_PRETTIFY, L"XML Prettify");
+                AppendMenu(hTransformMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_BASE64_ENCODE, L"Base64 Encode");
+                AppendMenu(hTransformMenu, MF_STRING, TRANSFORM_BASE64_DECODE, L"Base64 Decode");
                 
                 AppendMenu(hMenu, MF_STRING | MF_POPUP, (UINT_PTR)hTransformMenu, L"Transform Text");
+                AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+            }
+            
+            if (!mgr->multiSelectedIndices.empty() && mgr->multiSelectedIndices.size() >= 2) {
+                AppendMenu(hMenu, MF_STRING, CMD_MERGE_ITEMS, L"Merge Selected Items");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
             
@@ -1964,7 +2008,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     mgr->FilterSnippets();
                     mgr->UpdateListWindow();
                 }
-            } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_PLAIN_TEXT && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
+            } else if (cmd == CMD_MERGE_ITEMS && !mgr->snippetsMode) {
+                mgr->MergeSelectedItems();
+            } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_BASE64_DECODE && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->TransformTextItem(clickedItemIndex, cmd);
             }
             
@@ -2187,12 +2233,18 @@ void ClipboardManager::RemoveTrayIcon() {
     Shell_NotifyIcon(NIM_DELETE, &nid);
 }
 
-void ClipboardManager::RegisterHotkey() {
-    // Legacy function - not used, kept for compatibility
+bool ClipboardManager::RegisterHotkey() {
+    if (!hwndMain) return false;
+    // MOD_NOREPEAT (0x4000) prevents repeated triggers when key is held
+    UINT mod = hotkeyConfig.modifiers | 0x4000;  // MOD_NOREPEAT
+    return RegisterHotKey(hwndMain, 1, mod, hotkeyConfig.vkCode) != 0;
 }
 
 void ClipboardManager::UnregisterHotkey() {
-    // Legacy function - not used, kept for compatibility
+    if (hwndMain && hotkeyRegistered) {
+        UnregisterHotKey(hwndMain, 1);
+        hotkeyRegistered = false;
+    }
 }
 
 void ClipboardManager::InstallKeyboardHook() {
@@ -2794,6 +2846,72 @@ void ClipboardManager::ClearMultiSelection() {
     multiSelectedIndices.clear();
     multiSelectAnchor = -1;
     UpdateListWindow();
+}
+
+void ClipboardManager::MergeSelectedItems() {
+    if (multiSelectedIndices.size() < 2) return;
+    std::vector<int> sorted(multiSelectedIndices.begin(), multiSelectedIndices.end());
+    std::sort(sorted.begin(), sorted.end());
+    
+    std::wstring merged;
+    for (size_t i = 0; i < sorted.size(); i++) {
+        int fi = sorted[i];
+        if (fi < 0 || fi >= (int)filteredIndices.size()) continue;
+        int ai = filteredIndices[fi];
+        if (ai < 0 || ai >= (int)clipboardHistory.size()) continue;
+        std::wstring txt = clipboardHistory[ai]->GetFullSearchableText();
+        // Strip trailing nulls
+        while (!txt.empty() && txt.back() == L'\0') txt.pop_back();
+        if (!merged.empty()) merged += L"\r\n";
+        merged += txt;
+    }
+    if (merged.empty()) return;
+
+    // Create new item from merged text
+    size_t dataSize = (merged.length() + 1) * sizeof(wchar_t);
+    std::vector<BYTE> data(dataSize);
+    memcpy(data.data(), merged.c_str(), dataSize);
+    try {
+        auto item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, data);
+        clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
+        while (clipboardHistory.size() > (size_t)MAX_ITEMS) clipboardHistory.pop_back();
+    } catch (...) { return; }
+    ClearMultiSelection();
+    FilterItems();
+    UpdateListWindow();
+}
+
+bool ClipboardManager::TryParseHexColor(const std::wstring& text, COLORREF& outColor) {
+    // Match #RGB, #RRGGBB, or RRGGBB (6 hex digits)
+    std::wstring t = text;
+    // Strip whitespace
+    while (!t.empty() && iswspace(t.front())) t.erase(t.begin());
+    while (!t.empty() && iswspace(t.back())) t.pop_back();
+    // Strip trailing null
+    while (!t.empty() && t.back() == L'\0') t.pop_back();
+    
+    if (t.empty()) return false;
+    size_t start = 0;
+    if (t[0] == L'#') start = 1;
+    std::wstring hex = t.substr(start);
+    
+    if (hex.size() != 3 && hex.size() != 6) return false;
+    for (wchar_t c : hex) {
+        if (!iswxdigit(c)) return false;
+    }
+    
+    unsigned int r, g, b;
+    if (hex.size() == 3) {
+        r = (unsigned int)wcstoul(hex.substr(0, 1).c_str(), nullptr, 16); r = r * 16 + r;
+        g = (unsigned int)wcstoul(hex.substr(1, 1).c_str(), nullptr, 16); g = g * 16 + g;
+        b = (unsigned int)wcstoul(hex.substr(2, 1).c_str(), nullptr, 16); b = b * 16 + b;
+    } else {
+        r = (unsigned int)wcstoul(hex.substr(0, 2).c_str(), nullptr, 16);
+        g = (unsigned int)wcstoul(hex.substr(2, 2).c_str(), nullptr, 16);
+        b = (unsigned int)wcstoul(hex.substr(4, 2).c_str(), nullptr, 16);
+    }
+    outColor = RGB(r, g, b);
+    return true;
 }
 
 void ClipboardManager::ProcessClipboard() {
@@ -3463,12 +3581,125 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
             break;
         }
         case TRANSFORM_PLAIN_TEXT: {
-            // Same as TRANSFORM_PLAIN_TEXT - just use the text as-is (already extracted)
-            // This transformation removes formatting by only keeping plain text
+            break;
+        }
+        case TRANSFORM_JSON_PRETTIFY: {
+            // Simple JSON prettifier
+            std::wstring result;
+            result.reserve(transformedText.size() * 2);
+            int indent = 0;
+            bool inString = false;
+            bool escaped = false;
+            for (size_t i = 0; i < transformedText.size(); i++) {
+                wchar_t c = transformedText[i];
+                if (escaped) { result += c; escaped = false; continue; }
+                if (c == L'\\' && inString) { result += c; escaped = true; continue; }
+                if (c == L'"') { inString = !inString; result += c; continue; }
+                if (inString) { result += c; continue; }
+                if (c == L'{' || c == L'[') {
+                    result += c;
+                    indent++;
+                    result += L'\n';
+                    for (int j = 0; j < indent; j++) result += L"  ";
+                } else if (c == L'}' || c == L']') {
+                    indent--;
+                    result += L'\n';
+                    for (int j = 0; j < indent; j++) result += L"  ";
+                    result += c;
+                } else if (c == L',') {
+                    result += c;
+                    result += L'\n';
+                    for (int j = 0; j < indent; j++) result += L"  ";
+                } else if (c == L':') {
+                    result += L": ";
+                } else if (!iswspace(c)) {
+                    result += c;
+                }
+            }
+            transformedText = result;
+            break;
+        }
+        case TRANSFORM_XML_PRETTIFY: {
+            std::wstring result;
+            result.reserve(transformedText.size() * 2);
+            int indent = 0;
+            size_t i = 0;
+            while (i < transformedText.size()) {
+                if (transformedText[i] == L'<') {
+                    size_t end = transformedText.find(L'>', i);
+                    if (end == std::wstring::npos) { result += transformedText.substr(i); break; }
+                    std::wstring tag = transformedText.substr(i, end - i + 1);
+                    bool isClosing = (tag.size() > 1 && tag[1] == L'/');
+                    bool isSelfClosing = (tag.size() > 1 && tag[tag.size() - 2] == L'/');
+                    bool isDecl = (tag.size() > 1 && tag[1] == L'?');
+                    if (isClosing) indent = std::max(0, indent - 1);
+                    if (!result.empty() && result.back() != L'\n') result += L'\n';
+                    for (int j = 0; j < indent; j++) result += L"  ";
+                    result += tag;
+                    if (!isClosing && !isSelfClosing && !isDecl) indent++;
+                    i = end + 1;
+                } else {
+                    size_t next = transformedText.find(L'<', i);
+                    std::wstring content = (next == std::wstring::npos) ? transformedText.substr(i) : transformedText.substr(i, next - i);
+                    size_t s = content.find_first_not_of(L" \t\r\n");
+                    size_t e = content.find_last_not_of(L" \t\r\n");
+                    if (s != std::wstring::npos) result += content.substr(s, e - s + 1);
+                    i = (next == std::wstring::npos) ? transformedText.size() : next;
+                }
+            }
+            transformedText = result;
+            break;
+        }
+        case TRANSFORM_BASE64_ENCODE: {
+            static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            int wLen = WideCharToMultiByte(CP_UTF8, 0, transformedText.c_str(), (int)transformedText.size(), nullptr, 0, nullptr, nullptr);
+            std::string utf8(wLen, 0);
+            WideCharToMultiByte(CP_UTF8, 0, transformedText.c_str(), (int)transformedText.size(), &utf8[0], wLen, nullptr, nullptr);
+            std::string encoded;
+            encoded.reserve(((utf8.size() + 2) / 3) * 4);
+            for (size_t j = 0; j < utf8.size(); j += 3) {
+                unsigned int n = ((unsigned char)utf8[j]) << 16;
+                if (j + 1 < utf8.size()) n |= ((unsigned char)utf8[j + 1]) << 8;
+                if (j + 2 < utf8.size()) n |= (unsigned char)utf8[j + 2];
+                encoded += b64[(n >> 18) & 63];
+                encoded += b64[(n >> 12) & 63];
+                encoded += (j + 1 < utf8.size()) ? b64[(n >> 6) & 63] : '=';
+                encoded += (j + 2 < utf8.size()) ? b64[n & 63] : '=';
+            }
+            transformedText = std::wstring(encoded.begin(), encoded.end());
+            break;
+        }
+        case TRANSFORM_BASE64_DECODE: {
+            auto b64val = [](wchar_t c) -> int {
+                if (c >= L'A' && c <= L'Z') return c - L'A';
+                if (c >= L'a' && c <= L'z') return c - L'a' + 26;
+                if (c >= L'0' && c <= L'9') return c - L'0' + 52;
+                if (c == L'+') return 62;
+                if (c == L'/') return 63;
+                return -1;
+            };
+            std::wstring clean;
+            for (wchar_t c : transformedText) { if (!iswspace(c)) clean += c; }
+            std::string decoded;
+            for (size_t j = 0; j + 3 < clean.size(); j += 4) {
+                int a = b64val(clean[j]), b = b64val(clean[j+1]);
+                int c = b64val(clean[j+2]), d = b64val(clean[j+3]);
+                if (a < 0 || b < 0) break;
+                decoded += (char)((a << 2) | (b >> 4));
+                if (c >= 0) decoded += (char)(((b & 0xF) << 4) | (c >> 2));
+                if (d >= 0) decoded += (char)(((c & 3) << 6) | d);
+            }
+            int wLen = MultiByteToWideChar(CP_UTF8, 0, decoded.c_str(), (int)decoded.size(), nullptr, 0);
+            if (wLen > 0) {
+                transformedText.resize(wLen);
+                MultiByteToWideChar(CP_UTF8, 0, decoded.c_str(), (int)decoded.size(), &transformedText[0], wLen);
+            } else {
+                transformedText = std::wstring(decoded.begin(), decoded.end());
+            }
             break;
         }
         default:
-            return; // Unknown transformation type
+            return;
     }
     
     // Update the item with transformed text
