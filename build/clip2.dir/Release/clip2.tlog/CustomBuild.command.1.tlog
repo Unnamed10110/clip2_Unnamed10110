@@ -1,0 +1,10 @@
+^D:\REPOS\CLIP2_UNNAMED10110\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/repos/clip2_Unnamed10110 -BD:/repos/clip2_Unnamed10110/build --check-stamp-file D:/repos/clip2_Unnamed10110/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

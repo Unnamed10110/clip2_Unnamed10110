@@ -1,0 +1,10 @@
+^D:\REPOS\CLIP2_UNNAMED10110\BUILD\CMAKEFILES\56879B8CCDBCA6E6D92A121A230F710B\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/repos/clip2_Unnamed10110 -BD:/repos/clip2_Unnamed10110/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/repos/clip2_Unnamed10110/build/clip2.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

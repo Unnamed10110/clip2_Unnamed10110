@@ -15,6 +15,17 @@
 #include <objbase.h>
 #include <oleauto.h>
 #include <richedit.h>
+#ifdef HAVE_UIAUTOMATION
+#include <UIAutomation.h>
+#pragma comment(lib, "UIAutomationCore.lib")
+#endif
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mf.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
 #ifndef MSFTEDIT_CLASS
 #define MSFTEDIT_CLASS L"RichEdit50W"
 #endif
@@ -612,8 +623,8 @@ std::wstring ClipboardItem::GetFullSearchableText() const {
 }
 
 // ClipboardManager implementation
-ClipboardManager::ClipboardManager() 
-    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0) {
+ClipboardManager::ClipboardManager()
+    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     // Default hotkey: Ctrl+NumPadDot
@@ -870,6 +881,9 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
             AppendMenu(hMenu, MF_STRING, 1, L"Show Clipboard");
+#ifdef HAVE_UIAUTOMATION
+            AppendMenu(hMenu, MF_STRING, 6, L"Copy from focused control");
+#endif
             AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             // Snippets submenu
             if (!mgr->snippets.empty()) {
@@ -902,6 +916,11 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             
             if (cmd == 1) {
                 mgr->ShowListWindow();
+#ifdef HAVE_UIAUTOMATION
+            } else if (cmd == 6) {
+                if (!mgr->CopyFromFocusedControlViaUIA())
+                    MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
+#endif
             } else if (cmd == 2) {
                 mgr->Stop();
                 PostQuitMessage(0);
@@ -934,6 +953,11 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         // Handle menu commands (fallback, though TPM_RETURNCMD should handle it)
         if (LOWORD(wParam) == 1) {
             mgr->ShowListWindow();
+#ifdef HAVE_UIAUTOMATION
+        } else if (LOWORD(wParam) == 6) {
+            if (!mgr->CopyFromFocusedControlViaUIA())
+                MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
+#endif
         } else if (LOWORD(wParam) == 2) {
             mgr->Stop();
             PostQuitMessage(0);
@@ -955,6 +979,12 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 mgr->ShowListWindow();
             }
         }
+#ifdef HAVE_UIAUTOMATION
+        else if (wParam == ClipboardManager::HOTKEY_ID_COPY_FOCUSED) {
+            if (!mgr->CopyFromFocusedControlViaUIA())
+                MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
+        }
+#endif
         return 0;
     
     case WM_CLIPBOARD_HOTKEY:
@@ -982,6 +1012,9 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             if (currentSequence != mgr->lastSequenceNumber) {
                 // Play sound immediately when clipboard changes
                 mgr->PlayClickSound();
+                
+                // Bypass copy blocks: capture clipboard content immediately before any app can clear/replace it
+                mgr->TryCaptureClipboardImmediately();
                 
                 // Update sequence number
                 mgr->lastSequenceNumber = currentSequence;
@@ -2215,11 +2248,21 @@ void ClipboardManager::RegisterHotkey() {
     if (!RegisterHotKey(hwndMain, HOTKEY_ID_OVERLAY, mod, hotkeyConfig.vkCode)) {
         // If registration fails (e.g. key already taken), hook is still active
     }
+#ifdef HAVE_UIAUTOMATION
+    // Ctrl+F10: copy from focused control when app never puts content on clipboard
+    if (!RegisterHotKey(hwndMain, HOTKEY_ID_COPY_FOCUSED, MOD_CONTROL | MOD_NOREPEAT, VK_F10)) {
+        // Ctrl+F10 may be in use by another app
+    }
+#endif
 }
 
 void ClipboardManager::UnregisterHotkey() {
-    if (hwndMain)
+    if (hwndMain) {
         UnregisterHotKey(hwndMain, HOTKEY_ID_OVERLAY);
+#ifdef HAVE_UIAUTOMATION
+        UnregisterHotKey(hwndMain, HOTKEY_ID_COPY_FOCUSED);
+#endif
+    }
 }
 
 void ClipboardManager::InstallKeyboardHook() {
@@ -2823,6 +2866,322 @@ void ClipboardManager::ClearMultiSelection() {
     UpdateListWindow();
 }
 
+// Try to grab clipboard content immediately (e.g. before a blocking app clears it). Call from WM_CLIPBOARDUPDATE.
+bool ClipboardManager::TryCaptureClipboardImmediately() {
+    hasImmediateClipboardSnapshot = false;
+    immediateClipboardSnapshot.clear();
+    if (!hwndMain) return false;
+    if (!OpenClipboard(hwndMain)) return false;
+
+    const UINT priorityFormats[] = {
+        CF_HDROP, CF_UNICODETEXT, CF_TEXT, CF_BITMAP, CF_DIBV5, CF_DIB,
+        CF_ENHMETAFILE, CF_METAFILEPICT
+    };
+    auto isHandleBased = [](UINT fmt) {
+        return fmt == CF_BITMAP || fmt == CF_PALETTE || fmt == CF_METAFILEPICT ||
+               fmt == CF_ENHMETAFILE || fmt == 0x0082 || fmt == 0x008E || fmt == 0x0083;
+    };
+
+    try {
+        UINT primaryFormat = 0;
+        for (UINT pf : priorityFormats) {
+            if (IsClipboardFormatAvailable(pf)) { primaryFormat = pf; break; }
+        }
+        if (primaryFormat == 0) primaryFormat = EnumClipboardFormats(0);
+        if (primaryFormat == 0) { CloseClipboard(); return false; }
+
+        auto copyFormat = [&isHandleBased](UINT fmt, std::vector<BYTE>& out) -> bool {
+            if (isHandleBased(fmt) && fmt != CF_BITMAP) return false;
+            if (fmt == CF_BITMAP) {
+                HBITMAP hBmp = (HBITMAP)GetClipboardData(CF_BITMAP);
+                if (!hBmp) return false;
+                out = ConvertBitmapToDIB(hBmp);
+                return !out.empty();
+            }
+            HGLOBAL hMem = GetClipboardData(fmt);
+            if (!hMem) return false;
+            SIZE_T sz = GlobalSize(hMem);
+            if (sz == 0 || sz >= 100 * 1024 * 1024) return false;
+            void* p = GlobalLock(hMem);
+            if (!p) return false;
+            out.resize(sz);
+            memcpy(out.data(), p, sz);
+            GlobalUnlock(hMem);
+            return true;
+        };
+
+        std::vector<BYTE> primaryData;
+        UINT storageFormat = primaryFormat;
+        if (primaryFormat == CF_BITMAP) {
+            if (!copyFormat(CF_BITMAP, primaryData)) { CloseClipboard(); return false; }
+            storageFormat = CF_DIB;
+        } else if (isHandleBased(primaryFormat)) {
+            CloseClipboard();
+            return false;
+        } else {
+            if (!copyFormat(primaryFormat, primaryData)) { CloseClipboard(); return false; }
+        }
+        if (primaryData.empty() || primaryData.size() >= 200 * 1024 * 1024) {
+            CloseClipboard();
+            return false;
+        }
+        immediateClipboardSnapshot[storageFormat] = std::move(primaryData);
+
+        const int MAX_FORMATS_PER_ITEM = 5;
+        const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024;
+        int formatCount = 1;
+        size_t totalSize = immediateClipboardSnapshot[storageFormat].size();
+        UINT format = EnumClipboardFormats(0);
+        while (format != 0 && formatCount < MAX_FORMATS_PER_ITEM) {
+            if (format == primaryFormat || format == storageFormat) {
+                format = EnumClipboardFormats(format);
+                continue;
+            }
+            if (isHandleBased(format)) {
+                format = EnumClipboardFormats(format);
+                continue;
+            }
+            std::vector<BYTE> data;
+            if (!copyFormat(format, data) || data.empty() || data.size() >= 5 * 1024 * 1024 ||
+                totalSize + data.size() > MAX_FORMAT_SIZE_PER_ITEM) {
+                format = EnumClipboardFormats(format);
+                continue;
+            }
+            immediateClipboardSnapshot[format] = std::move(data);
+            totalSize += immediateClipboardSnapshot[format].size();
+            formatCount++;
+            format = EnumClipboardFormats(format);
+        }
+        hasImmediateClipboardSnapshot = true;
+    } catch (...) {
+        immediateClipboardSnapshot.clear();
+    }
+    CloseClipboard();
+    return hasImmediateClipboardSnapshot;
+}
+
+// Process a previously captured snapshot (bypasses apps that clear the clipboard after copy).
+void ClipboardManager::ProcessClipboardFromSnapshot() {
+    if (immediateClipboardSnapshot.empty()) return;
+    const UINT priorityFormats[] = {
+        CF_HDROP, CF_UNICODETEXT, CF_TEXT, CF_DIB, CF_DIBV5, CF_ENHMETAFILE, CF_METAFILEPICT
+    };
+    UINT primaryFormat = 0;
+    for (UINT pf : priorityFormats) {
+        auto it = immediateClipboardSnapshot.find(pf);
+        if (it != immediateClipboardSnapshot.end() && !it->second.empty()) {
+            primaryFormat = pf;
+            break;
+        }
+    }
+    if (primaryFormat == 0 && !immediateClipboardSnapshot.empty())
+        primaryFormat = immediateClipboardSnapshot.begin()->first;
+    if (primaryFormat == 0) {
+        immediateClipboardSnapshot.clear();
+        hasImmediateClipboardSnapshot = false;
+        return;
+    }
+    const std::vector<BYTE>& primaryData = immediateClipboardSnapshot[primaryFormat];
+    if (primaryData.empty() || primaryData.size() >= 200 * 1024 * 1024) {
+        immediateClipboardSnapshot.clear();
+        hasImmediateClipboardSnapshot = false;
+        return;
+    }
+    std::unique_ptr<ClipboardItem> item;
+    try {
+        item = std::make_unique<ClipboardItem>(primaryFormat, primaryData);
+    } catch (...) {
+        immediateClipboardSnapshot.clear();
+        hasImmediateClipboardSnapshot = false;
+        return;
+    }
+    for (const auto& kv : immediateClipboardSnapshot) {
+        if (kv.first == primaryFormat || kv.second.empty()) continue;
+        item->AddFormat(kv.first, kv.second);
+    }
+    bool isPastPaste = false;
+    if (!lastPastedText.empty() && item->format == CF_UNICODETEXT) {
+        try {
+            const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+            if (textData && textData->size() >= sizeof(wchar_t)) {
+                size_t len = textData->size() / sizeof(wchar_t);
+                if (len > 0) {
+                    const wchar_t* textPtr = (const wchar_t*)textData->data();
+                    size_t actualLen = len;
+                    for (size_t j = 0; j < len; j++) {
+                        if (textPtr[j] == L'\0') { actualLen = j; break; }
+                    }
+                    if (actualLen > 0) {
+                        std::wstring clipboardText(textPtr, actualLen);
+                        if (clipboardText == lastPastedText) {
+                            isPastPaste = true;
+                            lastPastedText.clear();
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+    bool isDuplicate = false;
+    if (!clipboardHistory.empty() && item && item->formats.size() > 0 && clipboardHistory[0]->formats.size() > 0) {
+        try {
+            const auto& lastItem = clipboardHistory[0];
+            if (item->formats.size() == lastItem->formats.size()) {
+                bool allMatch = true;
+                const size_t MAX_COMPARE = 10 * 1024 * 1024;
+                for (const auto& fp : item->formats) {
+                    const std::vector<BYTE>* lastData = lastItem->GetFormatData(fp.first);
+                    if (!lastData || lastData->size() != fp.second.size() || fp.second.size() > MAX_COMPARE ||
+                        (fp.second.size() > 0 && memcmp(fp.second.data(), lastData->data(), fp.second.size()) != 0)) {
+                        allMatch = false;
+                        break;
+                    }
+                }
+                if (allMatch) isDuplicate = true;
+            }
+        } catch (...) {}
+    }
+    if (!isDuplicate && !isPastPaste && item) {
+        try {
+            clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
+            while (clipboardHistory.size() > (size_t)MAX_ITEMS) clipboardHistory.pop_back();
+            if (listVisible) { FilterItems(); UpdateListWindow(); }
+        } catch (...) {}
+    }
+    immediateClipboardSnapshot.clear();
+    hasImmediateClipboardSnapshot = false;
+}
+
+#ifdef HAVE_UIAUTOMATION
+// Returns true if s is a known placeholder / "not accessible" message (not real content).
+static bool IsPlaceholderOrNotAccessibleText(const std::wstring& s) {
+    if (s.empty()) return true;
+    std::wstring lower;
+    lower.reserve(s.size());
+    for (wchar_t c : s) lower += (wchar_t)towlower(c);
+    // "The editor is not accessible at this time. To enable screen reader optimized mode, use Shift+Alt+F1"
+    if (lower.find(L"not accessible at this time") != std::wstring::npos) return true;
+    if (lower.find(L"screen reader optimized mode") != std::wstring::npos) return true;
+    return false;
+}
+
+// Get text from a UI Automation element (selection or document range). Returns true if text was written.
+static bool GetTextFromElement(IUIAutomation* pAutomation, IUIAutomationElement* pElement, std::wstring& outText) {
+    if (!pAutomation || !pElement) return false;
+    IUnknown* pPatternUnknown = nullptr;
+    HRESULT hr = pElement->GetCurrentPattern(UIA_TextPatternId, (IUnknown**)&pPatternUnknown);
+    if (FAILED(hr) || !pPatternUnknown) return false;
+    IUIAutomationTextPattern* pTextPattern = nullptr;
+    hr = pPatternUnknown->QueryInterface(__uuidof(IUIAutomationTextPattern), (void**)&pTextPattern);
+    pPatternUnknown->Release();
+    if (FAILED(hr) || !pTextPattern) return false;
+    std::wstring text;
+    IUIAutomationTextRangeArray* pRangeArray = nullptr;
+    hr = pTextPattern->GetSelection(&pRangeArray);
+    if (SUCCEEDED(hr) && pRangeArray) {
+        int length = 0;
+        if (SUCCEEDED(pRangeArray->get_Length(&length)) && length > 0) {
+            IUIAutomationTextRange* pRange = nullptr;
+            if (SUCCEEDED(pRangeArray->GetElement(0, &pRange)) && pRange) {
+                BSTR bstr = nullptr;
+                if (SUCCEEDED(pRange->GetText(-1, &bstr)) && bstr) {
+                    text = bstr;
+                    SysFreeString(bstr);
+                }
+                pRange->Release();
+            }
+        }
+        pRangeArray->Release();
+    }
+    if (text.empty()) {
+        IUIAutomationTextRange* pDocRange = nullptr;
+        hr = pTextPattern->get_DocumentRange(&pDocRange);
+        if (SUCCEEDED(hr) && pDocRange) {
+            BSTR bstr = nullptr;
+            if (SUCCEEDED(pDocRange->GetText(-1, &bstr)) && bstr) {
+                text = bstr;
+                SysFreeString(bstr);
+            }
+            pDocRange->Release();
+        }
+    }
+    pTextPattern->Release();
+    if (text.empty()) return false;
+    outText = std::move(text);
+    return true;
+}
+#endif
+
+// Get text from the currently focused control via UI Automation (bypasses apps that never put content on clipboard).
+bool ClipboardManager::CopyFromFocusedControlViaUIA() {
+#ifdef HAVE_UIAUTOMATION
+    IUIAutomation* pAutomation = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                                  __uuidof(IUIAutomation), (void**)&pAutomation);
+    if (FAILED(hr) || !pAutomation) return false;
+
+    std::wstring text;
+    IUIAutomationElement* pFocused = nullptr;
+    hr = pAutomation->GetFocusedElement(&pFocused);
+    if (SUCCEEDED(hr) && pFocused) {
+        GetTextFromElement(pAutomation, pFocused, text);
+        pFocused->Release();
+    }
+    // If focused element gave a placeholder (e.g. "The editor is not accessible at this time..."), try foreground window
+    if (IsPlaceholderOrNotAccessibleText(text)) {
+        text.clear();
+        HWND hFore = GetForegroundWindow();
+        if (hFore) {
+            IUIAutomationElement* pWindow = nullptr;
+            hr = pAutomation->ElementFromHandle(hFore, &pWindow);
+            if (SUCCEEDED(hr) && pWindow) {
+                GetTextFromElement(pAutomation, pWindow, text);
+                pWindow->Release();
+            }
+        }
+    }
+    pAutomation->Release();
+
+    if (text.empty() || IsPlaceholderOrNotAccessibleText(text)) return false;
+
+    // Add to our history and set system clipboard so user can paste
+    std::vector<BYTE> data((text.size() + 1) * sizeof(wchar_t));
+    memcpy(data.data(), text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+    std::unique_ptr<ClipboardItem> item;
+    try {
+        item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, data);
+    } catch (...) {
+        return true;  // We got text; clipboard set below may still work
+    }
+    clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
+    while (clipboardHistory.size() > (size_t)MAX_ITEMS) clipboardHistory.pop_back();
+    if (listVisible) { FilterItems(); UpdateListWindow(); }
+
+    if (hwndMain && OpenClipboard(hwndMain)) {
+        EmptyClipboard();
+        size_t byteLen = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
+        if (hMem) {
+            void* p = GlobalLock(hMem);
+            if (p) {
+                memcpy(p, text.c_str(), byteLen);
+                GlobalUnlock(hMem);
+                SetClipboardData(CF_UNICODETEXT, hMem);
+                lastSequenceNumber = GetClipboardSequenceNumber();
+            } else {
+                GlobalFree(hMem);
+            }
+        }
+        CloseClipboard();
+    }
+    PlayClickSound();
+    return true;
+#else
+    (void)0;
+    return false;
+#endif
+}
+
 void ClipboardManager::ProcessClipboard() {
     // Prevent re-entrant calls
     if (isProcessingClipboard) {
@@ -2830,6 +3189,13 @@ void ClipboardManager::ProcessClipboard() {
     }
     
     isProcessingClipboard = true;
+    
+    // If we captured the clipboard immediately (to bypass copy blocks), process that snapshot and exit
+    if (hasImmediateClipboardSnapshot) {
+        ProcessClipboardFromSnapshot();
+        isProcessingClipboard = false;
+        return;
+    }
     
     // Retry logic with delays to avoid interfering with copy operations
     const int MAX_RETRIES = 5;
@@ -3298,6 +3664,116 @@ static std::wstring GetClickMp3PathFromResource() {
     return s_path;
 }
 
+// Decode click.mp3 to a temporary WAV using Media Foundation; return path to WAV or empty on failure.
+// PlaySound(WAV file) is very reliable, so we prefer this over MCI/WMP for the copy sound.
+static std::wstring GetOrCreateClickWavPath() {
+    static std::wstring s_wavPath;
+    static bool s_succeeded = false;
+    if (s_succeeded) return s_wavPath;
+
+    std::wstring mp3Path = GetClickMp3PathFromResource();
+    if (mp3Path.empty()) return s_wavPath;
+
+    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    if (FAILED(hr)) return s_wavPath;
+
+    IMFSourceReader* pReader = nullptr;
+    std::wstring url = L"file:///";
+    for (wchar_t c : mp3Path) {
+        if (c == L'\\') url += L'/';
+        else if (c == L' ') url += L"%20";
+        else url += c;
+    }
+    hr = MFCreateSourceReaderFromURL(url.c_str(), nullptr, &pReader);
+    if (FAILED(hr) || !pReader) { MFShutdown(); return s_wavPath; }
+
+    IMFMediaType* pPCMType = nullptr;
+    hr = MFCreateMediaType(&pPCMType);
+    if (FAILED(hr)) { pReader->Release(); MFShutdown(); return s_wavPath; }
+    pPCMType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    pPCMType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    hr = pReader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, pPCMType);
+    pPCMType->Release();
+    if (FAILED(hr)) { pReader->Release(); MFShutdown(); return s_wavPath; }
+
+    IMFMediaType* pOutType = nullptr;
+    hr = pReader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, &pOutType);
+    if (FAILED(hr) || !pOutType) { pReader->Release(); MFShutdown(); return s_wavPath; }
+    UINT32 sampleRate = 44100, channels = 1;
+    pOutType->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sampleRate);
+    pOutType->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels);
+    pOutType->Release();
+
+    std::vector<BYTE> pcmData;
+    IMFSample* pSample = nullptr;
+    IMFMediaBuffer* pBuffer = nullptr;
+    while (true) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        hr = pReader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr, &flags, &ts, &pSample);
+        if (FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) break;
+        if (!pSample) continue;
+        hr = pSample->ConvertToContiguousBuffer(&pBuffer);
+        pSample->Release();
+        if (FAILED(hr) || !pBuffer) continue;
+        BYTE* pData = nullptr;
+        DWORD maxLen = 0, dataLen = 0;
+        hr = pBuffer->Lock(&pData, &maxLen, &dataLen);
+        if (SUCCEEDED(hr) && pData && dataLen > 0) {
+            pcmData.insert(pcmData.end(), pData, pData + dataLen);
+            pBuffer->Unlock();
+        }
+        pBuffer->Release();
+    }
+    pReader->Release();
+    MFShutdown();
+    if (pcmData.empty()) return s_wavPath;
+
+    wchar_t tempDir[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempDir) == 0) return s_wavPath;
+    s_wavPath = std::wstring(tempDir) + L"clip2_click.wav";
+    HANDLE hFile = CreateFileW(s_wavPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return s_wavPath;
+
+#pragma pack(push, 1)
+    struct WavHeader {
+        char riff[4];
+        DWORD fileLen;
+        char wave[4];
+        char fmt[4];
+        DWORD fmtLen;
+        WORD format;
+        WORD channels;
+        DWORD sampleRate;
+        DWORD byteRate;
+        WORD blockAlign;
+        WORD bitsPerSample;
+        char data[4];
+        DWORD dataLen;
+    };
+#pragma pack(pop)
+    WavHeader h = {};
+    memcpy(h.riff, "RIFF", 4);
+    h.fileLen = (DWORD)(sizeof(WavHeader) - 8 + pcmData.size());
+    memcpy(h.wave, "WAVE", 4);
+    memcpy(h.fmt, "fmt ", 4);
+    h.fmtLen = 16;
+    h.format = 1;
+    h.channels = (WORD)channels;
+    h.sampleRate = sampleRate;
+    h.bitsPerSample = 16;
+    h.blockAlign = (WORD)(channels * 2);
+    h.byteRate = sampleRate * h.blockAlign;
+    memcpy(h.data, "data", 4);
+    h.dataLen = (DWORD)pcmData.size();
+    DWORD written = 0;
+    WriteFile(hFile, &h, sizeof(h), &written, nullptr);
+    WriteFile(hFile, pcmData.data(), (DWORD)pcmData.size(), &written, nullptr);
+    CloseHandle(hFile);
+    s_succeeded = true;  // Only cache success so we retry on next call if startup failed
+    return s_wavPath;
+}
+
 // Play MP3 via Windows Media Player COM (used when MCI fails).
 static bool PlayMp3ViaWMP(const std::wstring& path) {
     static const CLSID CLSID_WMP = {
@@ -3414,12 +3890,34 @@ static const void* GetEmbeddedClickWav(size_t* outSize) {
 
 void ClipboardManager::WarmUpClickSound() {
     GetClickMp3PathFromResource();
+    std::wstring wavPath = GetOrCreateClickWavPath();
+    // Play once synchronously at startup so the first copy also sounds (primes the audio pipeline)
+    if (!wavPath.empty())
+        PlaySoundW(wavPath.c_str(), nullptr, SND_FILENAME | SND_SYNC | SND_NODEFAULT);
 }
 
 void ClipboardManager::PlayClickSound() {
+    // 1) Media Foundation: decode click.mp3 to WAV once, then PlaySound(WAV) — most reliable
+    std::wstring wavPath = GetOrCreateClickWavPath();
+    if (!wavPath.empty()) {
+        if (PlaySoundW(wavPath.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT))
+            return;
+    }
+    // 2) Try click.wav next to exe (no decode needed)
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) != 0) {
+        std::wstring dir = exePath;
+        size_t lastSlash = dir.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) dir.resize(lastSlash + 1);
+        std::wstring localWav = dir + L"click.wav";
+        if (GetFileAttributesW(localWav.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (PlaySoundW(localWav.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT))
+                return;
+        }
+    }
+    // 3) MCI with click.mp3
     std::wstring mp3Path = GetClickMp3PathFromResource();
     if (!mp3Path.empty()) {
-        // 1) Try MCI with embedded click.mp3
         static bool aliasOpen = false;
         if (aliasOpen) {
             mciSendString(L"stop clicksnd", nullptr, 0, nullptr);
@@ -3437,13 +3935,13 @@ void ClipboardManager::PlayClickSound() {
             mciSendString(L"play clicksnd", nullptr, 0, nullptr);
             return;
         }
-        // 2) Try WMP for click.mp3
+        // 4) WMP for click.mp3
         try {
             if (PlayMp3ViaWMP(mp3Path))
                 return;
         } catch (...) {}
     }
-    // 3) Fallback: embedded WAV so something always plays
+    // 5) Fallback: embedded WAV so something always plays
     size_t len = 0;
     const void* wav = GetEmbeddedClickWav(&len);
     if (wav && len > 0)

@@ -203,6 +203,8 @@ private:
     void LoadHotkeyConfig();
     void SaveHotkeyConfig();
     void ShowSettingsDialog();
+    // Read text from focused control via UI Automation (when app does not put anything on clipboard)
+    bool CopyFromFocusedControlViaUIA();
     
     struct HotkeyConfig {
         UINT modifiers;  // MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN
@@ -241,6 +243,8 @@ private:
     HotkeyConfig hotkeyConfig;  // Current hotkey configuration
     DWORD lastHotkeyTick;      // Debounce: last time overlay hotkey was handled
     HWND hwndSettings;  // Settings dialog window
+    std::map<UINT, std::vector<BYTE>> immediateClipboardSnapshot;  // Captured in WM_CLIPBOARDUPDATE before app can clear
+    bool hasImmediateClipboardSnapshot;
     struct Snippet {
         std::wstring name;
         std::wstring content;       // RTF or plain text
@@ -253,6 +257,10 @@ private:
     std::wstring ExpandSnippetPlaceholders(const std::wstring& content);
     void ShowSnippetsManagerDialog();
     
+    // Bypass copy blocks: capture clipboard immediately when it changes so we have content before apps clear it
+    bool TryCaptureClipboardImmediately();
+    void ProcessClipboardFromSnapshot();
+    
     static LRESULT CALLBACK SnippetsManagerProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     
     std::vector<Snippet> snippets;
@@ -264,6 +272,7 @@ private:
     static const UINT WM_CLIPBOARD_HOTKEY = WM_USER + 2;
     static const UINT WM_PROCESS_CLIPBOARD = WM_USER + 3;
     static const int HOTKEY_ID_OVERLAY = 1;
+    static const int HOTKEY_ID_COPY_FOCUSED = 2;  // Ctrl+F10: copy from focused control (UIA)
     static const int MAX_ITEMS = 300;
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;

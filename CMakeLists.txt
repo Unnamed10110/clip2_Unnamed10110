@@ -30,17 +30,38 @@ if(WIN32)
         "$<TARGET_FILE_DIR:${PROJECT_NAME}>/click.mp3"
     )
     
-    # Link necessary libraries
-    target_link_libraries(${PROJECT_NAME} 
-        user32 
-        gdi32 
-        shell32 
-        winmm
-        comctl32
-        shlwapi
-        ole32
-        oleaut32
+    # Link necessary libraries (mf* for Media Foundation: decode MP3 to WAV for reliable click sound)
+    set(CLIP2_LIBS user32 gdi32 shell32 winmm comctl32 shlwapi ole32 oleaut32 mfplat mf mfreadwrite mfuuid)
+    # UIAutomation: "Copy from focused control" when app never puts content on clipboard
+    set(UIAUTOMATION_SEARCH_PATHS "")
+    if(DEFINED ENV{WindowsSdkDir})
+        file(GLOB _winsdk_lib_vers "$ENV{WindowsSdkDir}Lib/*")
+        foreach(_ver ${_winsdk_lib_vers})
+            list(APPEND UIAUTOMATION_SEARCH_PATHS "${_ver}/um/x64" "${_ver}/um/x86")
+        endforeach()
+    endif()
+    file(GLOB _kits_lib_vers "C:/Program Files (x86)/Windows Kits/10/Lib/*")
+    foreach(_ver ${_kits_lib_vers})
+        if(IS_DIRECTORY "${_ver}")
+            list(APPEND UIAUTOMATION_SEARCH_PATHS "${_ver}/um/x64" "${_ver}/um/x86")
+        endif()
+    endforeach()
+    # Explicit fallbacks for common SDK versions (Windows SDK provides UIAutomationCore.lib)
+    list(APPEND UIAUTOMATION_SEARCH_PATHS
+        "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64"
+        "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x86"
+        "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x64"
+        "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x86"
     )
+    find_library(UIAUTOMATION_LIB NAMES UIAutomation UIAutomationCore PATHS ${UIAUTOMATION_SEARCH_PATHS} NO_DEFAULT_PATH)
+    if(UIAUTOMATION_LIB)
+        list(APPEND CLIP2_LIBS ${UIAUTOMATION_LIB})
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_UIAUTOMATION=1)
+        message(STATUS "UIAutomation found: ${UIAUTOMATION_LIB}")
+    else()
+        message(STATUS "UIAutomation not found; 'Copy from focused control' will be disabled")
+    endif()
+    target_link_libraries(${PROJECT_NAME} ${CLIP2_LIBS})
     
     # Set output directory
     set_target_properties(${PROJECT_NAME} PROPERTIES
