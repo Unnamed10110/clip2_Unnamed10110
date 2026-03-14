@@ -3668,9 +3668,8 @@ static std::wstring GetClickMp3PathFromResource() {
 // PlaySound(WAV file) is very reliable, so we prefer this over MCI/WMP for the copy sound.
 static std::wstring GetOrCreateClickWavPath() {
     static std::wstring s_wavPath;
-    static bool s_tried = false;
-    if (s_tried) return s_wavPath;
-    s_tried = true;
+    static bool s_succeeded = false;
+    if (s_succeeded) return s_wavPath;
 
     std::wstring mp3Path = GetClickMp3PathFromResource();
     if (mp3Path.empty()) return s_wavPath;
@@ -3771,6 +3770,7 @@ static std::wstring GetOrCreateClickWavPath() {
     WriteFile(hFile, &h, sizeof(h), &written, nullptr);
     WriteFile(hFile, pcmData.data(), (DWORD)pcmData.size(), &written, nullptr);
     CloseHandle(hFile);
+    s_succeeded = true;  // Only cache success so we retry on next call if startup failed
     return s_wavPath;
 }
 
@@ -3890,7 +3890,10 @@ static const void* GetEmbeddedClickWav(size_t* outSize) {
 
 void ClipboardManager::WarmUpClickSound() {
     GetClickMp3PathFromResource();
-    (void)GetOrCreateClickWavPath();  // Decode MP3→WAV once so first copy plays immediately
+    std::wstring wavPath = GetOrCreateClickWavPath();
+    // Play once synchronously at startup so the first copy also sounds (primes the audio pipeline)
+    if (!wavPath.empty())
+        PlaySoundW(wavPath.c_str(), nullptr, SND_FILENAME | SND_SYNC | SND_NODEFAULT);
 }
 
 void ClipboardManager::PlayClickSound() {
