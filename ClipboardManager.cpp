@@ -19,6 +19,13 @@
 #include <UIAutomation.h>
 #pragma comment(lib, "UIAutomationCore.lib")
 #endif
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mf.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
 #ifndef MSFTEDIT_CLASS
 #define MSFTEDIT_CLASS L"RichEdit50W"
 #endif
@@ -3657,6 +3664,116 @@ static std::wstring GetClickMp3PathFromResource() {
     return s_path;
 }
 
+// Decode click.mp3 to a temporary WAV using Media Foundation; return path to WAV or empty on failure.
+// PlaySound(WAV file) is very reliable, so we prefer this over MCI/WMP for the copy sound.
+static std::wstring GetOrCreateClickWavPath() {
+    static std::wstring s_wavPath;
+    static bool s_tried = false;
+    if (s_tried) return s_wavPath;
+    s_tried = true;
+
+    std::wstring mp3Path = GetClickMp3PathFromResource();
+    if (mp3Path.empty()) return s_wavPath;
+
+    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    if (FAILED(hr)) return s_wavPath;
+
+    IMFSourceReader* pReader = nullptr;
+    std::wstring url = L"file:///";
+    for (wchar_t c : mp3Path) {
+        if (c == L'\\') url += L'/';
+        else if (c == L' ') url += L"%20";
+        else url += c;
+    }
+    hr = MFCreateSourceReaderFromURL(url.c_str(), nullptr, &pReader);
+    if (FAILED(hr) || !pReader) { MFShutdown(); return s_wavPath; }
+
+    IMFMediaType* pPCMType = nullptr;
+    hr = MFCreateMediaType(&pPCMType);
+    if (FAILED(hr)) { pReader->Release(); MFShutdown(); return s_wavPath; }
+    pPCMType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    pPCMType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    hr = pReader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, pPCMType);
+    pPCMType->Release();
+    if (FAILED(hr)) { pReader->Release(); MFShutdown(); return s_wavPath; }
+
+    IMFMediaType* pOutType = nullptr;
+    hr = pReader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, &pOutType);
+    if (FAILED(hr) || !pOutType) { pReader->Release(); MFShutdown(); return s_wavPath; }
+    UINT32 sampleRate = 44100, channels = 1;
+    pOutType->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sampleRate);
+    pOutType->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels);
+    pOutType->Release();
+
+    std::vector<BYTE> pcmData;
+    IMFSample* pSample = nullptr;
+    IMFMediaBuffer* pBuffer = nullptr;
+    while (true) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        hr = pReader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr, &flags, &ts, &pSample);
+        if (FAILED(hr) || (flags & MF_SOURCE_READERF_ENDOFSTREAM)) break;
+        if (!pSample) continue;
+        hr = pSample->ConvertToContiguousBuffer(&pBuffer);
+        pSample->Release();
+        if (FAILED(hr) || !pBuffer) continue;
+        BYTE* pData = nullptr;
+        DWORD maxLen = 0, dataLen = 0;
+        hr = pBuffer->Lock(&pData, &maxLen, &dataLen);
+        if (SUCCEEDED(hr) && pData && dataLen > 0) {
+            pcmData.insert(pcmData.end(), pData, pData + dataLen);
+            pBuffer->Unlock();
+        }
+        pBuffer->Release();
+    }
+    pReader->Release();
+    MFShutdown();
+    if (pcmData.empty()) return s_wavPath;
+
+    wchar_t tempDir[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempDir) == 0) return s_wavPath;
+    s_wavPath = std::wstring(tempDir) + L"clip2_click.wav";
+    HANDLE hFile = CreateFileW(s_wavPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return s_wavPath;
+
+#pragma pack(push, 1)
+    struct WavHeader {
+        char riff[4];
+        DWORD fileLen;
+        char wave[4];
+        char fmt[4];
+        DWORD fmtLen;
+        WORD format;
+        WORD channels;
+        DWORD sampleRate;
+        DWORD byteRate;
+        WORD blockAlign;
+        WORD bitsPerSample;
+        char data[4];
+        DWORD dataLen;
+    };
+#pragma pack(pop)
+    WavHeader h = {};
+    memcpy(h.riff, "RIFF", 4);
+    h.fileLen = (DWORD)(sizeof(WavHeader) - 8 + pcmData.size());
+    memcpy(h.wave, "WAVE", 4);
+    memcpy(h.fmt, "fmt ", 4);
+    h.fmtLen = 16;
+    h.format = 1;
+    h.channels = (WORD)channels;
+    h.sampleRate = sampleRate;
+    h.bitsPerSample = 16;
+    h.blockAlign = (WORD)(channels * 2);
+    h.byteRate = sampleRate * h.blockAlign;
+    memcpy(h.data, "data", 4);
+    h.dataLen = (DWORD)pcmData.size();
+    DWORD written = 0;
+    WriteFile(hFile, &h, sizeof(h), &written, nullptr);
+    WriteFile(hFile, pcmData.data(), (DWORD)pcmData.size(), &written, nullptr);
+    CloseHandle(hFile);
+    return s_wavPath;
+}
+
 // Play MP3 via Windows Media Player COM (used when MCI fails).
 static bool PlayMp3ViaWMP(const std::wstring& path) {
     static const CLSID CLSID_WMP = {
@@ -3773,12 +3890,31 @@ static const void* GetEmbeddedClickWav(size_t* outSize) {
 
 void ClipboardManager::WarmUpClickSound() {
     GetClickMp3PathFromResource();
+    (void)GetOrCreateClickWavPath();  // Decode MP3→WAV once so first copy plays immediately
 }
 
 void ClipboardManager::PlayClickSound() {
+    // 1) Media Foundation: decode click.mp3 to WAV once, then PlaySound(WAV) — most reliable
+    std::wstring wavPath = GetOrCreateClickWavPath();
+    if (!wavPath.empty()) {
+        if (PlaySoundW(wavPath.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT))
+            return;
+    }
+    // 2) Try click.wav next to exe (no decode needed)
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) != 0) {
+        std::wstring dir = exePath;
+        size_t lastSlash = dir.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) dir.resize(lastSlash + 1);
+        std::wstring localWav = dir + L"click.wav";
+        if (GetFileAttributesW(localWav.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (PlaySoundW(localWav.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT))
+                return;
+        }
+    }
+    // 3) MCI with click.mp3
     std::wstring mp3Path = GetClickMp3PathFromResource();
     if (!mp3Path.empty()) {
-        // 1) Try MCI with embedded click.mp3
         static bool aliasOpen = false;
         if (aliasOpen) {
             mciSendString(L"stop clicksnd", nullptr, 0, nullptr);
@@ -3796,13 +3932,13 @@ void ClipboardManager::PlayClickSound() {
             mciSendString(L"play clicksnd", nullptr, 0, nullptr);
             return;
         }
-        // 2) Try WMP for click.mp3
+        // 4) WMP for click.mp3
         try {
             if (PlayMp3ViaWMP(mp3Path))
                 return;
         } catch (...) {}
     }
-    // 3) Fallback: embedded WAV so something always plays
+    // 5) Fallback: embedded WAV so something always plays
     size_t len = 0;
     const void* wav = GetEmbeddedClickWav(&len);
     if (wav && len > 0)
