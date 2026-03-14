@@ -29,6 +29,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Clipboard Persistence**: History saved to disk; survives app restarts (up to 300 items)
 - ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
 - ✅ **Snippets Overlay**: **Ctrl+Right** = Snippets, **Ctrl+Left** = Clipboard (when overlay is open)
+- ✅ **Copy from focused control**: When an app never puts content on the clipboard, use tray → **Copy from focused control** to read text from the focused control via UI Automation and add it to history (requires build with UIAutomation; see Technical Details)
 
 ## Building
 
@@ -130,6 +131,7 @@ The executable will be created as `clip2.exe`.
 - **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat` (binary format; up to 300 text items; load on startup, save on exit)
 - **Snippets storage**: Registry `HKEY_CURRENT_USER\Software\clip2\Snippets`
 - **Search**: Full-text search up to 500KB per item; finds matches across line breaks
+- **Copy from focused control**: Uses Windows UI Automation to read selected (or full) text from the focused control when the app does not put anything on the clipboard. The tray menu item appears only if the project is built with the UIAutomation library (e.g. when the Windows SDK is available and CMake finds `UIAutomation`). If you build with MinGW and the menu item is missing, build with Visual Studio and the Windows SDK to enable it.
 
 ## Requirements
 
