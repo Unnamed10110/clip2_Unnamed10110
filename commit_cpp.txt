@@ -4,7 +4,6 @@
 #include <ctime>
 #include <fstream>
 #include <algorithm>
-#include <cmath>
 #include <cwctype>
 #include <cstring>
 #include <shlobj.h>
@@ -13,7 +12,6 @@
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <objbase.h>
-#include <oleauto.h>
 #include <richedit.h>
 #ifndef MSFTEDIT_CLASS
 #define MSFTEDIT_CLASS L"RichEdit50W"
@@ -613,7 +611,7 @@ std::wstring ClipboardItem::GetFullSearchableText() const {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager() 
-    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     // Default hotkey: Ctrl+NumPadDot
@@ -770,7 +768,6 @@ bool ClipboardManager::Initialize() {
     LoadClipboardHistory();
     
     InstallKeyboardHook();
-    RegisterHotkey();  // Global hotkey as backup when hook doesn't fire (e.g. some fullscreen/admin apps)
     
     wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
     lastSequenceNumber = GetClipboardSequenceNumber();
@@ -944,26 +941,8 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         }
         break;
         
-    case WM_HOTKEY:
-        if (wParam == ClipboardManager::HOTKEY_ID_OVERLAY) {
-            DWORD now = GetTickCount();
-            if (now - mgr->lastHotkeyTick < 250) return 0;  // Debounce (hook and RegisterHotKey may both fire)
-            mgr->lastHotkeyTick = now;
-            if (mgr->listVisible) {
-                mgr->HideListWindow();
-            } else {
-                mgr->ShowListWindow();
-            }
-        }
-        return 0;
-    
     case WM_CLIPBOARD_HOTKEY:
-        // Toggle list window visibility (from low-level keyboard hook)
-        {
-            DWORD now = GetTickCount();
-            if (now - mgr->lastHotkeyTick < 250) return 0;  // Debounce
-            mgr->lastHotkeyTick = now;
-        }
+        // Toggle list window visibility
         if (mgr->listVisible) {
             mgr->HideListWindow();
         } else {
@@ -2209,17 +2188,11 @@ void ClipboardManager::RemoveTrayIcon() {
 }
 
 void ClipboardManager::RegisterHotkey() {
-    if (!hwndMain) return;
-    // RegisterHotKey works globally even when other apps have focus (backup to low-level hook)
-    UINT mod = hotkeyConfig.modifiers | 0x4000;  // MOD_NOREPEAT to avoid repeat while key held
-    if (!RegisterHotKey(hwndMain, HOTKEY_ID_OVERLAY, mod, hotkeyConfig.vkCode)) {
-        // If registration fails (e.g. key already taken), hook is still active
-    }
+    // Legacy function - not used, kept for compatibility
 }
 
 void ClipboardManager::UnregisterHotkey() {
-    if (hwndMain)
-        UnregisterHotKey(hwndMain, HOTKEY_ID_OVERLAY);
+    // Legacy function - not used, kept for compatibility
 }
 
 void ClipboardManager::InstallKeyboardHook() {
@@ -3246,208 +3219,43 @@ void ClipboardManager::ProcessClipboard() {
     isProcessingClipboard = false;
 }
 
-// Resource ID for embedded click.mp3 (must match ClipboardManager.rc)
-#define IDR_CLICK_MP3 101
-
-// Get path to click.mp3: first try embedded resource (extract to temp), then exe directory.
-static std::wstring GetClickMp3PathFromResource() {
-    static std::wstring s_path;
-    static bool s_tried = false;
-    if (s_tried) return s_path;
-    s_tried = true;
-
-    HMODULE hMod = GetModuleHandleW(nullptr);
-    HRSRC hRes = FindResourceW(hMod, MAKEINTRESOURCEW(IDR_CLICK_MP3), RT_RCDATA);
-    if (hRes) {
-        HGLOBAL hGlob = LoadResource(hMod, hRes);
-        if (hGlob) {
-            const void* pData = LockResource(hGlob);
-            if (pData) {
-                DWORD size = SizeofResource(hMod, hRes);
-                if (size > 0) {
-                    wchar_t tempDir[MAX_PATH];
-                    if (GetTempPathW(MAX_PATH, tempDir) != 0) {
-                        s_path = std::wstring(tempDir) + L"clip2_click.mp3";
-                        HANDLE hFile = CreateFileW(s_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                        if (hFile != INVALID_HANDLE_VALUE) {
-                            DWORD written = 0;
-                            BOOL ok = WriteFile(hFile, pData, size, &written, nullptr);
-                            CloseHandle(hFile);
-                            if (ok && written == size)
-                                return s_path;
-                        }
-                        s_path.clear();
-                    }
-                }
-            }
-        }
+static std::wstring GetClickSoundPath() {
+    static std::wstring path;
+    static bool initialized = false;
+    if (!initialized) {
+        initialized = true;
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+        if (lastSlash) *(lastSlash + 1) = L'\0';
+        path = std::wstring(exePath) + L"click.mp3";
     }
-
-    // Fallback: click.mp3 next to the executable
-    wchar_t exePath[MAX_PATH];
-    if (GetModuleFileNameW(hMod, exePath, MAX_PATH) != 0) {
-        std::wstring dir = exePath;
-        size_t lastSlash = dir.find_last_of(L"\\/");
-        if (lastSlash != std::wstring::npos)
-            dir.resize(lastSlash + 1);
-        dir += L"click.mp3";
-        DWORD att = GetFileAttributesW(dir.c_str());
-        if (att != INVALID_FILE_ATTRIBUTES && !(att & FILE_ATTRIBUTE_DIRECTORY))
-            s_path = dir;
-    }
-    return s_path;
-}
-
-// Play MP3 via Windows Media Player COM (used when MCI fails).
-static bool PlayMp3ViaWMP(const std::wstring& path) {
-    static const CLSID CLSID_WMP = {
-        0x6BF52A52, 0x394A, 0x11d3, { 0xB1, 0x53, 0x00, 0xC0, 0x4F, 0x79, 0xFA, 0xA6 }
-    };
-    IDispatch* pWmp = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_WMP, nullptr, CLSCTX_INPROC_SERVER, IID_IDispatch, (void**)&pWmp);
-    if (FAILED(hr) || !pWmp) return false;
-
-    OLECHAR* urlName = const_cast<OLECHAR*>(L"URL");
-    DISPID dispidUrl = 0;
-    hr = pWmp->GetIDsOfNames(IID_NULL, &urlName, 1, LOCALE_USER_DEFAULT, &dispidUrl);
-    if (FAILED(hr)) { pWmp->Release(); return false; }
-
-    BSTR bstrPath = SysAllocString(path.c_str());
-    if (!bstrPath) { pWmp->Release(); return false; }
-    VARIANT varPath;
-    VariantInit(&varPath);
-    varPath.vt = VT_BSTR;
-    varPath.bstrVal = bstrPath;
-
-    DISPPARAMS dp = {};
-    dp.cArgs = 1;
-    dp.rgvarg = &varPath;
-    dp.cNamedArgs = 1;
-    DISPID dispidPut = DISPID_PROPERTYPUT;
-    dp.rgdispidNamedArgs = &dispidPut;
-
-    hr = pWmp->Invoke(dispidUrl, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYPUT, &dp, nullptr, nullptr, nullptr);
-    SysFreeString(bstrPath);
-    if (FAILED(hr)) { pWmp->Release(); return false; }
-
-    OLECHAR* ctrlName = const_cast<OLECHAR*>(L"Controls");
-    DISPID dispidCtrl = 0;
-    hr = pWmp->GetIDsOfNames(IID_NULL, &ctrlName, 1, LOCALE_USER_DEFAULT, &dispidCtrl);
-    if (FAILED(hr)) { pWmp->Release(); return false; }
-
-    VARIANT varCtrl;
-    VariantInit(&varCtrl);
-    DISPPARAMS dpGet = {};
-    hr = pWmp->Invoke(dispidCtrl, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &dpGet, &varCtrl, nullptr, nullptr);
-    if (FAILED(hr) || varCtrl.vt != VT_DISPATCH || !varCtrl.pdispVal) {
-        pWmp->Release();
-        return false;
-    }
-
-    IDispatch* pCtrl = varCtrl.pdispVal;
-    OLECHAR* playName = const_cast<OLECHAR*>(L"play");
-    DISPID dispidPlay = 0;
-    hr = pCtrl->GetIDsOfNames(IID_NULL, &playName, 1, LOCALE_USER_DEFAULT, &dispidPlay);
-    if (FAILED(hr)) { pCtrl->Release(); pWmp->Release(); return false; }
-
-    DISPPARAMS dpPlay = {};
-    hr = pCtrl->Invoke(dispidPlay, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &dpPlay, nullptr, nullptr, nullptr);
-    pCtrl->Release();
-    pWmp->Release();
-    return SUCCEEDED(hr);
-}
-
-// Fallback: short WAV generated in-memory when click.mp3 cannot be played.
-static const void* GetEmbeddedClickWav(size_t* outSize) {
-#pragma pack(push, 1)
-    struct WavHeader {
-        char riff[4];
-        DWORD fileLen;
-        char wave[4];
-        char fmt[4];
-        DWORD fmtLen;
-        WORD format;
-        WORD channels;
-        DWORD sampleRate;
-        DWORD byteRate;
-        WORD blockAlign;
-        WORD bitsPerSample;
-        char data[4];
-        DWORD dataLen;
-    };
-#pragma pack(pop)
-    static std::vector<char> s_wav;
-    static bool s_built = false;
-    if (!s_built) {
-        s_built = true;
-        const DWORD sampleRate = 22050;
-        const DWORD durationMs = 60;
-        const DWORD numSamples = sampleRate * durationMs / 1000;
-        const DWORD dataLen = numSamples * 2;
-        const DWORD fileLen = sizeof(WavHeader) - 8 + dataLen;
-        s_wav.resize(sizeof(WavHeader) + dataLen);
-        WavHeader* h = (WavHeader*)s_wav.data();
-        memcpy(h->riff, "RIFF", 4);
-        h->fileLen = fileLen;
-        memcpy(h->wave, "WAVE", 4);
-        memcpy(h->fmt, "fmt ", 4);
-        h->fmtLen = 16;
-        h->format = 1;
-        h->channels = 1;
-        h->sampleRate = sampleRate;
-        h->byteRate = sampleRate * 2;
-        h->blockAlign = 2;
-        h->bitsPerSample = 16;
-        memcpy(h->data, "data", 4);
-        h->dataLen = dataLen;
-        short* samples = (short*)(s_wav.data() + sizeof(WavHeader));
-        for (DWORD i = 0; i < numSamples; i++) {
-            double t = (double)i / sampleRate;
-            double env = (t < 0.01) ? 1.0 : (t < 0.06 ? 1.0 - (t - 0.01) / 0.05 : 0.0);
-            double v = env * 0.35 * 32767.0 * std::sin(2.0 * 3.14159265358979 * 800.0 * t);
-            samples[i] = (short)(v < -32768 ? -32768 : (v > 32767 ? 32767 : (int)v));
-        }
-    }
-    if (outSize) *outSize = s_wav.size();
-    return s_wav.data();
+    return path;
 }
 
 void ClipboardManager::WarmUpClickSound() {
-    GetClickMp3PathFromResource();
+    std::wstring soundPath = GetClickSoundPath();
+    std::wstring openCmd = L"open \"" + soundPath + L"\" type MPEGVideo alias clicksnd_warmup";
+    if (mciSendString(openCmd.c_str(), nullptr, 0, nullptr) == 0) {
+        mciSendString(L"close clicksnd_warmup", nullptr, 0, nullptr);
+    }
 }
 
 void ClipboardManager::PlayClickSound() {
-    std::wstring mp3Path = GetClickMp3PathFromResource();
-    if (!mp3Path.empty()) {
-        // 1) Try MCI with embedded click.mp3
-        static bool aliasOpen = false;
-        if (aliasOpen) {
-            mciSendString(L"stop clicksnd", nullptr, 0, nullptr);
-            mciSendString(L"close clicksnd", nullptr, 0, nullptr);
-            aliasOpen = false;
-        }
-        std::wstring openCmd = L"open \"" + mp3Path + L"\" type MPEGVideo alias clicksnd";
-        MCIERROR err = mciSendString(openCmd.c_str(), nullptr, 0, nullptr);
-        if (err != 0) {
-            openCmd = L"open \"" + mp3Path + L"\" alias clicksnd";
-            err = mciSendString(openCmd.c_str(), nullptr, 0, nullptr);
-        }
-        if (err == 0) {
-            aliasOpen = true;
-            mciSendString(L"play clicksnd", nullptr, 0, nullptr);
-            return;
-        }
-        // 2) Try WMP for click.mp3
-        try {
-            if (PlayMp3ViaWMP(mp3Path))
-                return;
-        } catch (...) {}
+    static bool aliasOpen = false;
+    std::wstring soundPath = GetClickSoundPath();
+    
+    if (aliasOpen) {
+        mciSendString(L"stop clicksnd", nullptr, 0, nullptr);
+        mciSendString(L"close clicksnd", nullptr, 0, nullptr);
+        aliasOpen = false;
     }
-    // 3) Fallback: embedded WAV so something always plays
-    size_t len = 0;
-    const void* wav = GetEmbeddedClickWav(&len);
-    if (wav && len > 0)
-        PlaySoundA((LPCSTR)wav, nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    
+    std::wstring openCmd = L"open \"" + soundPath + L"\" type MPEGVideo alias clicksnd";
+    if (mciSendString(openCmd.c_str(), nullptr, 0, nullptr) == 0) {
+        aliasOpen = true;
+        mciSendString(L"play clicksnd", nullptr, 0, nullptr);
+    }
 }
 
 void ClipboardManager::DeleteItem(int filteredIndex) {

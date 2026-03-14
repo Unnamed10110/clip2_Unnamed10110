@@ -39,6 +39,7 @@ if(WIN32)
         comctl32
         shlwapi
         ole32
+        oleaut32
     )
     
     # Set output directory

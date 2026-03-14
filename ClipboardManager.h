@@ -171,7 +171,7 @@ private:
     void CreateTrayIcon();
     void UpdateTrayIcon();
     void RemoveTrayIcon();
-    bool RegisterHotkey();   // Returns true if successful (use over hook for elevated apps)
+    void RegisterHotkey();
     void UnregisterHotkey();
     void InstallKeyboardHook();
     void UninstallKeyboardHook();
@@ -189,8 +189,6 @@ private:
     void ClearMultiSelection();
     void DeleteItem(int filteredIndex);
     void TransformTextItem(int filteredIndex, int transformType);
-    void MergeSelectedItems();
-    static bool TryParseHexColor(const std::wstring& text, COLORREF& outColor);
     bool IsTextItem(int actualIndex);
     void ProcessClipboard();
     void PlayClickSound();
@@ -222,7 +220,6 @@ private:
     std::vector<std::unique_ptr<ClipboardItem>> clipboardHistory;
     UINT lastSequenceNumber;
     HHOOK hKeyboardHook;
-    bool hotkeyRegistered;  // true = using RegisterHotKey (works with elevated apps), false = using LL hook
     int scrollOffset;
     int itemsPerPage;
     std::wstring numberInput;
@@ -242,6 +239,7 @@ private:
     int multiSelectAnchor;  // Anchor index for Shift+Arrow multi-selection (-1 if no anchor)
     WNDPROC originalSearchEditProc;  // Original window procedure for search edit control
     HotkeyConfig hotkeyConfig;  // Current hotkey configuration
+    DWORD lastHotkeyTick;      // Debounce: last time overlay hotkey was handled
     HWND hwndSettings;  // Settings dialog window
     struct Snippet {
         std::wstring name;
@@ -265,6 +263,7 @@ private:
     static const UINT WM_TRAYICON = WM_USER + 1;
     static const UINT WM_CLIPBOARD_HOTKEY = WM_USER + 2;
     static const UINT WM_PROCESS_CLIPBOARD = WM_USER + 3;
+    static const int HOTKEY_ID_OVERLAY = 1;
     static const int MAX_ITEMS = 300;
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
@@ -276,12 +275,7 @@ private:
         TRANSFORM_TITLE_CASE = 202,
         TRANSFORM_REMOVE_LINE_BREAKS = 203,
         TRANSFORM_TRIM_WHITESPACE = 204,
-        TRANSFORM_PLAIN_TEXT = 205,
-        TRANSFORM_JSON_PRETTIFY = 206,
-        TRANSFORM_XML_PRETTIFY = 207,
-        TRANSFORM_BASE64_ENCODE = 208,
-        TRANSFORM_BASE64_DECODE = 209,
-        CMD_MERGE_ITEMS = 210
+        TRANSFORM_PLAIN_TEXT = 205  // Remove formatting, keep only plain text
     };
 };
 
