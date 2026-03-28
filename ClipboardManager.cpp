@@ -622,6 +622,152 @@ std::wstring ClipboardItem::GetFullSearchableText() const {
     return L"";
 }
 
+// Get normalized text from an item for duplicate detection (content up to first null, trimmed).
+// So "text" copied twice with different trailing nulls still counts as duplicate.
+static std::wstring GetNormalizedTextForDuplicateCheck(const ClipboardItem* item) {
+    if (!item) return L"";
+    const std::vector<BYTE>* udata = item->GetFormatData(CF_UNICODETEXT);
+    if (udata && udata->size() >= sizeof(wchar_t)) {
+        size_t len = udata->size() / sizeof(wchar_t);
+        const wchar_t* p = (const wchar_t*)udata->data();
+        size_t n = 0;
+        while (n < len && p[n] != L'\0') n++;
+        std::wstring s(p, n);
+        while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L'\r' || s.back() == L'\n'))
+            s.pop_back();
+        return s;
+    }
+    const std::vector<BYTE>* adata = item->GetFormatData(CF_TEXT);
+    if (adata && !adata->empty()) {
+        int wlen = MultiByteToWideChar(CP_ACP, 0, (const char*)adata->data(), (int)adata->size(), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring result(wlen, 0);
+            MultiByteToWideChar(CP_ACP, 0, (const char*)adata->data(), (int)adata->size(), &result[0], wlen);
+            size_t n = 0;
+            while (n < result.size() && result[n] != L'\0') n++;
+            result.resize(n);
+            while (!result.empty() && (result.back() == L' ' || result.back() == L'\t' || result.back() == L'\r' || result.back() == L'\n'))
+                result.pop_back();
+            return result;
+        }
+    }
+    return L"";
+}
+
+// Plain text from a history item for direct injection (paste without system clipboard).
+static std::wstring GetPlainTextForDirectPaste(const ClipboardItem* item) {
+    if (!item) return L"";
+    const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+    if (textData && textData->size() >= sizeof(wchar_t)) {
+        size_t len = textData->size() / sizeof(wchar_t);
+        const wchar_t* p = (const wchar_t*)textData->data();
+        size_t n = 0;
+        while (n < len && p[n] != L'\0') n++;
+        return std::wstring(p, n);
+    }
+    textData = item->GetFormatData(CF_TEXT);
+    if (textData && !textData->empty()) {
+        int wlen = MultiByteToWideChar(CP_ACP, 0, (const char*)textData->data(), (int)textData->size(), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring result(wlen, 0);
+            MultiByteToWideChar(CP_ACP, 0, (const char*)textData->data(), (int)textData->size(), &result[0], wlen);
+            size_t n = 0;
+            while (n < result.size() && result[n] != L'\0') n++;
+            result.resize(n);
+            return result;
+        }
+    }
+    if (!item->preview.empty() && item->preview[0] != L'[')
+        return item->preview;
+    return L"";
+}
+
+// Send Unicode string as keystrokes (KEYEVENTF_UNICODE). Unreliable in Electron/VS Code; prefer clipboard swap + Ctrl+V.
+static void SendUnicodeTextAsKeystrokes(const std::wstring& text) {
+    for (size_t i = 0; i < text.size(); i++) {
+        wchar_t ch = text[i];
+        if (ch == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') {
+            ch = L'\n';
+            i++;
+        }
+        INPUT inputs[2] = {};
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].ki.wVk = 0;
+        inputs[0].ki.wScan = ch;
+        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs[1].type = INPUT_KEYBOARD;
+        inputs[1].ki.wVk = 0;
+        inputs[1].ki.wScan = ch;
+        inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        SendInput(2, inputs, sizeof(INPUT));
+    }
+}
+
+// Release keys still held from Ctrl+F11 / Ctrl+Shift+F11 so typing or Ctrl+V is not corrupted.
+static void ReleaseHotkeyModifiersForPaste() {
+    if (GetAsyncKeyState(VK_F11) & 0x8000)
+        keybd_event(VK_F11, 0, KEYEVENTF_KEYUP, 0);
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+        keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    Sleep(20);
+}
+
+// Backup / restore CF_UNICODETEXT only (for paste-with-restore; VS Code/Electron need real Ctrl+V).
+static bool BackupClipboardUnicode(HWND hwnd, std::wstring& out) {
+    out.clear();
+    if (!OpenClipboard(hwnd)) return false;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const wchar_t* p = (const wchar_t*)GlobalLock(h);
+        if (p) { out = p; GlobalUnlock(h); }
+    }
+    CloseClipboard();
+    return true;
+}
+
+static bool SetClipboardUnicodeOnly(HWND hwnd, const std::wstring& text) {
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    size_t byteLen = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
+    if (!hMem) { CloseClipboard(); return false; }
+    void* p = GlobalLock(hMem);
+    if (!p) { GlobalFree(hMem); CloseClipboard(); return false; }
+    memcpy(p, text.c_str(), byteLen);
+    GlobalUnlock(hMem);
+    if (!SetClipboardData(CF_UNICODETEXT, hMem)) { GlobalFree(hMem); CloseClipboard(); return false; }
+    CloseClipboard();
+    return true;
+}
+
+static bool RestoreClipboardUnicode(HWND hwnd, const std::wstring& backup) {
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    if (!backup.empty()) {
+        size_t byteLen = (backup.size() + 1) * sizeof(wchar_t);
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
+        if (hMem) {
+            void* p = GlobalLock(hMem);
+            if (p) {
+                memcpy(p, backup.c_str(), byteLen);
+                GlobalUnlock(hMem);
+                SetClipboardData(CF_UNICODETEXT, hMem);
+            } else GlobalFree(hMem);
+        }
+    }
+    CloseClipboard();
+    return true;
+}
+
+static void SendCtrlV() {
+    keybd_event(VK_CONTROL, 0, 0, 0);
+    keybd_event('V', 0, 0, 0);
+    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+}
+
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager()
     : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false) {
@@ -985,6 +1131,13 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
         }
 #endif
+        else if (wParam == ClipboardManager::HOTKEY_ID_PASTE_FOCUSED) {
+            if (!mgr->PasteToFocusedControlWithoutClipboard(false))
+                MessageBoxW(hwnd, L"Could not paste: no text in history, or the target could not receive keystrokes.", L"clip2", MB_OK | MB_ICONINFORMATION);
+        } else if (wParam == ClipboardManager::HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD) {
+            if (!mgr->PasteToFocusedControlWithoutClipboard(true))
+                MessageBoxW(hwnd, L"Could not paste: no text in history, or clipboard could not be set.", L"clip2", MB_OK | MB_ICONINFORMATION);
+        }
         return 0;
     
     case WM_CLIPBOARD_HOTKEY:
@@ -2254,6 +2407,14 @@ void ClipboardManager::RegisterHotkey() {
         // Ctrl+F10 may be in use by another app
     }
 #endif
+    // Ctrl+F11: keystroke injection (bypasses paste blocks in Trillex / secure fields)
+    if (!RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED, MOD_CONTROL | MOD_NOREPEAT, VK_F11)) {
+        // Ctrl+F11 may be in use by another app
+    }
+    // Ctrl+Shift+F11: clipboard swap + Ctrl+V (Electron/VS Code where Unicode injection fails)
+    if (!RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F11)) {
+        // may be in use
+    }
 }
 
 void ClipboardManager::UnregisterHotkey() {
@@ -2262,6 +2423,8 @@ void ClipboardManager::UnregisterHotkey() {
 #ifdef HAVE_UIAUTOMATION
         UnregisterHotKey(hwndMain, HOTKEY_ID_COPY_FOCUSED);
 #endif
+        UnregisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED);
+        UnregisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD);
     }
 }
 
@@ -3041,6 +3204,13 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
             }
         } catch (...) {}
     }
+    // Same text copied twice (e.g. Ctrl+C twice on "text") → treat as duplicate even if raw bytes differ
+    if (!isDuplicate && !clipboardHistory.empty() && item) {
+        std::wstring newNorm = GetNormalizedTextForDuplicateCheck(item.get());
+        std::wstring lastNorm = GetNormalizedTextForDuplicateCheck(clipboardHistory[0].get());
+        if (!newNorm.empty() && newNorm == lastNorm)
+            isDuplicate = true;
+    }
     if (!isDuplicate && !isPastPaste && item) {
         try {
             clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
@@ -3180,6 +3350,68 @@ bool ClipboardManager::CopyFromFocusedControlViaUIA() {
     (void)0;
     return false;
 #endif
+}
+
+bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSwap) {
+    if (clipboardHistory.empty())
+        return false;
+    int actualIndex = -1;
+    if (listVisible && selectedIndex >= 0 && selectedIndex < (int)filteredIndices.size())
+        actualIndex = filteredIndices[selectedIndex];
+    else if (!clipboardHistory.empty())
+        actualIndex = 0;
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size())
+        return false;
+    const ClipboardItem* item = clipboardHistory[actualIndex].get();
+    std::wstring text = GetPlainTextForDirectPaste(item);
+    if (text.empty())
+        return false;
+    HWND hTarget = GetForegroundWindow();
+    if (hTarget == hwndList || hTarget == hwndMain || (hwndList && IsChild(hwndList, hTarget))) {
+        if (previousFocusWindow && IsWindow(previousFocusWindow) && previousFocusWindow != hwndList && previousFocusWindow != hwndMain)
+            hTarget = previousFocusWindow;
+        else
+            hTarget = nullptr;
+    }
+    if (!hTarget || !IsWindow(hTarget))
+        return false;
+
+    DWORD tgtTid = GetWindowThreadProcessId(hTarget, nullptr);
+    DWORD curTid = GetCurrentThreadId();
+    if (tgtTid != curTid)
+        AttachThreadInput(curTid, tgtTid, TRUE);
+    SetForegroundWindow(hTarget);
+    if (tgtTid != curTid)
+        AttachThreadInput(curTid, tgtTid, FALSE);
+
+    Sleep(80);
+    // Ctrl+F11 / Ctrl+Shift+F11 may still hold Ctrl, Shift, F11 — release before paste or typing
+    ReleaseHotkeyModifiersForPaste();
+
+    isPasting = true;
+    lastPastedText = text;
+
+    if (useClipboardSwap) {
+        std::wstring backup;
+        BackupClipboardUnicode(hwndMain, backup);
+        if (!SetClipboardUnicodeOnly(hwndMain, text)) {
+            RestoreClipboardUnicode(hwndMain, backup);
+            isPasting = false;
+            return false;
+        }
+        SendCtrlV();
+        Sleep(220);
+        RestoreClipboardUnicode(hwndMain, backup);
+        lastSequenceNumber = GetClipboardSequenceNumber();
+    } else {
+        // Keystroke injection (not paste): bypasses Trillex / banking apps that block Ctrl+V only
+        SendUnicodeTextAsKeystrokes(text);
+        Sleep(120);
+    }
+
+    isPasting = false;
+    PlayClickSound();
+    return true;
 }
 
 void ClipboardManager::ProcessClipboard() {
@@ -3550,6 +3782,13 @@ void ClipboardManager::ProcessClipboard() {
                                         isDuplicate = true;
                                     }
                                 }
+                            }
+                            // Same text copied twice (e.g. Ctrl+C twice on "text") → treat as duplicate even if raw bytes differ
+                            if (!isDuplicate && item) {
+                                std::wstring newNorm = GetNormalizedTextForDuplicateCheck(item.get());
+                                std::wstring lastNorm = GetNormalizedTextForDuplicateCheck(clipboardHistory[0].get());
+                                if (!newNorm.empty() && newNorm == lastNorm)
+                                    isDuplicate = true;
                             }
                         } catch (...) {
                             // Error during duplicate check, treat as not duplicate and continue
