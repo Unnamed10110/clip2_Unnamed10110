@@ -177,7 +177,8 @@ private:
     void UninstallKeyboardHook();
     static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
     void FocusListWindow();
-    void ShowListWindow();
+    void ShowListWindow(bool startInSnippetsMode = false);
+    void SetListSnippetsMode(bool wantSnippets);
     void HideListWindow();
     void UpdateListWindow();
     void ShowPreviewWindow(int itemIndex, int x, int y);
@@ -273,6 +274,8 @@ private:
     static const UINT WM_TRAYICON = WM_USER + 1;
     static const UINT WM_CLIPBOARD_HOTKEY = WM_USER + 2;
     static const UINT WM_PROCESS_CLIPBOARD = WM_USER + 3;
+    static const UINT WM_SNIPPETS_OVERLAY_HOTKEY = WM_USER + 5;
+    static const UINT WM_DISMISS_OVERLAY = WM_USER + 6;  // e.g. Esc from low-level hook
     static const int HOTKEY_ID_OVERLAY = 1;
     static const int HOTKEY_ID_COPY_FOCUSED = 2;  // Ctrl+F10: copy from focused control (UIA)
     static const int HOTKEY_ID_PASTE_FOCUSED = 3;           // Ctrl+F11: keystroke injection (bypass Trillex / paste blocks)

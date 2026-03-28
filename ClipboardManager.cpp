@@ -1154,6 +1154,27 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         }
         return 0;
     
+    case WM_SNIPPETS_OVERLAY_HOTKEY:
+        {
+            DWORD now = GetTickCount();
+            if (now - mgr->lastHotkeyTick < 250) return 0;  // Debounce (same tick as overlay hotkey)
+            mgr->lastHotkeyTick = now;
+        }
+        if (!mgr->listVisible) {
+            mgr->ShowListWindow(true);
+        } else if (mgr->snippetsMode) {
+            mgr->HideListWindow();
+        } else {
+            mgr->SetListSnippetsMode(true);
+        }
+        return 0;
+    
+    case WM_DISMISS_OVERLAY:
+        if (mgr->listVisible) {
+            mgr->HideListWindow();
+        }
+        return 0;
+    
     case WM_CLIPBOARDUPDATE:
         // Clipboard changed - instant notification from Windows
         if (!mgr->isPasting) {
@@ -1189,13 +1210,17 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             if (mgr->listVisible && mgr->hwndList && IsWindowVisible(mgr->hwndList)) {
                 HWND fgWindow = GetForegroundWindow();
                 if (fgWindow != mgr->hwndList && fgWindow != mgr->hwndSearch) {
-                    // Check if foreground window is a child of our list
-                    bool isChild = false;
-                    if (fgWindow != nullptr) {
-                        isChild = IsChild(mgr->hwndList, fgWindow) != FALSE;
-                    }
-                    if (!isChild) {
-                        mgr->HideListWindow();
+                    if (mgr->hwndPreview && fgWindow == mgr->hwndPreview) {
+                        // Preview popup is still part of the overlay session
+                    } else {
+                        // Check if foreground window is a child of our list
+                        bool isChild = false;
+                        if (fgWindow != nullptr) {
+                            isChild = IsChild(mgr->hwndList, fgWindow) != FALSE;
+                        }
+                        if (!isChild) {
+                            mgr->HideListWindow();
+                        }
                     }
                 }
             } else {
@@ -1582,28 +1607,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         // Ctrl+Right = Snippets mode, Ctrl+Left = Clipboard mode
         bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         if (ctrlPressed && (wParam == VK_RIGHT || wParam == VK_LEFT)) {
-            bool wantSnippets = (wParam == VK_RIGHT);
-            if (mgr->snippetsMode != wantSnippets) {
-                mgr->snippetsMode = wantSnippets;
-                mgr->numberInput.clear();
-                mgr->scrollOffset = 0;
-                if (mgr->snippetsMode) {
-                    mgr->searchText.clear();
-                    if (mgr->hwndSearch) {
-                        SetWindowText(mgr->hwndSearch, L"");
-                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
-                    }
-                    mgr->FilterSnippets();
-                    mgr->selectedIndex = (mgr->filteredSnippetIndices.empty() ? -1 : 0);
-                    SetFocus(mgr->hwndList);
-                } else {
-                    mgr->FilterItems();
-                    if (mgr->hwndSearch) {
-                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
-                    }
-                }
-                mgr->UpdateListWindow();
-            }
+            mgr->SetListSnippetsMode(wParam == VK_RIGHT);
             return 0;
         }
         // Handle Enter key first
@@ -2221,20 +2225,18 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_KILLFOCUS:
         {
-            // Hide list when it loses focus (unless focus is moving to a child control)
+            // Hide list when it loses focus (unless focus is moving to a child or the preview popup)
             HWND hwndGettingFocus = (HWND)wParam;
             
-            // Check if focus is moving to a child of the list window (like search box)
             bool isChildWindow = false;
             if (hwndGettingFocus != nullptr) {
                 isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
             }
+            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
             
-            if (!isChildWindow && hwndGettingFocus != hwnd) {
-                // Focus is moving to another window (not a child) - hide the list
+            if (!isChildWindow && !isPreviewWindow && hwndGettingFocus != hwnd) {
                 mgr->HideListWindow();
             } else {
-                // Focus is moving to a child control or staying in list - keep window on top
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
@@ -2242,15 +2244,14 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_ACTIVATE:
         if (wParam == WA_INACTIVE) {
-            // Window is becoming inactive - hide the list immediately
-            // Check if focus is going to a child control first
             HWND hwndGettingFocus = GetFocus();
             bool isChildWindow = false;
             if (hwndGettingFocus != nullptr) {
                 isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
             }
+            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
             
-            if (!isChildWindow) {
+            if (!isChildWindow && !isPreviewWindow) {
                 mgr->HideListWindow();
             }
         } else {
@@ -2259,20 +2260,18 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         break;
     
     case WM_NCACTIVATE:
-        // Hide list when window loses non-client activation (clicking title bar or outside)
         if (wParam == FALSE) {
-            // Check if focus is going to a child control
             HWND hwndGettingFocus = GetFocus();
             bool isChildWindow = false;
             if (hwndGettingFocus != nullptr) {
                 isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
             }
+            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
             
-            if (!isChildWindow) {
+            if (!isChildWindow && !isPreviewWindow) {
                 mgr->HideListWindow();
             }
         }
-        // Still call DefWindowProc to allow normal activation behavior
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }
     
@@ -2459,6 +2458,27 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
         
+        // Ctrl+Numpad0: toggle snippets overlay (open / switch clipboard→snippets / close)
+        if (wParam == WM_KEYDOWN && isCtrlPressed && !isAltPressed && !isShiftPressed && !isWinPressed &&
+            pKeyboard->vkCode == VK_NUMPAD0) {
+            PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
+            return 1;
+        }
+        
+        // Plain Esc closes overlay when list, search, preview, or a list child has focus
+        if (wParam == WM_KEYDOWN && pKeyboard->vkCode == VK_ESCAPE && mgr->listVisible) {
+            bool plainEsc = !isCtrlPressed && !isAltPressed && !isShiftPressed && !isWinPressed;
+            if (plainEsc) {
+                HWND fg = GetForegroundWindow();
+                if (fg == mgr->hwndList || fg == mgr->hwndSearch ||
+                    (mgr->hwndPreview && fg == mgr->hwndPreview) ||
+                    (fg && mgr->hwndList && IsChild(mgr->hwndList, fg))) {
+                    PostMessage(mgr->hwndMain, ClipboardManager::WM_DISMISS_OVERLAY, 0, 0);
+                    return 1;
+                }
+            }
+        }
+        
         // Check if all required modifiers are pressed
         bool modifiersMatch = true;
         if (hasCtrl && !isCtrlPressed) modifiersMatch = false;
@@ -2483,7 +2503,32 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
-void ClipboardManager::ShowListWindow() {
+void ClipboardManager::SetListSnippetsMode(bool wantSnippets) {
+    if (snippetsMode == wantSnippets) {
+        return;
+    }
+    snippetsMode = wantSnippets;
+    numberInput.clear();
+    scrollOffset = 0;
+    if (snippetsMode) {
+        searchText.clear();
+        if (hwndSearch) {
+            SetWindowText(hwndSearch, L"");
+            SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
+        }
+        FilterSnippets();
+        selectedIndex = (filteredSnippetIndices.empty() ? -1 : 0);
+        SetFocus(hwndList);
+    } else {
+        FilterItems();
+        if (hwndSearch) {
+            SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
+        }
+    }
+    UpdateListWindow();
+}
+
+void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
     if (!hwndList) {
         return;
     }
@@ -2503,15 +2548,25 @@ void ClipboardManager::ShowListWindow() {
     if (hwndSearch) {
         SetWindowText(hwndSearch, L"");
     }
-    // Start in clipboard mode (not snippets)
-    snippetsMode = false;
-    // Initialize filtered indices (show all items initially)
-    FilterItems();
-    // Reset selection to first item (if any items exist)
-    if (!filteredIndices.empty()) {
-        selectedIndex = 0;
+    if (startInSnippetsMode) {
+        snippetsMode = true;
+        if (hwndSearch) {
+            SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
+        }
+        FilterSnippets();
+        if (!filteredSnippetIndices.empty()) {
+            selectedIndex = 0;
+        } else {
+            selectedIndex = -1;
+        }
     } else {
-        selectedIndex = -1;
+        snippetsMode = false;
+        FilterItems();
+        if (!filteredIndices.empty()) {
+            selectedIndex = 0;
+        } else {
+            selectedIndex = -1;
+        }
     }
     ClearMultiSelection(); // Clear multi-selection when showing list
     // Show search box
