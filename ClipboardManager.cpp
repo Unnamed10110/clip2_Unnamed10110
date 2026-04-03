@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cwctype>
 #include <cstring>
+#include <map>
 #include <shlobj.h>
 #include <mmsystem.h>
 #include <commctrl.h>
@@ -682,27 +683,6 @@ static std::wstring GetPlainTextForDirectPaste(const ClipboardItem* item) {
     return L"";
 }
 
-// Send Unicode string as keystrokes (KEYEVENTF_UNICODE). Unreliable in Electron/VS Code; prefer clipboard swap + Ctrl+V.
-static void SendUnicodeTextAsKeystrokes(const std::wstring& text) {
-    for (size_t i = 0; i < text.size(); i++) {
-        wchar_t ch = text[i];
-        if (ch == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') {
-            ch = L'\n';
-            i++;
-        }
-        INPUT inputs[2] = {};
-        inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].ki.wVk = 0;
-        inputs[0].ki.wScan = ch;
-        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs[1].type = INPUT_KEYBOARD;
-        inputs[1].ki.wVk = 0;
-        inputs[1].ki.wScan = ch;
-        inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        SendInput(2, inputs, sizeof(INPUT));
-    }
-}
-
 // Release keys still held from Ctrl+F11 / Ctrl+Shift+F11 so typing or Ctrl+V is not corrupted.
 static void ReleaseHotkeyModifiersForPaste() {
     if (GetAsyncKeyState(VK_F11) & 0x8000)
@@ -712,19 +692,6 @@ static void ReleaseHotkeyModifiersForPaste() {
     if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
         keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
     Sleep(20);
-}
-
-// Backup / restore CF_UNICODETEXT only (for paste-with-restore; VS Code/Electron need real Ctrl+V).
-static bool BackupClipboardUnicode(HWND hwnd, std::wstring& out) {
-    out.clear();
-    if (!OpenClipboard(hwnd)) return false;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-        const wchar_t* p = (const wchar_t*)GlobalLock(h);
-        if (p) { out = p; GlobalUnlock(h); }
-    }
-    CloseClipboard();
-    return true;
 }
 
 static bool SetClipboardUnicodeOnly(HWND hwnd, const std::wstring& text) {
@@ -742,23 +709,111 @@ static bool SetClipboardUnicodeOnly(HWND hwnd, const std::wstring& text) {
     return true;
 }
 
-static bool RestoreClipboardUnicode(HWND hwnd, const std::wstring& backup) {
+// Full clipboard backup for swap+paste (not just CF_UNICODETEXT). CF_BITMAP is stored as CF_DIB bytes.
+static bool BackupClipboardSerialFormats(HWND hwnd, std::map<UINT, std::vector<BYTE>>& out) {
+    out.clear();
     if (!OpenClipboard(hwnd)) return false;
-    EmptyClipboard();
-    if (!backup.empty()) {
-        size_t byteLen = (backup.size() + 1) * sizeof(wchar_t);
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
-        if (hMem) {
-            void* p = GlobalLock(hMem);
-            if (p) {
-                memcpy(p, backup.c_str(), byteLen);
-                GlobalUnlock(hMem);
-                SetClipboardData(CF_UNICODETEXT, hMem);
-            } else GlobalFree(hMem);
+    const size_t MAX_TOTAL = 50 * 1024 * 1024;
+    size_t total = 0;
+    auto skipUnsupported = [](UINT f) {
+        return f == CF_PALETTE || f == CF_METAFILEPICT || f == CF_ENHMETAFILE ||
+               f == 0x0082 || f == 0x008E || f == 0x0083;
+    };
+    UINT fmt = 0;
+    while ((fmt = EnumClipboardFormats(fmt)) != 0) {
+        if (skipUnsupported(fmt)) continue;
+        if (fmt == CF_BITMAP) {
+            if (out.find(CF_DIB) != out.end()) continue;
+            HBITMAP hBmp = (HBITMAP)GetClipboardData(CF_BITMAP);
+            if (!hBmp) continue;
+            std::vector<BYTE> data = ConvertBitmapToDIB(hBmp);
+            if (data.empty() || total + data.size() > MAX_TOTAL) continue;
+            out[CF_DIB] = std::move(data);
+            total += out[CF_DIB].size();
+            continue;
         }
+        HGLOBAL hMem = GetClipboardData(fmt);
+        if (!hMem) continue;
+        SIZE_T sz = GlobalSize(hMem);
+        if (sz == 0 || sz >= 100 * 1024 * 1024) continue;
+        void* p = GlobalLock(hMem);
+        if (!p) continue;
+        std::vector<BYTE> data(sz);
+        memcpy(data.data(), p, sz);
+        GlobalUnlock(hMem);
+        if (total + data.size() > MAX_TOTAL) continue;
+        if (out.find(fmt) != out.end()) continue;
+        out[fmt] = std::move(data);
+        total += out[fmt].size();
     }
     CloseClipboard();
     return true;
+}
+
+static bool RestoreClipboardSerialFormats(HWND hwnd, const std::map<UINT, std::vector<BYTE>>& backup) {
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    for (const auto& kv : backup) {
+        if (kv.second.empty()) continue;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, kv.second.size());
+        if (!hMem) continue;
+        void* p = GlobalLock(hMem);
+        if (!p) {
+            GlobalFree(hMem);
+            continue;
+        }
+        memcpy(p, kv.second.data(), kv.second.size());
+        GlobalUnlock(hMem);
+        if (!SetClipboardData(kv.first, hMem))
+            GlobalFree(hMem);
+    }
+    CloseClipboard();
+    return true;
+}
+
+// Restore all formats from a history item (same strategy as PasteItem rich paste).
+static bool SetClipboardFromHistoryItem(HWND hwnd, const ClipboardItem* item) {
+    if (!item || item->formats.empty()) return false;
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    bool success = false;
+    for (const auto& formatPair : item->formats) {
+        UINT fmt = formatPair.first;
+        const std::vector<BYTE>& formatData = formatPair.second;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, formatData.size());
+        if (!hMem) continue;
+        void* pMem = GlobalLock(hMem);
+        if (!pMem) {
+            GlobalFree(hMem);
+            continue;
+        }
+        memcpy(pMem, formatData.data(), formatData.size());
+        GlobalUnlock(hMem);
+        if (SetClipboardData(fmt, hMem))
+            success = true;
+        else
+            GlobalFree(hMem);
+    }
+    CloseClipboard();
+    return success;
+}
+
+static std::wstring LastPastedTextFromItem(const ClipboardItem* item) {
+    if (!item) return L"";
+    const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+    if (textData && textData->size() >= sizeof(wchar_t)) {
+        size_t len = textData->size() / sizeof(wchar_t);
+        const wchar_t* textPtr = (const wchar_t*)textData->data();
+        size_t actualLen = len;
+        for (size_t j = 0; j < len; j++) {
+            if (textPtr[j] == L'\0') {
+                actualLen = j;
+                break;
+            }
+        }
+        if (actualLen > 0) return std::wstring(textPtr, actualLen);
+    }
+    return item->preview;
 }
 
 static void SendCtrlV() {
@@ -3145,7 +3200,7 @@ bool ClipboardManager::TryCaptureClipboardImmediately() {
         }
         immediateClipboardSnapshot[storageFormat] = std::move(primaryData);
 
-        const int MAX_FORMATS_PER_ITEM = 5;
+        const int MAX_FORMATS_PER_ITEM = 12;
         const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024;
         int formatCount = 1;
         size_t totalSize = immediateClipboardSnapshot[storageFormat].size();
@@ -3408,6 +3463,7 @@ bool ClipboardManager::CopyFromFocusedControlViaUIA() {
 }
 
 bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSwap) {
+    (void)useClipboardSwap;
     if (clipboardHistory.empty())
         return false;
     int actualIndex = -1;
@@ -3419,7 +3475,7 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
         return false;
     const ClipboardItem* item = clipboardHistory[actualIndex].get();
     std::wstring text = GetPlainTextForDirectPaste(item);
-    if (text.empty())
+    if (text.empty() && item->formats.empty())
         return false;
     HWND hTarget = GetForegroundWindow();
     if (hTarget == hwndList || hTarget == hwndMain || (hwndList && IsChild(hwndList, hTarget))) {
@@ -3440,29 +3496,39 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
         AttachThreadInput(curTid, tgtTid, FALSE);
 
     Sleep(80);
-    // Ctrl+F11 / Ctrl+Shift+F11 may still hold Ctrl, Shift, F11 — release before paste or typing
+    // Ctrl+F11 / Ctrl+Shift+F11 may still hold Ctrl, Shift, F11 — release before paste
     ReleaseHotkeyModifiersForPaste();
 
     isPasting = true;
-    lastPastedText = text;
 
-    if (useClipboardSwap) {
-        std::wstring backup;
-        BackupClipboardUnicode(hwndMain, backup);
-        if (!SetClipboardUnicodeOnly(hwndMain, text)) {
-            RestoreClipboardUnicode(hwndMain, backup);
-            isPasting = false;
-            return false;
-        }
-        SendCtrlV();
-        Sleep(220);
-        RestoreClipboardUnicode(hwndMain, backup);
-        lastSequenceNumber = GetClipboardSequenceNumber();
-    } else {
-        // Keystroke injection (not paste): bypasses Trillex / banking apps that block Ctrl+V only
-        SendUnicodeTextAsKeystrokes(text);
-        Sleep(120);
+    std::map<UINT, std::vector<BYTE>> backup;
+    if (!BackupClipboardSerialFormats(hwndMain, backup)) {
+        isPasting = false;
+        return false;
     }
+
+    bool clipboardSet = false;
+    if (!item->formats.empty())
+        clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
+    if (!clipboardSet && !text.empty())
+        clipboardSet = SetClipboardUnicodeOnly(hwndMain, text);
+    if (!clipboardSet) {
+        RestoreClipboardSerialFormats(hwndMain, backup);
+        isPasting = false;
+        return false;
+    }
+
+    if (!text.empty())
+        lastPastedText = text;
+    else
+        lastPastedText = LastPastedTextFromItem(item);
+
+    lastSequenceNumber = GetClipboardSequenceNumber();
+
+    SendCtrlV();
+    Sleep(220);
+    RestoreClipboardSerialFormats(hwndMain, backup);
+    lastSequenceNumber = GetClipboardSequenceNumber();
 
     isPasting = false;
     PlayClickSound();
@@ -3664,8 +3730,8 @@ void ClipboardManager::ProcessClipboard() {
                     // CRITICAL: Limit formats aggressively to prevent memory crashes
                     int formatCount = 0;
                     size_t totalFormatSize = 0;
-                    const int MAX_FORMATS_PER_ITEM = 5; // Reduced to 5 formats max
-                    const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024; // 10MB per item total (reduced)
+                    const int MAX_FORMATS_PER_ITEM = 12;
+                    const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024; // 10MB per item total
                     
                     UINT format = EnumClipboardFormats(0);
                     while (format != 0 && formatCount < MAX_FORMATS_PER_ITEM) {

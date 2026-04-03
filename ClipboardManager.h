@@ -206,7 +206,7 @@ private:
     void ShowSettingsDialog();
     // Read text from focused control via UI Automation (when app does not put anything on clipboard)
     bool CopyFromFocusedControlViaUIA();
-    // Paste plain text from history: Ctrl+F11 = keystroke injection (bypasses paste blocks); Ctrl+Shift+F11 = clipboard+Ctrl+V
+    // Paste from history: Ctrl+F11 / Ctrl+Shift+F11 restore stored clipboard formats + Ctrl+V (tabs/line breaks/HTML like normal paste). useClipboardSwap is reserved (same path).
     bool PasteToFocusedControlWithoutClipboard(bool useClipboardSwap);
     
     struct HotkeyConfig {
