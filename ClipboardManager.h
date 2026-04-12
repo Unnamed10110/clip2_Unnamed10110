@@ -177,7 +177,8 @@ private:
     void UninstallKeyboardHook();
     static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
     void FocusListWindow();
-    void ShowListWindow();
+    void ShowListWindow(bool startInSnippetsMode = false);
+    void SetListSnippetsMode(bool wantSnippets);
     void HideListWindow();
     void UpdateListWindow();
     void ShowPreviewWindow(int itemIndex, int x, int y);
@@ -205,6 +206,8 @@ private:
     void ShowSettingsDialog();
     // Read text from focused control via UI Automation (when app does not put anything on clipboard)
     bool CopyFromFocusedControlViaUIA();
+    // Paste from history: Ctrl+F11 / Ctrl+Shift+F11 restore stored clipboard formats + Ctrl+V (tabs/line breaks/HTML like normal paste). useClipboardSwap is reserved (same path).
+    bool PasteToFocusedControlWithoutClipboard(bool useClipboardSwap);
     
     struct HotkeyConfig {
         UINT modifiers;  // MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN
@@ -271,8 +274,12 @@ private:
     static const UINT WM_TRAYICON = WM_USER + 1;
     static const UINT WM_CLIPBOARD_HOTKEY = WM_USER + 2;
     static const UINT WM_PROCESS_CLIPBOARD = WM_USER + 3;
+    static const UINT WM_SNIPPETS_OVERLAY_HOTKEY = WM_USER + 5;
+    static const UINT WM_DISMISS_OVERLAY = WM_USER + 6;  // e.g. Esc from low-level hook
     static const int HOTKEY_ID_OVERLAY = 1;
     static const int HOTKEY_ID_COPY_FOCUSED = 2;  // Ctrl+F10: copy from focused control (UIA)
+    static const int HOTKEY_ID_PASTE_FOCUSED = 3;           // Ctrl+F11: keystroke injection (bypass Trillex / paste blocks)
+    static const int HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD = 4;  // Ctrl+Shift+F11: clipboard swap + Ctrl+V (VS Code, etc.)
     static const int MAX_ITEMS = 300;
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;

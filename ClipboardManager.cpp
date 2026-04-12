@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cwctype>
 #include <cstring>
+#include <map>
 #include <shlobj.h>
 #include <mmsystem.h>
 #include <commctrl.h>
@@ -622,6 +623,206 @@ std::wstring ClipboardItem::GetFullSearchableText() const {
     return L"";
 }
 
+// Get normalized text from an item for duplicate detection (content up to first null, trimmed).
+// So "text" copied twice with different trailing nulls still counts as duplicate.
+static std::wstring GetNormalizedTextForDuplicateCheck(const ClipboardItem* item) {
+    if (!item) return L"";
+    const std::vector<BYTE>* udata = item->GetFormatData(CF_UNICODETEXT);
+    if (udata && udata->size() >= sizeof(wchar_t)) {
+        size_t len = udata->size() / sizeof(wchar_t);
+        const wchar_t* p = (const wchar_t*)udata->data();
+        size_t n = 0;
+        while (n < len && p[n] != L'\0') n++;
+        std::wstring s(p, n);
+        while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L'\r' || s.back() == L'\n'))
+            s.pop_back();
+        return s;
+    }
+    const std::vector<BYTE>* adata = item->GetFormatData(CF_TEXT);
+    if (adata && !adata->empty()) {
+        int wlen = MultiByteToWideChar(CP_ACP, 0, (const char*)adata->data(), (int)adata->size(), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring result(wlen, 0);
+            MultiByteToWideChar(CP_ACP, 0, (const char*)adata->data(), (int)adata->size(), &result[0], wlen);
+            size_t n = 0;
+            while (n < result.size() && result[n] != L'\0') n++;
+            result.resize(n);
+            while (!result.empty() && (result.back() == L' ' || result.back() == L'\t' || result.back() == L'\r' || result.back() == L'\n'))
+                result.pop_back();
+            return result;
+        }
+    }
+    return L"";
+}
+
+// Plain text from a history item for direct injection (paste without system clipboard).
+static std::wstring GetPlainTextForDirectPaste(const ClipboardItem* item) {
+    if (!item) return L"";
+    const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+    if (textData && textData->size() >= sizeof(wchar_t)) {
+        size_t len = textData->size() / sizeof(wchar_t);
+        const wchar_t* p = (const wchar_t*)textData->data();
+        size_t n = 0;
+        while (n < len && p[n] != L'\0') n++;
+        return std::wstring(p, n);
+    }
+    textData = item->GetFormatData(CF_TEXT);
+    if (textData && !textData->empty()) {
+        int wlen = MultiByteToWideChar(CP_ACP, 0, (const char*)textData->data(), (int)textData->size(), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring result(wlen, 0);
+            MultiByteToWideChar(CP_ACP, 0, (const char*)textData->data(), (int)textData->size(), &result[0], wlen);
+            size_t n = 0;
+            while (n < result.size() && result[n] != L'\0') n++;
+            result.resize(n);
+            return result;
+        }
+    }
+    if (!item->preview.empty() && item->preview[0] != L'[')
+        return item->preview;
+    return L"";
+}
+
+// Release keys still held from Ctrl+F11 / Ctrl+Shift+F11 so typing or Ctrl+V is not corrupted.
+static void ReleaseHotkeyModifiersForPaste() {
+    if (GetAsyncKeyState(VK_F11) & 0x8000)
+        keybd_event(VK_F11, 0, KEYEVENTF_KEYUP, 0);
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+        keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    Sleep(20);
+}
+
+static bool SetClipboardUnicodeOnly(HWND hwnd, const std::wstring& text) {
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    size_t byteLen = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
+    if (!hMem) { CloseClipboard(); return false; }
+    void* p = GlobalLock(hMem);
+    if (!p) { GlobalFree(hMem); CloseClipboard(); return false; }
+    memcpy(p, text.c_str(), byteLen);
+    GlobalUnlock(hMem);
+    if (!SetClipboardData(CF_UNICODETEXT, hMem)) { GlobalFree(hMem); CloseClipboard(); return false; }
+    CloseClipboard();
+    return true;
+}
+
+// Full clipboard backup for swap+paste (not just CF_UNICODETEXT). CF_BITMAP is stored as CF_DIB bytes.
+static bool BackupClipboardSerialFormats(HWND hwnd, std::map<UINT, std::vector<BYTE>>& out) {
+    out.clear();
+    if (!OpenClipboard(hwnd)) return false;
+    const size_t MAX_TOTAL = 50 * 1024 * 1024;
+    size_t total = 0;
+    auto skipUnsupported = [](UINT f) {
+        return f == CF_PALETTE || f == CF_METAFILEPICT || f == CF_ENHMETAFILE ||
+               f == 0x0082 || f == 0x008E || f == 0x0083;
+    };
+    UINT fmt = 0;
+    while ((fmt = EnumClipboardFormats(fmt)) != 0) {
+        if (skipUnsupported(fmt)) continue;
+        if (fmt == CF_BITMAP) {
+            if (out.find(CF_DIB) != out.end()) continue;
+            HBITMAP hBmp = (HBITMAP)GetClipboardData(CF_BITMAP);
+            if (!hBmp) continue;
+            std::vector<BYTE> data = ConvertBitmapToDIB(hBmp);
+            if (data.empty() || total + data.size() > MAX_TOTAL) continue;
+            out[CF_DIB] = std::move(data);
+            total += out[CF_DIB].size();
+            continue;
+        }
+        HGLOBAL hMem = GetClipboardData(fmt);
+        if (!hMem) continue;
+        SIZE_T sz = GlobalSize(hMem);
+        if (sz == 0 || sz >= 100 * 1024 * 1024) continue;
+        void* p = GlobalLock(hMem);
+        if (!p) continue;
+        std::vector<BYTE> data(sz);
+        memcpy(data.data(), p, sz);
+        GlobalUnlock(hMem);
+        if (total + data.size() > MAX_TOTAL) continue;
+        if (out.find(fmt) != out.end()) continue;
+        out[fmt] = std::move(data);
+        total += out[fmt].size();
+    }
+    CloseClipboard();
+    return true;
+}
+
+static bool RestoreClipboardSerialFormats(HWND hwnd, const std::map<UINT, std::vector<BYTE>>& backup) {
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    for (const auto& kv : backup) {
+        if (kv.second.empty()) continue;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, kv.second.size());
+        if (!hMem) continue;
+        void* p = GlobalLock(hMem);
+        if (!p) {
+            GlobalFree(hMem);
+            continue;
+        }
+        memcpy(p, kv.second.data(), kv.second.size());
+        GlobalUnlock(hMem);
+        if (!SetClipboardData(kv.first, hMem))
+            GlobalFree(hMem);
+    }
+    CloseClipboard();
+    return true;
+}
+
+// Restore all formats from a history item (same strategy as PasteItem rich paste).
+static bool SetClipboardFromHistoryItem(HWND hwnd, const ClipboardItem* item) {
+    if (!item || item->formats.empty()) return false;
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    bool success = false;
+    for (const auto& formatPair : item->formats) {
+        UINT fmt = formatPair.first;
+        const std::vector<BYTE>& formatData = formatPair.second;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, formatData.size());
+        if (!hMem) continue;
+        void* pMem = GlobalLock(hMem);
+        if (!pMem) {
+            GlobalFree(hMem);
+            continue;
+        }
+        memcpy(pMem, formatData.data(), formatData.size());
+        GlobalUnlock(hMem);
+        if (SetClipboardData(fmt, hMem))
+            success = true;
+        else
+            GlobalFree(hMem);
+    }
+    CloseClipboard();
+    return success;
+}
+
+static std::wstring LastPastedTextFromItem(const ClipboardItem* item) {
+    if (!item) return L"";
+    const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
+    if (textData && textData->size() >= sizeof(wchar_t)) {
+        size_t len = textData->size() / sizeof(wchar_t);
+        const wchar_t* textPtr = (const wchar_t*)textData->data();
+        size_t actualLen = len;
+        for (size_t j = 0; j < len; j++) {
+            if (textPtr[j] == L'\0') {
+                actualLen = j;
+                break;
+            }
+        }
+        if (actualLen > 0) return std::wstring(textPtr, actualLen);
+    }
+    return item->preview;
+}
+
+static void SendCtrlV() {
+    keybd_event(VK_CONTROL, 0, 0, 0);
+    keybd_event('V', 0, 0, 0);
+    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+}
+
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager()
     : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false) {
@@ -903,6 +1104,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             AppendMenu(hMenu, startupEnabled ? (MF_STRING | MF_CHECKED) : MF_STRING, 3, L"Start with Windows");
             AppendMenu(hMenu, MF_STRING, 4, L"Settings");
             AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenu(hMenu, MF_STRING, 7, L"Restart");
             AppendMenu(hMenu, MF_STRING, 2, L"Exit");
             
             SetForegroundWindow(hwnd);
@@ -921,6 +1123,12 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 if (!mgr->CopyFromFocusedControlViaUIA())
                     MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
 #endif
+            } else if (cmd == 7) {
+                wchar_t exePath[MAX_PATH];
+                GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+                ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+                mgr->Stop();
+                PostQuitMessage(0);
             } else if (cmd == 2) {
                 mgr->Stop();
                 PostQuitMessage(0);
@@ -958,6 +1166,12 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             if (!mgr->CopyFromFocusedControlViaUIA())
                 MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
 #endif
+        } else if (LOWORD(wParam) == 7) {
+            wchar_t exePath[MAX_PATH];
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+            mgr->Stop();
+            PostQuitMessage(0);
         } else if (LOWORD(wParam) == 2) {
             mgr->Stop();
             PostQuitMessage(0);
@@ -985,6 +1199,13 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
         }
 #endif
+        else if (wParam == ClipboardManager::HOTKEY_ID_PASTE_FOCUSED) {
+            if (!mgr->PasteToFocusedControlWithoutClipboard(false))
+                MessageBoxW(hwnd, L"Could not paste: no text in history, or the target could not receive keystrokes.", L"clip2", MB_OK | MB_ICONINFORMATION);
+        } else if (wParam == ClipboardManager::HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD) {
+            if (!mgr->PasteToFocusedControlWithoutClipboard(true))
+                MessageBoxW(hwnd, L"Could not paste: no text in history, or clipboard could not be set.", L"clip2", MB_OK | MB_ICONINFORMATION);
+        }
         return 0;
     
     case WM_CLIPBOARD_HOTKEY:
@@ -998,6 +1219,27 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             mgr->HideListWindow();
         } else {
             mgr->ShowListWindow();
+        }
+        return 0;
+    
+    case WM_SNIPPETS_OVERLAY_HOTKEY:
+        {
+            DWORD now = GetTickCount();
+            if (now - mgr->lastHotkeyTick < 250) return 0;  // Debounce (same tick as overlay hotkey)
+            mgr->lastHotkeyTick = now;
+        }
+        if (!mgr->listVisible) {
+            mgr->ShowListWindow(true);
+        } else if (mgr->snippetsMode) {
+            mgr->HideListWindow();
+        } else {
+            mgr->SetListSnippetsMode(true);
+        }
+        return 0;
+    
+    case WM_DISMISS_OVERLAY:
+        if (mgr->listVisible) {
+            mgr->HideListWindow();
         }
         return 0;
     
@@ -1036,13 +1278,17 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             if (mgr->listVisible && mgr->hwndList && IsWindowVisible(mgr->hwndList)) {
                 HWND fgWindow = GetForegroundWindow();
                 if (fgWindow != mgr->hwndList && fgWindow != mgr->hwndSearch) {
-                    // Check if foreground window is a child of our list
-                    bool isChild = false;
-                    if (fgWindow != nullptr) {
-                        isChild = IsChild(mgr->hwndList, fgWindow) != FALSE;
-                    }
-                    if (!isChild) {
-                        mgr->HideListWindow();
+                    if (mgr->hwndPreview && fgWindow == mgr->hwndPreview) {
+                        // Preview popup is still part of the overlay session
+                    } else {
+                        // Check if foreground window is a child of our list
+                        bool isChild = false;
+                        if (fgWindow != nullptr) {
+                            isChild = IsChild(mgr->hwndList, fgWindow) != FALSE;
+                        }
+                        if (!isChild) {
+                            mgr->HideListWindow();
+                        }
                     }
                 }
             } else {
@@ -1429,28 +1675,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         // Ctrl+Right = Snippets mode, Ctrl+Left = Clipboard mode
         bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         if (ctrlPressed && (wParam == VK_RIGHT || wParam == VK_LEFT)) {
-            bool wantSnippets = (wParam == VK_RIGHT);
-            if (mgr->snippetsMode != wantSnippets) {
-                mgr->snippetsMode = wantSnippets;
-                mgr->numberInput.clear();
-                mgr->scrollOffset = 0;
-                if (mgr->snippetsMode) {
-                    mgr->searchText.clear();
-                    if (mgr->hwndSearch) {
-                        SetWindowText(mgr->hwndSearch, L"");
-                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
-                    }
-                    mgr->FilterSnippets();
-                    mgr->selectedIndex = (mgr->filteredSnippetIndices.empty() ? -1 : 0);
-                    SetFocus(mgr->hwndList);
-                } else {
-                    mgr->FilterItems();
-                    if (mgr->hwndSearch) {
-                        SendMessage(mgr->hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
-                    }
-                }
-                mgr->UpdateListWindow();
-            }
+            mgr->SetListSnippetsMode(wParam == VK_RIGHT);
             return 0;
         }
         // Handle Enter key first
@@ -2068,20 +2293,18 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_KILLFOCUS:
         {
-            // Hide list when it loses focus (unless focus is moving to a child control)
+            // Hide list when it loses focus (unless focus is moving to a child or the preview popup)
             HWND hwndGettingFocus = (HWND)wParam;
             
-            // Check if focus is moving to a child of the list window (like search box)
             bool isChildWindow = false;
             if (hwndGettingFocus != nullptr) {
                 isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
             }
+            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
             
-            if (!isChildWindow && hwndGettingFocus != hwnd) {
-                // Focus is moving to another window (not a child) - hide the list
+            if (!isChildWindow && !isPreviewWindow && hwndGettingFocus != hwnd) {
                 mgr->HideListWindow();
             } else {
-                // Focus is moving to a child control or staying in list - keep window on top
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
@@ -2089,15 +2312,14 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_ACTIVATE:
         if (wParam == WA_INACTIVE) {
-            // Window is becoming inactive - hide the list immediately
-            // Check if focus is going to a child control first
             HWND hwndGettingFocus = GetFocus();
             bool isChildWindow = false;
             if (hwndGettingFocus != nullptr) {
                 isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
             }
+            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
             
-            if (!isChildWindow) {
+            if (!isChildWindow && !isPreviewWindow) {
                 mgr->HideListWindow();
             }
         } else {
@@ -2106,20 +2328,18 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         break;
     
     case WM_NCACTIVATE:
-        // Hide list when window loses non-client activation (clicking title bar or outside)
         if (wParam == FALSE) {
-            // Check if focus is going to a child control
             HWND hwndGettingFocus = GetFocus();
             bool isChildWindow = false;
             if (hwndGettingFocus != nullptr) {
                 isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
             }
+            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
             
-            if (!isChildWindow) {
+            if (!isChildWindow && !isPreviewWindow) {
                 mgr->HideListWindow();
             }
         }
-        // Still call DefWindowProc to allow normal activation behavior
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }
     
@@ -2254,6 +2474,14 @@ void ClipboardManager::RegisterHotkey() {
         // Ctrl+F10 may be in use by another app
     }
 #endif
+    // Ctrl+F11: keystroke injection (bypasses paste blocks in Trillex / secure fields)
+    if (!RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED, MOD_CONTROL | MOD_NOREPEAT, VK_F11)) {
+        // Ctrl+F11 may be in use by another app
+    }
+    // Ctrl+Shift+F11: clipboard swap + Ctrl+V (Electron/VS Code where Unicode injection fails)
+    if (!RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F11)) {
+        // may be in use
+    }
 }
 
 void ClipboardManager::UnregisterHotkey() {
@@ -2262,6 +2490,8 @@ void ClipboardManager::UnregisterHotkey() {
 #ifdef HAVE_UIAUTOMATION
         UnregisterHotKey(hwndMain, HOTKEY_ID_COPY_FOCUSED);
 #endif
+        UnregisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED);
+        UnregisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD);
     }
 }
 
@@ -2296,6 +2526,27 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
         
+        // Ctrl+Numpad0: toggle snippets overlay (open / switch clipboard→snippets / close)
+        if (wParam == WM_KEYDOWN && isCtrlPressed && !isAltPressed && !isShiftPressed && !isWinPressed &&
+            pKeyboard->vkCode == VK_NUMPAD0) {
+            PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
+            return 1;
+        }
+        
+        // Plain Esc closes overlay when list, search, preview, or a list child has focus
+        if (wParam == WM_KEYDOWN && pKeyboard->vkCode == VK_ESCAPE && mgr->listVisible) {
+            bool plainEsc = !isCtrlPressed && !isAltPressed && !isShiftPressed && !isWinPressed;
+            if (plainEsc) {
+                HWND fg = GetForegroundWindow();
+                if (fg == mgr->hwndList || fg == mgr->hwndSearch ||
+                    (mgr->hwndPreview && fg == mgr->hwndPreview) ||
+                    (fg && mgr->hwndList && IsChild(mgr->hwndList, fg))) {
+                    PostMessage(mgr->hwndMain, ClipboardManager::WM_DISMISS_OVERLAY, 0, 0);
+                    return 1;
+                }
+            }
+        }
+        
         // Check if all required modifiers are pressed
         bool modifiersMatch = true;
         if (hasCtrl && !isCtrlPressed) modifiersMatch = false;
@@ -2320,7 +2571,32 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
-void ClipboardManager::ShowListWindow() {
+void ClipboardManager::SetListSnippetsMode(bool wantSnippets) {
+    if (snippetsMode == wantSnippets) {
+        return;
+    }
+    snippetsMode = wantSnippets;
+    numberInput.clear();
+    scrollOffset = 0;
+    if (snippetsMode) {
+        searchText.clear();
+        if (hwndSearch) {
+            SetWindowText(hwndSearch, L"");
+            SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
+        }
+        FilterSnippets();
+        selectedIndex = (filteredSnippetIndices.empty() ? -1 : 0);
+        SetFocus(hwndList);
+    } else {
+        FilterItems();
+        if (hwndSearch) {
+            SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
+        }
+    }
+    UpdateListWindow();
+}
+
+void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
     if (!hwndList) {
         return;
     }
@@ -2340,15 +2616,25 @@ void ClipboardManager::ShowListWindow() {
     if (hwndSearch) {
         SetWindowText(hwndSearch, L"");
     }
-    // Start in clipboard mode (not snippets)
-    snippetsMode = false;
-    // Initialize filtered indices (show all items initially)
-    FilterItems();
-    // Reset selection to first item (if any items exist)
-    if (!filteredIndices.empty()) {
-        selectedIndex = 0;
+    if (startInSnippetsMode) {
+        snippetsMode = true;
+        if (hwndSearch) {
+            SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
+        }
+        FilterSnippets();
+        if (!filteredSnippetIndices.empty()) {
+            selectedIndex = 0;
+        } else {
+            selectedIndex = -1;
+        }
     } else {
-        selectedIndex = -1;
+        snippetsMode = false;
+        FilterItems();
+        if (!filteredIndices.empty()) {
+            selectedIndex = 0;
+        } else {
+            selectedIndex = -1;
+        }
     }
     ClearMultiSelection(); // Clear multi-selection when showing list
     // Show search box
@@ -2695,153 +2981,104 @@ void ClipboardManager::PasteMultipleItems() {
     if (multiSelectedIndices.empty()) {
         return;
     }
-    
-    // Sort indices to paste in order (top to bottom)
+
+    // Sort indices so pasting follows visible top-to-bottom order.
     std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
     std::sort(sortedIndices.begin(), sortedIndices.end());
-    
-    // Combine all text items into a single string with newlines
-    std::wstring combinedText;
-    bool hasTextItems = false;
-    
-    for (size_t i = 0; i < sortedIndices.size(); i++) {
-        int filteredIndex = sortedIndices[i];
+
+    std::vector<const ClipboardItem*> selectedItems;
+    selectedItems.reserve(sortedIndices.size());
+    for (int filteredIndex : sortedIndices) {
+        if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) continue;
         int actualIndex = filteredIndices[filteredIndex];
-        if (actualIndex >= 0 && actualIndex < (int)clipboardHistory.size()) {
-            const auto& item = clipboardHistory[actualIndex];
-            
-            // Extract text from the item
-            std::wstring itemText;
-            const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
-            if (textData && textData->size() >= sizeof(wchar_t)) {
-                size_t len = textData->size() / sizeof(wchar_t);
-                if (len > 0) {
-                    const wchar_t* textPtr = (const wchar_t*)textData->data();
-                    // Find actual length (up to null terminator)
-                    size_t actualLen = len;
-                    for (size_t j = 0; j < len; j++) {
-                        if (textPtr[j] == L'\0') {
-                            actualLen = j;
-                            break;
-                        }
-                    }
-                    if (actualLen > 0) {
-                        itemText = std::wstring(textPtr, actualLen);
-                        hasTextItems = true;
-                    }
-                }
-            } else {
-                // Try ANSI text
-                textData = item->GetFormatData(CF_TEXT);
-                if (textData && textData->size() > 0) {
-                    const char* ansiText = (const char*)textData->data();
-                    size_t len = textData->size();
-                    size_t actualLen = len;
-                    for (size_t j = 0; j < len; j++) {
-                        if (ansiText[j] == '\0') {
-                            actualLen = j;
-                            break;
-                        }
-                    }
-                    if (actualLen > 0) {
-                        std::string ansiStr(ansiText, actualLen);
-                        int wideLen = MultiByteToWideChar(CP_ACP, 0, ansiStr.c_str(), (int)ansiStr.length(), nullptr, 0);
-                        if (wideLen > 0) {
-                            itemText.resize(wideLen);
-                            MultiByteToWideChar(CP_ACP, 0, ansiStr.c_str(), (int)ansiStr.length(), &itemText[0], wideLen);
-                            hasTextItems = true;
-                        }
-                    }
-                }
-            }
-            
-            if (!itemText.empty()) {
-                combinedText += itemText;
-                // Add newline after each item except the last
-                if (i < sortedIndices.size() - 1) {
-                    combinedText += L"\n";
-                }
-            }
-        }
+        if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
+        selectedItems.push_back(clipboardHistory[actualIndex].get());
     }
-    
-    // If we have combined text, paste it as a single operation
-    if (hasTextItems && !combinedText.empty()) {
-        // Set flag to ignore clipboard changes we're about to make
-        isPasting = true;
-        
-        // Restore focus to previous window before pasting
-        if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
-            SetForegroundWindow(previousFocusWindow);
-            SetFocus(previousFocusWindow);
-            Sleep(150); // Give window time to receive focus
-        }
-        
-        // Ensure clipboard is available (retry logic)
-        bool clipboardReady = false;
-        int retries = 0;
-        while (!clipboardReady && retries < 10) {
+
+    if (selectedItems.empty()) {
+        ClearMultiSelection();
+        return;
+    }
+
+    // Ctrl+Enter in multi-select keeps plain text behavior for quick text-only paste.
+    bool pasteAsPlainText = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+
+    // Keep this true for the whole multi-paste session.
+    isPasting = true;
+
+    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+        SetForegroundWindow(previousFocusWindow);
+        SetFocus(previousFocusWindow);
+        Sleep(150);
+    }
+
+    ReleaseHotkeyModifiersForPaste();
+
+    std::map<UINT, std::vector<BYTE>> backup;
+    if (!BackupClipboardSerialFormats(hwndMain, backup)) {
+        isPasting = false;
+        ClearMultiSelection();
+        return;
+    }
+
+    std::wstring pastedTextAggregate;
+
+    auto waitForClipboardReady = [&]() {
+        for (int attempt = 0; attempt < 20; attempt++) {
             if (OpenClipboard(hwndMain)) {
-                clipboardReady = true;
-            } else {
-                Sleep(10);
-                retries++;
-            }
-        }
-        
-        if (clipboardReady) {
-            EmptyClipboard();
-            
-            // Set as Unicode text
-            size_t dataSize = (combinedText.length() + 1) * sizeof(wchar_t);
-            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
-            if (hMem) {
-                wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
-                if (pMem) {
-                    wcscpy_s(pMem, combinedText.length() + 1, combinedText.c_str());
-                    GlobalUnlock(hMem);
-                    
-                        if (SetClipboardData(CF_UNICODETEXT, hMem)) {
-                        // Store the text we're about to paste so we can ignore it if it's copied back
-                        lastPastedText = combinedText;
-                        
-                        // Update sequence number AFTER setting clipboard
-                        lastSequenceNumber = GetClipboardSequenceNumber();
-                        
-                        CloseClipboard();
-                        
-                        // Small delay before pasting
-                        Sleep(150);
-                        
-                        // Simulate paste (Ctrl+V) - single paste for all items
-                        keybd_event(VK_CONTROL, 0, 0, 0);
-                        keybd_event('V', 0, 0, 0);
-                        keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
-                        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-                        
-                        // Keep isPasting flag true longer to prevent re-adding the pasted item
-                        // Some applications copy the pasted content back to clipboard, so we need to wait
-                        Sleep(500); // Increased delay to ignore clipboard updates from paste operation
-                        
-                        isPasting = false;
-                    } else {
-                        GlobalFree(hMem);
-                        CloseClipboard();
-                    }
-                } else {
-                    GlobalFree(hMem);
-                    CloseClipboard();
-                }
-            } else {
                 CloseClipboard();
-                isPasting = false;
+                return true;
             }
-        } else {
-            isPasting = false;
+            Sleep(15);
+        }
+        return false;
+    };
+
+    for (size_t i = 0; i < selectedItems.size(); i++) {
+        const ClipboardItem* item = selectedItems[i];
+        if (!item) continue;
+
+        std::wstring plainText = GetPlainTextForDirectPaste(item);
+
+        waitForClipboardReady();
+
+        bool clipboardSet = false;
+        if (!pasteAsPlainText && !item->formats.empty()) {
+            clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
+        }
+        if (!clipboardSet && !plainText.empty()) {
+            clipboardSet = SetClipboardUnicodeOnly(hwndMain, plainText);
+        }
+        if (!clipboardSet) continue;
+
+        if (!plainText.empty()) {
+            if (!pastedTextAggregate.empty()) pastedTextAggregate += L"\n";
+            pastedTextAggregate += plainText;
+        }
+
+        lastSequenceNumber = GetClipboardSequenceNumber();
+        SendCtrlV();
+        Sleep(250);
+
+        if (i + 1 < selectedItems.size()) {
+            waitForClipboardReady();
+            if (SetClipboardUnicodeOnly(hwndMain, L"\r\n")) {
+                lastSequenceNumber = GetClipboardSequenceNumber();
+                SendCtrlV();
+                Sleep(250);
+            }
         }
     }
-    
-    // Clear multi-selection after pasting
+
+    RestoreClipboardSerialFormats(hwndMain, backup);
+    lastSequenceNumber = GetClipboardSequenceNumber();
+    if (!pastedTextAggregate.empty()) {
+        lastPastedText = pastedTextAggregate;
+    }
+
+    Sleep(350);
+    isPasting = false;
+
     ClearMultiSelection();
 }
 
@@ -2927,7 +3164,7 @@ bool ClipboardManager::TryCaptureClipboardImmediately() {
         }
         immediateClipboardSnapshot[storageFormat] = std::move(primaryData);
 
-        const int MAX_FORMATS_PER_ITEM = 5;
+        const int MAX_FORMATS_PER_ITEM = 12;
         const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024;
         int formatCount = 1;
         size_t totalSize = immediateClipboardSnapshot[storageFormat].size();
@@ -3040,6 +3277,13 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
                 if (allMatch) isDuplicate = true;
             }
         } catch (...) {}
+    }
+    // Same text copied twice (e.g. Ctrl+C twice on "text") → treat as duplicate even if raw bytes differ
+    if (!isDuplicate && !clipboardHistory.empty() && item) {
+        std::wstring newNorm = GetNormalizedTextForDuplicateCheck(item.get());
+        std::wstring lastNorm = GetNormalizedTextForDuplicateCheck(clipboardHistory[0].get());
+        if (!newNorm.empty() && newNorm == lastNorm)
+            isDuplicate = true;
     }
     if (!isDuplicate && !isPastPaste && item) {
         try {
@@ -3180,6 +3424,79 @@ bool ClipboardManager::CopyFromFocusedControlViaUIA() {
     (void)0;
     return false;
 #endif
+}
+
+bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSwap) {
+    (void)useClipboardSwap;
+    if (clipboardHistory.empty())
+        return false;
+    int actualIndex = -1;
+    if (listVisible && selectedIndex >= 0 && selectedIndex < (int)filteredIndices.size())
+        actualIndex = filteredIndices[selectedIndex];
+    else if (!clipboardHistory.empty())
+        actualIndex = 0;
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size())
+        return false;
+    const ClipboardItem* item = clipboardHistory[actualIndex].get();
+    std::wstring text = GetPlainTextForDirectPaste(item);
+    if (text.empty() && item->formats.empty())
+        return false;
+    HWND hTarget = GetForegroundWindow();
+    if (hTarget == hwndList || hTarget == hwndMain || (hwndList && IsChild(hwndList, hTarget))) {
+        if (previousFocusWindow && IsWindow(previousFocusWindow) && previousFocusWindow != hwndList && previousFocusWindow != hwndMain)
+            hTarget = previousFocusWindow;
+        else
+            hTarget = nullptr;
+    }
+    if (!hTarget || !IsWindow(hTarget))
+        return false;
+
+    DWORD tgtTid = GetWindowThreadProcessId(hTarget, nullptr);
+    DWORD curTid = GetCurrentThreadId();
+    if (tgtTid != curTid)
+        AttachThreadInput(curTid, tgtTid, TRUE);
+    SetForegroundWindow(hTarget);
+    if (tgtTid != curTid)
+        AttachThreadInput(curTid, tgtTid, FALSE);
+
+    Sleep(80);
+    // Ctrl+F11 / Ctrl+Shift+F11 may still hold Ctrl, Shift, F11 — release before paste
+    ReleaseHotkeyModifiersForPaste();
+
+    isPasting = true;
+
+    std::map<UINT, std::vector<BYTE>> backup;
+    if (!BackupClipboardSerialFormats(hwndMain, backup)) {
+        isPasting = false;
+        return false;
+    }
+
+    bool clipboardSet = false;
+    if (!item->formats.empty())
+        clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
+    if (!clipboardSet && !text.empty())
+        clipboardSet = SetClipboardUnicodeOnly(hwndMain, text);
+    if (!clipboardSet) {
+        RestoreClipboardSerialFormats(hwndMain, backup);
+        isPasting = false;
+        return false;
+    }
+
+    if (!text.empty())
+        lastPastedText = text;
+    else
+        lastPastedText = LastPastedTextFromItem(item);
+
+    lastSequenceNumber = GetClipboardSequenceNumber();
+
+    SendCtrlV();
+    Sleep(220);
+    RestoreClipboardSerialFormats(hwndMain, backup);
+    lastSequenceNumber = GetClipboardSequenceNumber();
+
+    isPasting = false;
+    PlayClickSound();
+    return true;
 }
 
 void ClipboardManager::ProcessClipboard() {
@@ -3377,8 +3694,8 @@ void ClipboardManager::ProcessClipboard() {
                     // CRITICAL: Limit formats aggressively to prevent memory crashes
                     int formatCount = 0;
                     size_t totalFormatSize = 0;
-                    const int MAX_FORMATS_PER_ITEM = 5; // Reduced to 5 formats max
-                    const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024; // 10MB per item total (reduced)
+                    const int MAX_FORMATS_PER_ITEM = 12;
+                    const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024; // 10MB per item total
                     
                     UINT format = EnumClipboardFormats(0);
                     while (format != 0 && formatCount < MAX_FORMATS_PER_ITEM) {
@@ -3550,6 +3867,13 @@ void ClipboardManager::ProcessClipboard() {
                                         isDuplicate = true;
                                     }
                                 }
+                            }
+                            // Same text copied twice (e.g. Ctrl+C twice on "text") → treat as duplicate even if raw bytes differ
+                            if (!isDuplicate && item) {
+                                std::wstring newNorm = GetNormalizedTextForDuplicateCheck(item.get());
+                                std::wstring lastNorm = GetNormalizedTextForDuplicateCheck(clipboardHistory[0].get());
+                                if (!newNorm.empty() && newNorm == lastNorm)
+                                    isDuplicate = true;
                             }
                         } catch (...) {
                             // Error during duplicate check, treat as not duplicate and continue
