@@ -1104,6 +1104,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             AppendMenu(hMenu, startupEnabled ? (MF_STRING | MF_CHECKED) : MF_STRING, 3, L"Start with Windows");
             AppendMenu(hMenu, MF_STRING, 4, L"Settings");
             AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenu(hMenu, MF_STRING, 7, L"Restart");
             AppendMenu(hMenu, MF_STRING, 2, L"Exit");
             
             SetForegroundWindow(hwnd);
@@ -1122,6 +1123,12 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 if (!mgr->CopyFromFocusedControlViaUIA())
                     MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
 #endif
+            } else if (cmd == 7) {
+                wchar_t exePath[MAX_PATH];
+                GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+                ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+                mgr->Stop();
+                PostQuitMessage(0);
             } else if (cmd == 2) {
                 mgr->Stop();
                 PostQuitMessage(0);
@@ -1159,6 +1166,12 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             if (!mgr->CopyFromFocusedControlViaUIA())
                 MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
 #endif
+        } else if (LOWORD(wParam) == 7) {
+            wchar_t exePath[MAX_PATH];
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+            mgr->Stop();
+            PostQuitMessage(0);
         } else if (LOWORD(wParam) == 2) {
             mgr->Stop();
             PostQuitMessage(0);
