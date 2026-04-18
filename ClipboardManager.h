@@ -160,12 +160,22 @@ public:
     bool Initialize();
     void Run();
     void Stop();
+
+    struct HotkeyConfig {
+        UINT modifiers;  // MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN
+        UINT vkCode;     // Virtual key code
+    };
+
+    static std::wstring HotkeyToString(const HotkeyConfig& hk);
+    static bool HotkeyFromKeyMessage(UINT vk, HotkeyConfig& out);
     
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK ListWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SearchEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SettingsDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK SettingsHotkeyEditSubclass(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+        UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
     static ClipboardManager* instance;
     
     void CreateTrayIcon();
@@ -209,11 +219,6 @@ private:
     // Paste from history: Ctrl+F11 / Ctrl+Shift+F11 restore stored clipboard formats + Ctrl+V (tabs/line breaks/HTML like normal paste). useClipboardSwap is reserved (same path).
     bool PasteToFocusedControlWithoutClipboard(bool useClipboardSwap);
     
-    struct HotkeyConfig {
-        UINT modifiers;  // MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN
-        UINT vkCode;     // Virtual key code
-    };
-    
     HWND hwndMain;
     HWND hwndList;
     HWND hwndPreview;
@@ -243,7 +248,11 @@ private:
     int selectedIndex;  // Currently selected item index (in filtered list)
     int multiSelectAnchor;  // Anchor index for Shift+Arrow multi-selection (-1 if no anchor)
     WNDPROC originalSearchEditProc;  // Original window procedure for search edit control
-    HotkeyConfig hotkeyConfig;  // Current hotkey configuration
+    HotkeyConfig hotkeyConfig;           // Overlay toggle
+    HotkeyConfig snippetsHotkey;         // Snippets overlay toggle
+    HotkeyConfig copyFocusedHotkey;      // Copy from focused control (UIA)
+    HotkeyConfig pasteFocusedHotkey;     // Keystroke injection paste
+    HotkeyConfig pasteClipboardHotkey;   // Clipboard swap + Ctrl+V paste
     DWORD lastHotkeyTick;      // Debounce: last time overlay hotkey was handled
     HWND hwndSettings;  // Settings dialog window
     std::map<UINT, std::vector<BYTE>> immediateClipboardSnapshot;  // Captured in WM_CLIPBOARDUPDATE before app can clear
