@@ -828,9 +828,16 @@ ClipboardManager::ClipboardManager()
     : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
-    // Default hotkey: Ctrl+NumPadDot
     hotkeyConfig.modifiers = MOD_CONTROL;
     hotkeyConfig.vkCode = VK_DECIMAL;
+    snippetsHotkey.modifiers = MOD_CONTROL;
+    snippetsHotkey.vkCode = VK_NUMPAD0;
+    copyFocusedHotkey.modifiers = MOD_CONTROL;
+    copyFocusedHotkey.vkCode = VK_F10;
+    pasteFocusedHotkey.modifiers = MOD_CONTROL;
+    pasteFocusedHotkey.vkCode = VK_F11;
+    pasteClipboardHotkey.modifiers = MOD_CONTROL | MOD_SHIFT;
+    pasteClipboardHotkey.vkCode = VK_F11;
 }
 
 ClipboardManager::~ClipboardManager() {
@@ -2463,25 +2470,12 @@ void ClipboardManager::RemoveTrayIcon() {
 
 void ClipboardManager::RegisterHotkey() {
     if (!hwndMain) return;
-    // RegisterHotKey works globally even when other apps have focus (backup to low-level hook)
-    UINT mod = hotkeyConfig.modifiers | 0x4000;  // MOD_NOREPEAT to avoid repeat while key held
-    if (!RegisterHotKey(hwndMain, HOTKEY_ID_OVERLAY, mod, hotkeyConfig.vkCode)) {
-        // If registration fails (e.g. key already taken), hook is still active
-    }
+    RegisterHotKey(hwndMain, HOTKEY_ID_OVERLAY, hotkeyConfig.modifiers | MOD_NOREPEAT, hotkeyConfig.vkCode);
 #ifdef HAVE_UIAUTOMATION
-    // Ctrl+F10: copy from focused control when app never puts content on clipboard
-    if (!RegisterHotKey(hwndMain, HOTKEY_ID_COPY_FOCUSED, MOD_CONTROL | MOD_NOREPEAT, VK_F10)) {
-        // Ctrl+F10 may be in use by another app
-    }
+    RegisterHotKey(hwndMain, HOTKEY_ID_COPY_FOCUSED, copyFocusedHotkey.modifiers | MOD_NOREPEAT, copyFocusedHotkey.vkCode);
 #endif
-    // Ctrl+F11: keystroke injection (bypasses paste blocks in Trillex / secure fields)
-    if (!RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED, MOD_CONTROL | MOD_NOREPEAT, VK_F11)) {
-        // Ctrl+F11 may be in use by another app
-    }
-    // Ctrl+Shift+F11: clipboard swap + Ctrl+V (Electron/VS Code where Unicode injection fails)
-    if (!RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F11)) {
-        // may be in use
-    }
+    RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED, pasteFocusedHotkey.modifiers | MOD_NOREPEAT, pasteFocusedHotkey.vkCode);
+    RegisterHotKey(hwndMain, HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD, pasteClipboardHotkey.modifiers | MOD_NOREPEAT, pasteClipboardHotkey.vkCode);
 }
 
 void ClipboardManager::UnregisterHotkey() {
@@ -2526,11 +2520,17 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
         
-        // Ctrl+Numpad0: toggle snippets overlay (open / switch clipboard→snippets / close)
-        if (wParam == WM_KEYDOWN && isCtrlPressed && !isAltPressed && !isShiftPressed && !isWinPressed &&
-            pKeyboard->vkCode == VK_NUMPAD0) {
-            PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
-            return 1;
+        {
+            bool snipCtrl  = (mgr->snippetsHotkey.modifiers & MOD_CONTROL) != 0;
+            bool snipAlt   = (mgr->snippetsHotkey.modifiers & MOD_ALT) != 0;
+            bool snipShift = (mgr->snippetsHotkey.modifiers & MOD_SHIFT) != 0;
+            bool snipWin   = (mgr->snippetsHotkey.modifiers & MOD_WIN) != 0;
+            bool snipMatch = (snipCtrl == isCtrlPressed) && (snipAlt == isAltPressed) &&
+                             (snipShift == isShiftPressed) && (snipWin == isWinPressed);
+            if (wParam == WM_KEYDOWN && snipMatch && pKeyboard->vkCode == mgr->snippetsHotkey.vkCode) {
+                PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
+                return 1;
+            }
         }
         
         // Plain Esc closes overlay when list, search, preview, or a list child has focus
@@ -4813,93 +4813,44 @@ bool ClipboardManager::IsStartupWithWindows() {
     return false;
 }
 
+static void RegReadHotkey(HKEY hKey, const wchar_t* modName, const wchar_t* vkName, ClipboardManager::HotkeyConfig& hk) {
+    DWORD val = 0, sz = sizeof(DWORD), type = REG_DWORD;
+    if (RegQueryValueExW(hKey, modName, nullptr, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS && type == REG_DWORD)
+        hk.modifiers = val;
+    sz = sizeof(DWORD); type = REG_DWORD;
+    if (RegQueryValueExW(hKey, vkName, nullptr, &type, (LPBYTE)&val, &sz) == ERROR_SUCCESS && type == REG_DWORD)
+        hk.vkCode = val;
+}
+
+static void RegWriteHotkey(HKEY hKey, const wchar_t* modName, const wchar_t* vkName, const ClipboardManager::HotkeyConfig& hk) {
+    DWORD m = hk.modifiers, v = hk.vkCode;
+    RegSetValueExW(hKey, modName, 0, REG_DWORD, (BYTE*)&m, sizeof(DWORD));
+    RegSetValueExW(hKey, vkName, 0, REG_DWORD, (BYTE*)&v, sizeof(DWORD));
+}
+
 void ClipboardManager::LoadHotkeyConfig() {
     HKEY hKey;
-    LONG result = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        L"Software\\clip2",
-        0,
-        KEY_READ,
-        &hKey
-    );
-    
-    if (result == ERROR_SUCCESS) {
-        DWORD modifiers = 0;
-        DWORD vkCode = 0;
-        DWORD dataSize = sizeof(DWORD);
-        DWORD type = REG_DWORD;
-        
-        // Read modifiers
-        result = RegQueryValueExW(
-            hKey,
-            L"HotkeyModifiers",
-            nullptr,
-            &type,
-            (LPBYTE)&modifiers,
-            &dataSize
-        );
-        
-        if (result == ERROR_SUCCESS && type == REG_DWORD) {
-            hotkeyConfig.modifiers = modifiers;
-        }
-        
-        // Read vkCode
-        dataSize = sizeof(DWORD);
-        result = RegQueryValueExW(
-            hKey,
-            L"HotkeyVkCode",
-            nullptr,
-            &type,
-            (LPBYTE)&vkCode,
-            &dataSize
-        );
-        
-        if (result == ERROR_SUCCESS && type == REG_DWORD) {
-            hotkeyConfig.vkCode = vkCode;
-        }
-        
-        RegCloseKey(hKey);
-    }
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return;
+    RegReadHotkey(hKey, L"HotkeyModifiers",          L"HotkeyVkCode",          hotkeyConfig);
+    RegReadHotkey(hKey, L"SnippetsModifiers",         L"SnippetsVkCode",        snippetsHotkey);
+    RegReadHotkey(hKey, L"CopyFocusedModifiers",      L"CopyFocusedVkCode",     copyFocusedHotkey);
+    RegReadHotkey(hKey, L"PasteFocusedModifiers",     L"PasteFocusedVkCode",    pasteFocusedHotkey);
+    RegReadHotkey(hKey, L"PasteClipboardModifiers",   L"PasteClipboardVkCode",  pasteClipboardHotkey);
+    RegCloseKey(hKey);
 }
 
 void ClipboardManager::SaveHotkeyConfig() {
     HKEY hKey;
-    LONG result = RegCreateKeyExW(
-        HKEY_CURRENT_USER,
-        L"Software\\clip2",
-        0,
-        nullptr,
-        REG_OPTION_NON_VOLATILE,
-        KEY_WRITE,
-        nullptr,
-        &hKey,
-        nullptr
-    );
-    
-    if (result == ERROR_SUCCESS) {
-        DWORD modifiers = hotkeyConfig.modifiers;
-        DWORD vkCode = hotkeyConfig.vkCode;
-        
-        RegSetValueExW(
-            hKey,
-            L"HotkeyModifiers",
-            0,
-            REG_DWORD,
-            (BYTE*)&modifiers,
-            sizeof(DWORD)
-        );
-        
-        RegSetValueExW(
-            hKey,
-            L"HotkeyVkCode",
-            0,
-            REG_DWORD,
-            (BYTE*)&vkCode,
-            sizeof(DWORD)
-        );
-        
-        RegCloseKey(hKey);
-    }
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    RegWriteHotkey(hKey, L"HotkeyModifiers",          L"HotkeyVkCode",          hotkeyConfig);
+    RegWriteHotkey(hKey, L"SnippetsModifiers",         L"SnippetsVkCode",        snippetsHotkey);
+    RegWriteHotkey(hKey, L"CopyFocusedModifiers",      L"CopyFocusedVkCode",     copyFocusedHotkey);
+    RegWriteHotkey(hKey, L"PasteFocusedModifiers",     L"PasteFocusedVkCode",    pasteFocusedHotkey);
+    RegWriteHotkey(hKey, L"PasteClipboardModifiers",   L"PasteClipboardVkCode",  pasteClipboardHotkey);
+    RegCloseKey(hKey);
 }
 
 void ClipboardManager::LoadSnippets() {
@@ -5280,88 +5231,234 @@ LRESULT CALLBACK ClipboardManager::SnippetsManagerProc(HWND hwnd, UINT uMsg, WPA
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-void ClipboardManager::ShowSettingsDialog() {
-    // Show current hotkey and allow basic configuration
-    std::wstring hotkeyText = L"Current hotkey: ";
-    if (hotkeyConfig.modifiers & MOD_CONTROL) hotkeyText += L"Ctrl+";
-    if (hotkeyConfig.modifiers & MOD_ALT) hotkeyText += L"Alt+";
-    if (hotkeyConfig.modifiers & MOD_SHIFT) hotkeyText += L"Shift+";
-    if (hotkeyConfig.modifiers & MOD_WIN) hotkeyText += L"Win+";
-    
-    // Get key name
-    wchar_t keyName[256] = {0};
-    UINT scanCode = MapVirtualKeyW(hotkeyConfig.vkCode, MAPVK_VK_TO_VSC);
-    if (scanCode != 0) {
-        LONG lParam = (scanCode << 16);
-        // Add extended key flag if needed (for numpad keys)
-        if (hotkeyConfig.vkCode == VK_DECIMAL || hotkeyConfig.vkCode == VK_NUMPAD0 || 
-            (hotkeyConfig.vkCode >= VK_NUMPAD1 && hotkeyConfig.vkCode <= VK_NUMPAD9)) {
-            lParam |= (1 << 24); // Extended key flag
-        }
-        if (GetKeyNameTextW(lParam, keyName, 256)) {
-            hotkeyText += keyName;
-        } else {
-            hotkeyText += L"Key " + std::to_wstring(hotkeyConfig.vkCode);
-        }
+std::wstring ClipboardManager::HotkeyToString(const HotkeyConfig& hk) {
+    std::wstring s;
+    if (hk.modifiers & MOD_CONTROL) s += L"Ctrl+";
+    if (hk.modifiers & MOD_ALT)     s += L"Alt+";
+    if (hk.modifiers & MOD_SHIFT)   s += L"Shift+";
+    if (hk.modifiers & MOD_WIN)     s += L"Win+";
+    wchar_t keyName[128] = {0};
+    UINT sc = MapVirtualKeyW(hk.vkCode, MAPVK_VK_TO_VSC);
+    if (sc) {
+        LONG lp = (sc << 16);
+        if (hk.vkCode >= VK_NUMPAD0 && hk.vkCode <= VK_NUMPAD9) lp |= (1 << 24);
+        if (hk.vkCode == VK_DECIMAL || hk.vkCode == VK_INSERT || hk.vkCode == VK_DELETE ||
+            hk.vkCode == VK_HOME || hk.vkCode == VK_END || hk.vkCode == VK_PRIOR ||
+            hk.vkCode == VK_NEXT || hk.vkCode == VK_UP || hk.vkCode == VK_DOWN ||
+            hk.vkCode == VK_LEFT || hk.vkCode == VK_RIGHT) lp |= (1 << 24);
+        if (GetKeyNameTextW(lp, keyName, 128))
+            s += keyName;
+        else
+            s += L"0x" + std::to_wstring(hk.vkCode);
     } else {
-        hotkeyText += L"Key " + std::to_wstring(hotkeyConfig.vkCode);
+        s += L"0x" + std::to_wstring(hk.vkCode);
     }
-    
-    hotkeyText += L"\n\nPress a key combination now to set it as the new hotkey.\n";
-    hotkeyText += L"Click OK, then press your desired key combination within 3 seconds.\n";
-    hotkeyText += L"Supported modifiers: Ctrl, Alt, Shift, Win";
-    
-    int result = MessageBox(hwndMain, hotkeyText.c_str(), L"clip2 Settings - Hotkey Configuration", MB_OKCANCEL | MB_ICONINFORMATION);
-    
-    if (result == IDOK) {
-        // Wait for user to press a key combination
-        MessageBox(hwndMain, L"Please press your desired hotkey combination now...", L"clip2 Settings", MB_OK | MB_ICONINFORMATION);
-        
-        // Simple hotkey capture - wait for key press
-        // Note: This is a simplified implementation
-        // In a full implementation, you'd use a hook or dialog with proper key capture
-        
-        // For now, show message that user can configure via registry
-        std::wstring configText = L"Hotkey configuration via dialog is coming soon.\n\n";
-        configText += L"For now, you can configure the hotkey by editing the registry:\n\n";
-        configText += L"Location: HKEY_CURRENT_USER\\Software\\clip2\n\n";
-        configText += L"Values:\n";
-        configText += L"  HotkeyModifiers (DWORD):\n";
-        configText += L"    MOD_CONTROL = 2\n";
-        configText += L"    MOD_ALT = 1\n";
-        configText += L"    MOD_SHIFT = 4\n";
-        configText += L"    MOD_WIN = 8\n";
-        configText += L"    Combine with + (e.g., MOD_CONTROL | MOD_SHIFT = 6)\n\n";
-        configText += L"  HotkeyVkCode (DWORD): Virtual key code\n";
-        configText += L"    Examples:\n";
-        configText += L"      VK_DECIMAL (NumPad .) = 110\n";
-        configText += L"      VK_F1 = 112\n";
-        configText += L"      'V' = 0x56\n";
-        configText += L"      Space = 0x20\n\n";
-        configText += L"After editing, restart clip2 for changes to take effect.";
-        
-        MessageBox(hwndMain, configText.c_str(), L"clip2 Settings", MB_OK | MB_ICONINFORMATION);
+    return s;
+}
+
+bool ClipboardManager::HotkeyFromKeyMessage(UINT vk, HotkeyConfig& out) {
+    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+        vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+        vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+        vk == VK_LWIN || vk == VK_RWIN)
+        return false;
+    UINT mod = 0;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mod |= MOD_CONTROL;
+    if (GetAsyncKeyState(VK_MENU)    & 0x8000) mod |= MOD_ALT;
+    if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) mod |= MOD_SHIFT;
+    if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) mod |= MOD_WIN;
+    out.modifiers = mod;
+    out.vkCode = vk;
+    return true;
+}
+
+static const int IDC_HK_OVERLAY          = 3001;
+static const int IDC_HK_SNIPPETS         = 3002;
+static const int IDC_HK_COPY_FOCUSED     = 3003;
+static const int IDC_HK_PASTE_FOCUSED    = 3004;
+static const int IDC_HK_PASTE_CLIPBOARD  = 3005;
+static const int IDC_BTN_SAVE            = 3010;
+static const int IDC_BTN_CANCEL          = 3011;
+static const int IDC_BTN_DEFAULTS        = 3012;
+
+static HWND CreateHotkeyLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h, HFONT font) {
+    HWND lbl = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                             x, y, w, h, parent, nullptr, GetModuleHandle(nullptr), nullptr);
+    SendMessage(lbl, WM_SETFONT, (WPARAM)font, TRUE);
+    return lbl;
+}
+
+static HWND CreateHotkeyDisplay(HWND parent, int id, const std::wstring& text, int x, int y, int w, int h, HFONT font) {
+    HWND ctrl = CreateWindowW(L"EDIT", text.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_CENTER | ES_READONLY,
+        x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandle(nullptr), nullptr);
+    SendMessage(ctrl, WM_SETFONT, (WPARAM)font, TRUE);
+    return ctrl;
+}
+
+LRESULT CALLBACK ClipboardManager::SettingsHotkeyEditSubclass(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    ClipboardManager* self = reinterpret_cast<ClipboardManager*>(dwRefData);
+    if (!self) return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+    if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) {
+        if (wParam == VK_TAB)
+            return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        HotkeyConfig captured;
+        if (HotkeyFromKeyMessage(static_cast<UINT>(wParam), captured)) {
+            const int id = GetDlgCtrlID(hWnd);
+            HotkeyConfig* target = nullptr;
+            if (id == IDC_HK_OVERLAY) target = &self->hotkeyConfig;
+            else if (id == IDC_HK_SNIPPETS) target = &self->snippetsHotkey;
+            else if (id == IDC_HK_COPY_FOCUSED) target = &self->copyFocusedHotkey;
+            else if (id == IDC_HK_PASTE_FOCUSED) target = &self->pasteFocusedHotkey;
+            else if (id == IDC_HK_PASTE_CLIPBOARD) target = &self->pasteClipboardHotkey;
+            if (target) {
+                *target = captured;
+                SetWindowTextW(hWnd, HotkeyToString(captured).c_str());
+            }
+            return 0;
+        }
+        return 0;
     }
+
+    if (uMsg == WM_CHAR || uMsg == WM_SYSCHAR) {
+        return 0;
+    }
+
+    if (uMsg == WM_NCDESTROY)
+        RemoveWindowSubclass(hWnd, SettingsHotkeyEditSubclass, uIdSubclass);
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+void ClipboardManager::ShowSettingsDialog() {
+    if (hwndSettings && IsWindow(hwndSettings)) {
+        SetForegroundWindow(hwndSettings);
+        return;
+    }
+
+    const int DLG_W = 480, DLG_H = 370;
+    RECT workArea;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
+    int x = workArea.left + ((workArea.right - workArea.left) - DLG_W) / 2;
+    int y = workArea.top  + ((workArea.bottom - workArea.top) - DLG_H) / 2;
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = SettingsDialogProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"clip2_SettingsDialog";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    hwndSettings = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"clip2_SettingsDialog", L"clip2 Settings \u2014 Keyboard Shortcuts",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x, y, DLG_W, DLG_H, hwndMain, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    HFONT hFont = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+    HFONT hBold = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+    int yPos = 15;
+    const int LBL_X = 15, LBL_W = 200, HK_X = 220, HK_W = 230, ROW_H = 28, GAP = 38;
+
+    CreateHotkeyLabel(hwndSettings, L"Click a field, then press your shortcut.", LBL_X, yPos, DLG_W - 30, 20, hBold);
+    yPos += 30;
+
+    struct { const wchar_t* label; int id; HotkeyConfig* cfg; } rows[] = {
+        { L"Clipboard Overlay:",        IDC_HK_OVERLAY,         &hotkeyConfig },
+        { L"Snippets Overlay:",         IDC_HK_SNIPPETS,        &snippetsHotkey },
+        { L"Copy Focused (UIA):",       IDC_HK_COPY_FOCUSED,    &copyFocusedHotkey },
+        { L"Paste (Keystroke):",        IDC_HK_PASTE_FOCUSED,   &pasteFocusedHotkey },
+        { L"Paste (Clipboard Swap):",   IDC_HK_PASTE_CLIPBOARD, &pasteClipboardHotkey },
+    };
+
+    for (auto& r : rows) {
+        CreateHotkeyLabel(hwndSettings, r.label, LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+        HWND hHotkey = CreateHotkeyDisplay(hwndSettings, r.id, HotkeyToString(*r.cfg), HK_X, yPos, HK_W, ROW_H, hFont);
+        SetWindowSubclass(hHotkey, SettingsHotkeyEditSubclass, 1, reinterpret_cast<DWORD_PTR>(this));
+        yPos += GAP;
+    }
+
+    yPos += 10;
+    const int BTN_W = 90, BTN_H = 30, BTN_GAP = 10;
+    int btnX = DLG_W - 15 - BTN_W * 3 - BTN_GAP * 2 - 10;
+
+    auto mkBtn = [&](int id, const wchar_t* text) {
+        HWND b = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            btnX, yPos, BTN_W, BTN_H, hwndSettings, (HMENU)(INT_PTR)id, GetModuleHandle(nullptr), nullptr);
+        SendMessage(b, WM_SETFONT, (WPARAM)hFont, TRUE);
+        btnX += BTN_W + BTN_GAP;
+        return b;
+    };
+
+    mkBtn(IDC_BTN_DEFAULTS, L"Defaults");
+    mkBtn(IDC_BTN_SAVE, L"Save");
+    mkBtn(IDC_BTN_CANCEL, L"Cancel");
+
+    ShowWindow(hwndSettings, SW_SHOW);
+    UpdateWindow(hwndSettings);
 }
 
 LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     ClipboardManager* mgr = instance;
-    
+    if (!mgr) return DefWindowProc(hwnd, uMsg, wParam, lParam);
+
     switch (uMsg) {
-    case WM_CLOSE:
-        if (mgr && mgr->hwndSettings == hwnd) {
-            mgr->hwndSettings = nullptr;
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+
+        if (id == IDC_BTN_CANCEL) {
+            DestroyWindow(hwnd);
+            return 0;
         }
+
+        if (id == IDC_BTN_DEFAULTS) {
+            mgr->hotkeyConfig        = { MOD_CONTROL, VK_DECIMAL };
+            mgr->snippetsHotkey      = { MOD_CONTROL, VK_NUMPAD0 };
+            mgr->copyFocusedHotkey   = { MOD_CONTROL, VK_F10 };
+            mgr->pasteFocusedHotkey  = { MOD_CONTROL, VK_F11 };
+            mgr->pasteClipboardHotkey = { MOD_CONTROL | MOD_SHIFT, VK_F11 };
+            struct { int id; HotkeyConfig* cfg; } rows[] = {
+                { IDC_HK_OVERLAY,         &mgr->hotkeyConfig },
+                { IDC_HK_SNIPPETS,        &mgr->snippetsHotkey },
+                { IDC_HK_COPY_FOCUSED,    &mgr->copyFocusedHotkey },
+                { IDC_HK_PASTE_FOCUSED,   &mgr->pasteFocusedHotkey },
+                { IDC_HK_PASTE_CLIPBOARD, &mgr->pasteClipboardHotkey },
+            };
+            for (auto& r : rows) {
+                HWND hCtrl = GetDlgItem(hwnd, r.id);
+                if (hCtrl) SetWindowTextW(hCtrl, HotkeyToString(*r.cfg).c_str());
+            }
+            return 0;
+        }
+
+        if (id == IDC_BTN_SAVE) {
+            mgr->UnregisterHotkey();
+            mgr->SaveHotkeyConfig();
+            mgr->RegisterHotkey();
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
-        
+
     case WM_DESTROY:
-        if (mgr && mgr->hwndSettings == hwnd) {
+        if (mgr->hwndSettings == hwnd)
             mgr->hwndSettings = nullptr;
-        }
         return 0;
     }
-    
+
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
