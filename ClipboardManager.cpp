@@ -683,14 +683,23 @@ static std::wstring GetPlainTextForDirectPaste(const ClipboardItem* item) {
     return L"";
 }
 
+static void SendKeyUpIfDown(WORD vk) {
+    if (!(GetAsyncKeyState(vk) & 0x8000)) return;
+    INPUT in = {};
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk;
+    in.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &in, sizeof(INPUT));
+}
+
 // Release keys still held from Ctrl+F11 / Ctrl+Shift+F11 so typing or Ctrl+V is not corrupted.
+// Use explicit L/R virtual keys — generic VK_CONTROL / VK_SHIFT keyup can miss the physical key still down.
 static void ReleaseHotkeyModifiersForPaste() {
-    if (GetAsyncKeyState(VK_F11) & 0x8000)
-        keybd_event(VK_F11, 0, KEYEVENTF_KEYUP, 0);
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
-        keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
-    if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
-        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    SendKeyUpIfDown(VK_F11);
+    SendKeyUpIfDown(VK_LSHIFT);
+    SendKeyUpIfDown(VK_RSHIFT);
+    SendKeyUpIfDown(VK_LCONTROL);
+    SendKeyUpIfDown(VK_RCONTROL);
     Sleep(20);
 }
 
@@ -816,11 +825,20 @@ static std::wstring LastPastedTextFromItem(const ClipboardItem* item) {
     return item->preview;
 }
 
+// One SendInput batch so Ctrl is down before V; keybd_event can interleave badly with our LL hook.
 static void SendCtrlV() {
-    keybd_event(VK_CONTROL, 0, 0, 0);
-    keybd_event('V', 0, 0, 0);
-    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
-    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    INPUT in[4] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_LCONTROL;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = 'V';
+    in[2].type = INPUT_KEYBOARD;
+    in[2].ki.wVk = 'V';
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].type = INPUT_KEYBOARD;
+    in[3].ki.wVk = VK_LCONTROL;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
 }
 
 // ClipboardManager implementation
@@ -2508,7 +2526,10 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
     
     if (nCode >= HC_ACTION && mgr != nullptr && mgr->hwndMain != nullptr) {
         KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
-        
+        // Do not handle keys we inject ourselves (e.g. Ctrl+V from SendCtrlV) — breaks paste in target apps.
+        if (pKeyboard->flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
+            return CallNextHookEx(mgr->hKeyboardHook, nCode, wParam, lParam);
+
         // Check for configured hotkey modifiers
         bool hasCtrl = (mgr->hotkeyConfig.modifiers & MOD_CONTROL) != 0;
         bool hasAlt = (mgr->hotkeyConfig.modifiers & MOD_ALT) != 0;
@@ -2568,7 +2589,8 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         }
     }
     
-    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    HHOOK hook = mgr ? mgr->hKeyboardHook : nullptr;
+    return CallNextHookEx(hook, nCode, wParam, lParam);
 }
 
 void ClipboardManager::SetListSnippetsMode(bool wantSnippets) {
@@ -2958,11 +2980,7 @@ void ClipboardManager::PasteItem(int index) {
             // Small delay before pasting
             Sleep(50);
             
-            // Simulate paste (Ctrl+V)
-            keybd_event(VK_CONTROL, 0, 0, 0);
-            keybd_event('V', 0, 0, 0);
-            keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
-            keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+            SendCtrlV();
             
             // Keep isPasting flag true longer to prevent re-adding the pasted item
             // Some applications copy the pasted content back to clipboard, so we need to wait
@@ -5029,10 +5047,7 @@ void ClipboardManager::PasteSnippet(int index) {
                 Sleep(50);
             }
             Sleep(50);
-            keybd_event(VK_CONTROL, 0, 0, 0);
-            keybd_event('V', 0, 0, 0);
-            keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
-            keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+            SendCtrlV();
             Sleep(500);
         }
     }
