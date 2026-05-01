@@ -656,15 +656,16 @@ static std::wstring GetNormalizedTextForDuplicateCheck(const ClipboardItem* item
 }
 
 // Plain text from a history item for direct injection (paste without system clipboard).
+// Uses full UTF-16 length from stored bytes (trim trailing nulls only) so content matches UIA / clipboard.
 static std::wstring GetPlainTextForDirectPaste(const ClipboardItem* item) {
     if (!item) return L"";
     const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
     if (textData && textData->size() >= sizeof(wchar_t)) {
-        size_t len = textData->size() / sizeof(wchar_t);
+        size_t wcharCount = textData->size() / sizeof(wchar_t);
         const wchar_t* p = (const wchar_t*)textData->data();
-        size_t n = 0;
-        while (n < len && p[n] != L'\0') n++;
-        return std::wstring(p, n);
+        while (wcharCount > 0 && p[wcharCount - 1] == L'\0')
+            wcharCount--;
+        return std::wstring(p, wcharCount);
     }
     textData = item->GetFormatData(CF_TEXT);
     if (textData && !textData->empty()) {
@@ -701,6 +702,22 @@ static void ReleaseHotkeyModifiersForPaste() {
     SendKeyUpIfDown(VK_LCONTROL);
     SendKeyUpIfDown(VK_RCONTROL);
     Sleep(20);
+}
+
+// Release every modifier that can change how injected Unicode is interpreted (Ctrl/Alt/Shift/Win).
+static void ReleaseAllModifierKeysForKeystrokePaste() {
+    SendKeyUpIfDown(VK_MENU);  // generic Alt
+    SendKeyUpIfDown(VK_LMENU);
+    SendKeyUpIfDown(VK_RMENU);
+    SendKeyUpIfDown(VK_CONTROL);
+    SendKeyUpIfDown(VK_LCONTROL);
+    SendKeyUpIfDown(VK_RCONTROL);
+    SendKeyUpIfDown(VK_SHIFT);
+    SendKeyUpIfDown(VK_LSHIFT);
+    SendKeyUpIfDown(VK_RSHIFT);
+    SendKeyUpIfDown(VK_LWIN);
+    SendKeyUpIfDown(VK_RWIN);
+    Sleep(25);
 }
 
 static bool SetClipboardUnicodeOnly(HWND hwnd, const std::wstring& text) {
@@ -839,6 +856,59 @@ static void SendCtrlV() {
     in[3].ki.wVk = VK_LCONTROL;
     in[3].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(4, in, sizeof(INPUT));
+}
+
+// Type plain text into the focused control without using the clipboard (Unicode keyboard events).
+static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
+    ReleaseAllModifierKeysForKeystrokePaste();
+
+    auto pushChar = [](std::vector<INPUT>& out, wchar_t ch) {
+        if (ch == L'\0') return;
+        INPUT down{};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wVk = 0;
+        down.ki.wScan = ch;
+        down.ki.dwFlags = KEYEVENTF_UNICODE;
+        INPUT up = down;
+        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        out.push_back(down);
+        out.push_back(up);
+    };
+
+    const size_t maxInputsPerSend = 64;  // must not split a surrogate pair across SendInput calls
+    std::vector<INPUT> batch;
+    batch.reserve(maxInputsPerSend);
+
+    size_t i = 0;
+    while (i < text.size()) {
+        wchar_t ch = text[i];
+        bool isHighSurrogate = (ch >= 0xD800 && ch <= 0xDBFF);
+        bool pair = isHighSurrogate && (i + 1) < text.size() &&
+            text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF;
+        if (pair) {
+            if (batch.size() + 4 > maxInputsPerSend && !batch.empty()) {
+                if (SendInput((UINT)batch.size(), batch.data(), sizeof(INPUT)) != batch.size())
+                    return false;
+                batch.clear();
+            }
+            pushChar(batch, ch);
+            pushChar(batch, text[i + 1]);
+            i += 2;
+        } else {
+            if (batch.size() + 2 > maxInputsPerSend && !batch.empty()) {
+                if (SendInput((UINT)batch.size(), batch.data(), sizeof(INPUT)) != batch.size())
+                    return false;
+                batch.clear();
+            }
+            pushChar(batch, ch);
+            i += 1;
+        }
+    }
+    if (!batch.empty()) {
+        if (SendInput((UINT)batch.size(), batch.data(), sizeof(INPUT)) != batch.size())
+            return false;
+    }
+    return true;
 }
 
 // ClipboardManager implementation
@@ -2232,6 +2302,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
             
+            if (clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
+                AppendMenu(hMenu, MF_STRING, 106, L"Keystroke paste");
+            }
+            
             if (clickedItemIndex >= 0 && clickedItemIndex < listSize) {
                 AppendMenu(hMenu, MF_STRING, 101, L"Delete");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -2256,6 +2330,17 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             } else if (cmd == 102 && clickedItemIndex >= 0 && clickedItemIndex < listSize && mgr->snippetsMode) {
                 mgr->PasteSnippet(mgr->filteredSnippetIndices[clickedItemIndex]);
                 mgr->HideListWindow();
+            } else if (cmd == 106 && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
+                int savedSel = mgr->selectedIndex;
+                mgr->selectedIndex = clickedItemIndex;
+                bool ok = mgr->PasteToFocusedControlWithoutClipboard(false);
+                mgr->selectedIndex = savedSel;
+                if (!ok) {
+                    MessageBoxW(hwnd, L"Could not paste: no text in history, or the target could not receive keystrokes.",
+                                L"clip2", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    mgr->HideListWindow();
+                }
             } else if (cmd == 103 && mgr->snippetsMode) {
                 mgr->ShowSnippetsManagerDialog();
             } else if (cmd == 104 && mgr->snippetsMode) {
@@ -3315,6 +3400,13 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
 }
 
 #ifdef HAVE_UIAUTOMATION
+// BSTR may contain embedded WChars; std::wstring(bstr) stops at first L'\0'.
+static std::wstring UiaBstrToWstring(BSTR bstr) {
+    if (!bstr) return L"";
+    UINT n = SysStringLen(bstr);
+    return std::wstring(bstr, (size_t)n);
+}
+
 // Returns true if s is a known placeholder / "not accessible" message (not real content).
 static bool IsPlaceholderOrNotAccessibleText(const std::wstring& s) {
     if (s.empty()) return true;
@@ -3347,7 +3439,7 @@ static bool GetTextFromElement(IUIAutomation* pAutomation, IUIAutomationElement*
             if (SUCCEEDED(pRangeArray->GetElement(0, &pRange)) && pRange) {
                 BSTR bstr = nullptr;
                 if (SUCCEEDED(pRange->GetText(-1, &bstr)) && bstr) {
-                    text = bstr;
+                    text = UiaBstrToWstring(bstr);
                     SysFreeString(bstr);
                 }
                 pRange->Release();
@@ -3361,7 +3453,7 @@ static bool GetTextFromElement(IUIAutomation* pAutomation, IUIAutomationElement*
         if (SUCCEEDED(hr) && pDocRange) {
             BSTR bstr = nullptr;
             if (SUCCEEDED(pDocRange->GetText(-1, &bstr)) && bstr) {
-                text = bstr;
+                text = UiaBstrToWstring(bstr);
                 SysFreeString(bstr);
             }
             pDocRange->Release();
@@ -3445,7 +3537,6 @@ bool ClipboardManager::CopyFromFocusedControlViaUIA() {
 }
 
 bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSwap) {
-    (void)useClipboardSwap;
     if (clipboardHistory.empty())
         return false;
     int actualIndex = -1;
@@ -3478,10 +3569,22 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
         AttachThreadInput(curTid, tgtTid, FALSE);
 
     Sleep(80);
-    // Ctrl+F11 / Ctrl+Shift+F11 may still hold Ctrl, Shift, F11 — release before paste
     ReleaseHotkeyModifiersForPaste();
 
     isPasting = true;
+
+    if (!useClipboardSwap) {
+        if (text.empty()) {
+            isPasting = false;
+            return false;
+        }
+        bool ok = SendUnicodeTextAsKeystrokes(text);
+        if (ok)
+            lastPastedText = text;
+        isPasting = false;
+        PlayClickSound();
+        return ok;
+    }
 
     std::map<UINT, std::vector<BYTE>> backup;
     if (!BackupClipboardSerialFormats(hwndMain, backup)) {
