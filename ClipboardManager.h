@@ -214,6 +214,9 @@ private:
     void LoadHotkeyConfig();
     void SaveHotkeyConfig();
     void ShowSettingsDialog();
+    void SetTheme(int themeId);                     // Apply + persist a theme preset and repaint UI.
+    void SetThemeFontColor(COLORREF color);          // Override (or clear, via sentinel) overlay font color.
+    void SetThemeFontFace(const std::wstring& face); // Switch overlay/search font face and repaint.
     // Read text from focused control via UI Automation (when app does not put anything on clipboard)
     bool CopyFromFocusedControlViaUIA();
     // Paste from history into focused control: useClipboardSwap=false sends plain text as Unicode keystrokes (Ctrl+F11).

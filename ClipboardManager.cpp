@@ -35,14 +35,203 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
 
-// AS/400 5250 terminal theme (phosphor green on black)
+// AMOLED neon palette. Background stays pure black (true OLED), the rest of the
+// colors swap depending on the active theme preset selected at runtime.
 namespace Theme5250 {
-    const COLORREF BG        = RGB(0, 0, 0);
-    const COLORREF TXT       = RGB(0, 255, 102);   // phosphor green
-    const COLORREF SEL_BG    = RGB(0, 255, 102);   // reverse video
-    const COLORREF SEL_FG    = RGB(0, 0, 0);       // text on selection
-    const COLORREF BORDER    = RGB(0, 200, 80);
-    const COLORREF DIM       = RGB(0, 128, 40);    // dividers, dimmer elements
+    COLORREF BG        = RGB(0, 0, 0);
+    COLORREF TXT       = RGB(0, 255, 102);
+    COLORREF SEL_BG    = RGB(0, 255, 102);
+    COLORREF SEL_FG    = RGB(0, 0, 0);
+    COLORREF BORDER    = RGB(0, 200, 80);
+    COLORREF DIM       = RGB(0, 128, 40);
+}
+
+enum ThemeId {
+    THEME_NEON_GREEN  = 0,
+    THEME_NEON_RED    = 1,
+    THEME_NEON_BLUE   = 2,
+    THEME_NEON_CYAN   = 3,
+    THEME_NEON_PURPLE = 4,
+    THEME_NEON_YELLOW = 5,
+    THEME_NEON_ORANGE = 6,
+    THEME_NEON_WHITE  = 7,
+    THEME_COUNT
+};
+
+struct ThemePreset {
+    const wchar_t* name;
+    COLORREF txt;
+    COLORREF selBg;
+    COLORREF border;
+    COLORREF dim;
+};
+
+static const ThemePreset kThemePresets[THEME_COUNT] = {
+    { L"Neon Green (AS/400)", RGB(0, 255, 102),   RGB(0, 255, 102),   RGB(0, 200, 80),    RGB(0, 128, 40) },
+    { L"Neon Red",            RGB(255, 32, 64),   RGB(255, 32, 64),   RGB(220, 20, 50),   RGB(120, 8, 24) },
+    { L"Neon Blue",           RGB(40, 120, 255),  RGB(40, 120, 255),  RGB(30, 100, 220),  RGB(16, 56, 140) },
+    { L"Neon Cyan",           RGB(0, 240, 255),   RGB(0, 240, 255),   RGB(0, 200, 230),   RGB(0, 100, 120) },
+    { L"Neon Purple",         RGB(200, 60, 255),  RGB(200, 60, 255),  RGB(170, 40, 220),  RGB(90, 20, 130) },
+    { L"Neon Yellow",         RGB(255, 230, 0),   RGB(255, 230, 0),   RGB(220, 200, 0),   RGB(120, 110, 0) },
+    { L"Neon Orange",         RGB(255, 128, 0),   RGB(255, 128, 0),   RGB(220, 110, 0),   RGB(130, 60, 0) },
+    { L"Neon White",          RGB(240, 240, 240), RGB(240, 240, 240), RGB(200, 200, 200), RGB(110, 110, 110) },
+};
+
+static int g_currentThemeId = THEME_NEON_GREEN;
+
+// Sentinel meaning "no user override — follow the active preset's color".
+// COLORREF is 0x00BBGGRR; a high byte of 0xFF is invalid and safe as a marker.
+static const COLORREF kThemeFontColorPreset = (COLORREF)0xFFFFFFFF;
+static COLORREF g_themeFontColor = kThemeFontColorPreset;
+
+// Overlay/search font family. Empty means use the default. Default font keeps the
+// terminal aesthetic of the original 5250 theme.
+static const wchar_t* kDefaultThemeFontFace = L"Consolas";
+static std::wstring g_themeFontFace = kDefaultThemeFontFace;
+
+static void ApplyThemeId(int id) {
+    if (id < 0 || id >= THEME_COUNT) id = THEME_NEON_GREEN;
+    const ThemePreset& p = kThemePresets[id];
+    g_currentThemeId = id;
+    Theme5250::BG     = RGB(0, 0, 0);
+    Theme5250::SEL_FG = RGB(0, 0, 0);
+    Theme5250::BORDER = p.border;
+    Theme5250::DIM    = p.dim;
+    // Custom font color (when set) drives both text and selection background so the
+    // AMOLED reverse-video look is preserved with whatever neon shade the user picks.
+    if (g_themeFontColor == kThemeFontColorPreset) {
+        Theme5250::TXT    = p.txt;
+        Theme5250::SEL_BG = p.selBg;
+    } else {
+        Theme5250::TXT    = g_themeFontColor;
+        Theme5250::SEL_BG = g_themeFontColor;
+    }
+}
+
+static int LoadThemeIdFromRegistry() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return THEME_NEON_GREEN;
+    DWORD val = THEME_NEON_GREEN, sz = sizeof(DWORD), type = REG_DWORD;
+    if (RegQueryValueExW(hKey, L"ThemeId", nullptr, &type, (LPBYTE)&val, &sz) != ERROR_SUCCESS || type != REG_DWORD)
+        val = THEME_NEON_GREEN;
+    RegCloseKey(hKey);
+    if (val >= THEME_COUNT) val = THEME_NEON_GREEN;
+    return (int)val;
+}
+
+static void SaveThemeIdToRegistry(int id) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD v = (DWORD)id;
+    RegSetValueExW(hKey, L"ThemeId", 0, REG_DWORD, (BYTE*)&v, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
+static COLORREF LoadThemeFontColorFromRegistry() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return kThemeFontColorPreset;
+    DWORD val = kThemeFontColorPreset, sz = sizeof(DWORD), type = REG_DWORD;
+    LONG rc = RegQueryValueExW(hKey, L"ThemeFontColor", nullptr, &type, (LPBYTE)&val, &sz);
+    RegCloseKey(hKey);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return kThemeFontColorPreset;
+    return (COLORREF)val;
+}
+
+static void SaveThemeFontColorToRegistry(COLORREF c) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    if (c == kThemeFontColorPreset) {
+        // Clear the override entirely so the preset color takes back over on next launch.
+        RegDeleteValueW(hKey, L"ThemeFontColor");
+    } else {
+        DWORD v = (DWORD)c;
+        RegSetValueExW(hKey, L"ThemeFontColor", 0, REG_DWORD, (BYTE*)&v, sizeof(DWORD));
+    }
+    RegCloseKey(hKey);
+}
+
+static std::wstring LoadThemeFontFaceFromRegistry() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return kDefaultThemeFontFace;
+    wchar_t buf[LF_FACESIZE + 1] = {};
+    DWORD bytes = sizeof(buf) - sizeof(wchar_t);
+    DWORD type = REG_SZ;
+    LONG rc = RegQueryValueExW(hKey, L"ThemeFontFace", nullptr, &type, (LPBYTE)buf, &bytes);
+    RegCloseKey(hKey);
+    if (rc != ERROR_SUCCESS || type != REG_SZ || buf[0] == 0) return kDefaultThemeFontFace;
+    return std::wstring(buf);
+}
+
+static void SaveThemeFontFaceToRegistry(const std::wstring& face) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    if (face.empty() || face == kDefaultThemeFontFace) {
+        RegDeleteValueW(hKey, L"ThemeFontFace");
+    } else {
+        std::wstring clipped = face.size() <= LF_FACESIZE - 1 ? face : face.substr(0, LF_FACESIZE - 1);
+        RegSetValueExW(hKey, L"ThemeFontFace", 0, REG_SZ,
+                       (const BYTE*)clipped.c_str(), (DWORD)((clipped.size() + 1) * sizeof(wchar_t)));
+    }
+    RegCloseKey(hKey);
+}
+
+// Shared font handle used by the overlay paint loop and the search box. Re-created on
+// demand whenever the user picks a different face from Settings. The previous code
+// created two separate hard-coded "Consolas" fonts (one in CreateWindowEx setup for
+// the search edit, one inside WM_PAINT); they are unified here.
+static HFONT g_overlayFont = nullptr;
+static std::wstring g_overlayFontCachedFace;
+
+static HFONT GetOverlayFont() {
+    const std::wstring& want = g_themeFontFace.empty() ? std::wstring(kDefaultThemeFontFace) : g_themeFontFace;
+    if (g_overlayFont != nullptr && g_overlayFontCachedFace == want)
+        return g_overlayFont;
+    if (g_overlayFont) {
+        DeleteObject(g_overlayFont);
+        g_overlayFont = nullptr;
+    }
+    g_overlayFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, want.c_str());
+    g_overlayFontCachedFace = want;
+    return g_overlayFont;
+}
+
+static void ResetOverlayFontCache() {
+    if (g_overlayFont) {
+        DeleteObject(g_overlayFont);
+        g_overlayFont = nullptr;
+    }
+    g_overlayFontCachedFace.clear();
+}
+
+// Best-effort check that a font family actually exists on the system before we accept
+// it from the registry. Avoids ending up with a blank UI if a user-typed face is wrong.
+static bool FontFamilyExists(const std::wstring& face) {
+    if (face.empty()) return false;
+    HDC hdc = GetDC(nullptr);
+    if (!hdc) return false;
+    LOGFONTW lf = {};
+    wcsncpy_s(lf.lfFaceName, face.c_str(), _TRUNCATE);
+    lf.lfCharSet = DEFAULT_CHARSET;
+    bool found = false;
+    EnumFontFamiliesExW(hdc, &lf,
+        [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM lParam) -> int {
+            *(bool*)lParam = true;
+            return 0;
+        },
+        (LPARAM)&found, 0);
+    ReleaseDC(nullptr, hdc);
+    return found;
 }
 
 ClipboardManager* ClipboardManager::instance = nullptr;
@@ -72,6 +261,35 @@ static DWORD CALLBACK RichEditStreamOutCallback(DWORD_PTR cookie, LPBYTE buf, LO
 static bool IsRtfContent(const std::wstring& s) {
     if (s.size() < 5) return false;
     return (s[0] == L'{' && s[1] == L'\\' && (s[2] == L'r' || s[2] == L'R') && (s[3] == L't' || s[3] == L'T') && (s[4] == L'f' || s[4] == L'F'));
+}
+
+// Convert RTF bytes to a plain wide-string by streaming through a message-only RichEdit.
+// Returns empty on failure. Used so that when a snippet is stored only as RTF (no
+// contentPlain), we can still publish a correct CF_UNICODETEXT view of it.
+static std::wstring ExtractPlainFromRtfBytes(const std::string& rtfBytes) {
+    if (rtfBytes.empty()) return L"";
+    static bool s_msftedit = false;
+    if (!s_msftedit) {
+        LoadLibraryW(L"Msftedit.dll");
+        s_msftedit = true;
+    }
+    HWND hRe = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
+        ES_MULTILINE | ES_AUTOVSCROLL, 0, 0, 10, 10,
+        HWND_MESSAGE, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!hRe) return L"";
+    StreamCookie cookie = { rtfBytes.data(), 0, rtfBytes.size(), nullptr };
+    EDITSTREAM es = { (DWORD_PTR)&cookie, 0, RichEditStreamInCallback };
+    SendMessageW(hRe, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+    LONG len = GetWindowTextLengthW(hRe);
+    std::wstring out;
+    if (len > 0) {
+        out.resize((size_t)len + 1);
+        int got = GetWindowTextW(hRe, &out[0], (int)out.size());
+        if (got > 0) out.resize((size_t)got);
+        else out.clear();
+    }
+    DestroyWindow(hRe);
+    return out;
 }
 
 // ClipboardItem methods
@@ -858,12 +1076,103 @@ static void SendCtrlV() {
     SendInput(4, in, sizeof(INPUT));
 }
 
+// Cached registered clipboard formats for rich text/HTML.
+static UINT CfRtf() {
+    static UINT cf = 0;
+    if (cf == 0) cf = RegisterClipboardFormatA("Rich Text Format");
+    return cf;
+}
+static UINT CfHtml() {
+    static UINT cf = 0;
+    if (cf == 0) cf = RegisterClipboardFormatA("HTML Format");
+    return cf;
+}
+
+// Robust OpenClipboard with retries. Some apps hold the clipboard briefly when copying.
+static bool OpenClipboardWithRetry(HWND hwnd, int attempts = 24, int sleepMs = 8) {
+    for (int i = 0; i < attempts; i++) {
+        if (OpenClipboard(hwnd)) return true;
+        Sleep(sleepMs);
+    }
+    return false;
+}
+
+// Allocate moveable global memory, copy bytes, and put it on the clipboard for `fmt`.
+// Clipboard must be open. Returns true on success (clipboard takes ownership).
+static bool PutBytesOnClipboard(UINT fmt, const void* data, size_t size) {
+    if (!data || size == 0) return false;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!hMem) return false;
+    void* p = GlobalLock(hMem);
+    if (!p) { GlobalFree(hMem); return false; }
+    memcpy(p, data, size);
+    GlobalUnlock(hMem);
+    if (!SetClipboardData(fmt, hMem)) {
+        GlobalFree(hMem);
+        return false;
+    }
+    return true;
+}
+
+// Convert a "stored RTF" wstring (where each wchar holds one RTF byte 0..255) back into
+// a byte string suitable for the "Rich Text Format" clipboard format.
+static std::string RtfBytesFromStoredWide(const std::wstring& packed) {
+    std::string out;
+    out.reserve(packed.size());
+    for (wchar_t wc : packed) out += (char)(wc & 0xFF);
+    return out;
+}
+
+// True when an item carries text/RTF (anything we can combine into a single paste payload).
+static bool ItemHasOnlyTextFormats(const ClipboardItem* item) {
+    if (!item) return false;
+    UINT rtf = CfRtf();
+    UINT html = CfHtml();
+    for (const auto& kv : item->formats) {
+        UINT f = kv.first;
+        if (f == CF_UNICODETEXT || f == CF_TEXT || f == CF_OEMTEXT || f == CF_LOCALE) continue;
+        if (rtf && f == rtf) continue;
+        if (html && f == html) continue;
+        return false;
+    }
+    return true;
+}
+
+// Build a minimal RTF document wrapping `text` as a single paragraph block. Used to seed
+// rich-text-aware targets when concatenating multiple plain items.
+static std::string BuildRtfWrapFromUnicode(const std::wstring& text) {
+    std::string s;
+    s.reserve(text.size() * 3 + 128);
+    s += "{\\rtf1\\ansi\\ansicpg1252\\deff0\\nouicompat\\deflang1033"
+         "{\\fonttbl{\\f0\\fnil\\fcharset0 Calibri;}}"
+         "\\f0\\fs22 ";
+    for (size_t i = 0; i < text.size(); i++) {
+        wchar_t wc = text[i];
+        if (wc == L'\r') continue;
+        if (wc == L'\n') { s += "\\par\n"; continue; }
+        if (wc == L'\\' || wc == L'{' || wc == L'}') { s += '\\'; s += (char)wc; continue; }
+        if (wc < 0x80 && wc >= 0x20) { s += (char)wc; continue; }
+        if (wc == L'\t') { s += "\\tab "; continue; }
+        char buf[24];
+        int code = (int)(short)wc;  // RTF uses signed 16-bit
+        snprintf(buf, sizeof(buf), "\\u%d? ", code);
+        s += buf;
+    }
+    s += "}";
+    return s;
+}
+
 // Type plain text into the focused control without using the clipboard (Unicode keyboard events).
+// Improvements over the previous version:
+//   - Small batches (24 inputs) so the receiving app's input queue does not drop events.
+//   - Partial SendInput results are retried from the next index instead of dropping the tail.
+//   - Brief pacing between batches; \r/\n converted to a real VK_RETURN keystroke so rich
+//     editors (Word, OneNote, browsers) get real Enter events instead of literal U+000A.
 static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
     ReleaseAllModifierKeysForKeystrokePaste();
+    if (text.empty()) return true;
 
-    auto pushChar = [](std::vector<INPUT>& out, wchar_t ch) {
-        if (ch == L'\0') return;
+    auto pushUnicode = [](std::vector<INPUT>& out, wchar_t ch) {
         INPUT down{};
         down.type = INPUT_KEYBOARD;
         down.ki.wVk = 0;
@@ -874,41 +1183,83 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
         out.push_back(down);
         out.push_back(up);
     };
+    auto pushVK = [](std::vector<INPUT>& out, WORD vk) {
+        INPUT down{};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wVk = vk;
+        INPUT up = down;
+        up.ki.dwFlags = KEYEVENTF_KEYUP;
+        out.push_back(down);
+        out.push_back(up);
+    };
 
-    const size_t maxInputsPerSend = 64;  // must not split a surrogate pair across SendInput calls
+    auto flushBatch = [](std::vector<INPUT>& b) -> bool {
+        if (b.empty()) return true;
+        UINT total = (UINT)b.size();
+        UINT idx = 0;
+        for (int attempt = 0; attempt < 8 && idx < total; attempt++) {
+            UINT sent = SendInput(total - idx, b.data() + idx, sizeof(INPUT));
+            if (sent == 0) {
+                DWORD err = GetLastError();
+                (void)err;
+                Sleep(10);
+                continue;
+            }
+            idx += sent;
+            if (idx < total) Sleep(4);
+        }
+        b.clear();
+        return idx == total;
+    };
+
+    const size_t kBatchCap = 24;  // 12 chars per batch max
     std::vector<INPUT> batch;
-    batch.reserve(maxInputsPerSend);
+    batch.reserve(kBatchCap + 4);
 
     size_t i = 0;
     while (i < text.size()) {
         wchar_t ch = text[i];
+
+        // \r\n → single VK_RETURN; lone \n/\r → VK_RETURN; literal \t → VK_TAB.
+        if (ch == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') {
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            pushVK(batch, VK_RETURN);
+            i += 2;
+            continue;
+        }
+        if (ch == L'\r' || ch == L'\n') {
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            pushVK(batch, VK_RETURN);
+            i += 1;
+            continue;
+        }
+        if (ch == L'\t') {
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            pushVK(batch, VK_TAB);
+            i += 1;
+            continue;
+        }
+
+        // Surrogate pair: 4 inputs must go together in one batch.
         bool isHighSurrogate = (ch >= 0xD800 && ch <= 0xDBFF);
         bool pair = isHighSurrogate && (i + 1) < text.size() &&
             text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF;
         if (pair) {
-            if (batch.size() + 4 > maxInputsPerSend && !batch.empty()) {
-                if (SendInput((UINT)batch.size(), batch.data(), sizeof(INPUT)) != batch.size())
-                    return false;
-                batch.clear();
-            }
-            pushChar(batch, ch);
-            pushChar(batch, text[i + 1]);
+            if (batch.size() + 4 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            pushUnicode(batch, ch);
+            pushUnicode(batch, text[i + 1]);
             i += 2;
         } else {
-            if (batch.size() + 2 > maxInputsPerSend && !batch.empty()) {
-                if (SendInput((UINT)batch.size(), batch.data(), sizeof(INPUT)) != batch.size())
-                    return false;
-                batch.clear();
-            }
-            pushChar(batch, ch);
+            if (ch == L'\0') { i += 1; continue; }
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            pushUnicode(batch, ch);
             i += 1;
         }
+
+        // Larger texts: yield briefly every ~256 chars to keep the foreground app responsive.
+        if ((i & 0xFF) == 0) Sleep(1);
     }
-    if (!batch.empty()) {
-        if (SendInput((UINT)batch.size(), batch.data(), sizeof(INPUT)) != batch.size())
-            return false;
-    }
-    return true;
+    return flushBatch(batch);
 }
 
 // ClipboardManager implementation
@@ -918,8 +1269,11 @@ ClipboardManager::ClipboardManager()
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
     hotkeyConfig.vkCode = VK_DECIMAL;
-    snippetsHotkey.modifiers = MOD_CONTROL;
-    snippetsHotkey.vkCode = VK_NUMPAD0;
+    // Snippets overlay has no default shortcut. The overlay can still be opened from the
+    // tray menu, from the clipboard overlay via Ctrl+Right, or by typing *set + Enter.
+    // Users can assign a custom binding via Settings if they want one.
+    snippetsHotkey.modifiers = 0;
+    snippetsHotkey.vkCode = 0;
     copyFocusedHotkey.modifiers = MOD_CONTROL;
     copyFocusedHotkey.vkCode = VK_F10;
     pasteFocusedHotkey.modifiers = MOD_CONTROL;
@@ -940,7 +1294,19 @@ bool ClipboardManager::Initialize() {
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
         // COM initialization failed, but continue anyway
     }
-    
+
+    // Apply the saved theme BEFORE registering window classes — class background brushes
+    // capture the color at registration time. Font color/face overrides are loaded here
+    // so the very first overlay paint uses the chosen font and accent color.
+    g_themeFontColor = LoadThemeFontColorFromRegistry();
+    std::wstring savedFace = LoadThemeFontFaceFromRegistry();
+    if (!savedFace.empty() && FontFamilyExists(savedFace))
+        g_themeFontFace = savedFace;
+    else
+        g_themeFontFace = kDefaultThemeFontFace;
+    ResetOverlayFontCache();
+    ApplyThemeId(LoadThemeIdFromRegistry());
+
     // Register window class for main window
     WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
@@ -1033,9 +1399,7 @@ bool ClipboardManager::Initialize() {
     );
     
     if (hwndSearch) {
-        static HFONT hSearchFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-        SendMessage(hwndSearch, WM_SETFONT, (WPARAM)hSearchFont, TRUE);
+        SendMessage(hwndSearch, WM_SETFONT, (WPARAM)GetOverlayFont(), TRUE);
         SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
         // Subclass the edit control to handle Enter key
         originalSearchEditProc = (WNDPROC)SetWindowLongPtr(hwndSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
@@ -1556,14 +1920,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         // Draw background - 5250 black
         FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
         
-        // Use monospace font for terminal look
-        static HFONT hFont5250 = nullptr;
-        if (!hFont5250) {
-            hFont5250 = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN,
-                L"Consolas");
-        }
-        HGDIOBJ hOldFont = SelectObject(hdc, hFont5250);
+        // Selected user font (defaults to Consolas for the terminal look).
+        HGDIOBJ hOldFont = SelectObject(hdc, GetOverlayFont());
         
         // Draw border - 5250 green (sharper corners for terminal look)
         HPEN hBorderPen = CreatePen(PS_SOLID, 2, Theme5250::BORDER);
@@ -2393,11 +2751,19 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_CTLCOLOREDIT:
         {
-            // Style the search edit control - 5250 theme
+            // Style the search edit control. Theme can change at runtime, so the cached
+            // brush must be recreated when BG changes; otherwise we'd leak the old brush
+            // (or worse, return one tied to a different theme).
             HDC hdcEdit = (HDC)wParam;
             SetTextColor(hdcEdit, Theme5250::TXT);
             SetBkColor(hdcEdit, Theme5250::BG);
-            static HBRUSH hDarkBrush = CreateSolidBrush(Theme5250::BG);
+            static HBRUSH hDarkBrush = nullptr;
+            static COLORREF hDarkBrushColor = (COLORREF)~0u;
+            if (!hDarkBrush || hDarkBrushColor != Theme5250::BG) {
+                if (hDarkBrush) DeleteObject(hDarkBrush);
+                hDarkBrush = CreateSolidBrush(Theme5250::BG);
+                hDarkBrushColor = Theme5250::BG;
+            }
             return (LRESULT)hDarkBrush;
         }
     
@@ -2627,15 +2993,19 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
         
         {
-            bool snipCtrl  = (mgr->snippetsHotkey.modifiers & MOD_CONTROL) != 0;
-            bool snipAlt   = (mgr->snippetsHotkey.modifiers & MOD_ALT) != 0;
-            bool snipShift = (mgr->snippetsHotkey.modifiers & MOD_SHIFT) != 0;
-            bool snipWin   = (mgr->snippetsHotkey.modifiers & MOD_WIN) != 0;
-            bool snipMatch = (snipCtrl == isCtrlPressed) && (snipAlt == isAltPressed) &&
-                             (snipShift == isShiftPressed) && (snipWin == isWinPressed);
-            if (wParam == WM_KEYDOWN && snipMatch && pKeyboard->vkCode == mgr->snippetsHotkey.vkCode) {
-                PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
-                return 1;
+            // Snippets overlay shortcut is optional — if the user has not bound one
+            // (vkCode == 0) we skip dispatch entirely so the keypress falls through.
+            if (mgr->snippetsHotkey.vkCode != 0) {
+                bool snipCtrl  = (mgr->snippetsHotkey.modifiers & MOD_CONTROL) != 0;
+                bool snipAlt   = (mgr->snippetsHotkey.modifiers & MOD_ALT) != 0;
+                bool snipShift = (mgr->snippetsHotkey.modifiers & MOD_SHIFT) != 0;
+                bool snipWin   = (mgr->snippetsHotkey.modifiers & MOD_WIN) != 0;
+                bool snipMatch = (snipCtrl == isCtrlPressed) && (snipAlt == isAltPressed) &&
+                                 (snipShift == isShiftPressed) && (snipWin == isWinPressed);
+                if (wParam == WM_KEYDOWN && snipMatch && pKeyboard->vkCode == mgr->snippetsHotkey.vkCode) {
+                    PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
+                    return 1;
+                }
             }
         }
         
@@ -2914,176 +3284,77 @@ void ClipboardManager::UpdateListWindow() {
 }
 
 void ClipboardManager::PasteItem(int index) {
-    // index is a filtered index, convert to actual index
-    if (index < 0 || index >= (int)filteredIndices.size()) {
-        return;
-    }
-    
+    if (index < 0 || index >= (int)filteredIndices.size()) return;
     int actualIndex = filteredIndices[index];
-    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) {
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) return;
+
+    const auto& item = clipboardHistory[actualIndex];
+    if (!item) return;
+
+    bool pasteAsPlainText = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+
+    isPasting = true;
+
+    std::wstring plainText = GetPlainTextForDirectPaste(item.get());
+
+    if (!OpenClipboardWithRetry(hwndMain, 24, 8)) {
+        isPasting = false;
         return;
     }
-    
-    const auto& item = clipboardHistory[actualIndex];
-    
-    // Check if Ctrl is held - if so, paste as plain text only
-    bool pasteAsPlainText = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    
-    // Set flag to ignore clipboard changes we're about to make
-    isPasting = true;
-    
-    // Small delay to ensure clipboard is ready
-    Sleep(10);
-    
-    if (OpenClipboard(hwndMain)) {
-        EmptyClipboard();
-        
-        bool success = false;
-        
-        if (pasteAsPlainText) {
-            // Paste as plain text only - extract plain text from the item
-            std::wstring plainText;
-            
-            // Try to extract plain text - check formats in order of preference
-            const std::vector<BYTE>* textData = nullptr;
-            
-            // Try Unicode text first
-            textData = item->GetFormatData(CF_UNICODETEXT);
-            if (textData && textData->size() >= sizeof(wchar_t)) {
-                size_t len = (textData->size() / sizeof(wchar_t)) - 1; // Exclude null terminator
-                plainText = std::wstring((wchar_t*)textData->data(), len);
-            } else {
-                // Try ANSI text
-                textData = item->GetFormatData(CF_TEXT);
-                if (textData && textData->size() > 0) {
-                    size_t len = textData->size() - 1; // Exclude null terminator
-                    std::string ansiText((char*)textData->data(), len);
-                    int wideLen = MultiByteToWideChar(CP_ACP, 0, ansiText.c_str(), -1, nullptr, 0);
-                    if (wideLen > 0) {
-                        plainText.resize(wideLen - 1);
-                        MultiByteToWideChar(CP_ACP, 0, ansiText.c_str(), -1, &plainText[0], wideLen);
-                    }
-                } else {
-                    // For other formats (RTF, HTML, etc.), try to extract text from preview
-                    // Use the preview string which should contain plain text representation
-                    plainText = item->preview;
-                }
-            }
-            
-            if (!plainText.empty()) {
-                // Set as Unicode text
-                size_t dataSize = (plainText.length() + 1) * sizeof(wchar_t);
-                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
-                if (hMem) {
-                    wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
-                    if (pMem) {
-                        wcscpy_s(pMem, plainText.length() + 1, plainText.c_str());
-                        GlobalUnlock(hMem);
-                        
-                        if (SetClipboardData(CF_UNICODETEXT, hMem)) {
-                            success = true;
-                        } else {
-                            GlobalFree(hMem);
-                        }
-                    } else {
-                        GlobalFree(hMem);
-                    }
-                }
-            }
-        } else {
-            // Paste with ALL original formats to preserve formatting (bold, colors, sizes, etc.)
-            // This ensures rich text, RTF, HTML, and all other formats are restored
-            bool firstFormat = true;
-            for (const auto& formatPair : item->formats) {
-                UINT fmt = formatPair.first;
-                const std::vector<BYTE>& formatData = formatPair.second;
-                
-                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, formatData.size());
-                if (hMem) {
-                    void* pMem = GlobalLock(hMem);
-                    if (pMem) {
-                        memcpy(pMem, formatData.data(), formatData.size());
-                        GlobalUnlock(hMem);
-                        
-                        // SetClipboardData takes ownership of hMem on success, so don't free it
-                        if (SetClipboardData(fmt, hMem)) {
-                            if (firstFormat) {
-                                success = true;
-                                firstFormat = false;
-                            }
-                            // Note: hMem is now owned by the clipboard, don't free it
-                        } else {
-                            // Only free if SetClipboardData failed
-                            GlobalFree(hMem);
-                        }
-                    } else {
-                        GlobalFree(hMem);
-                    }
-                }
-            }
+    EmptyClipboard();
+
+    bool success = false;
+    if (pasteAsPlainText) {
+        std::wstring t = plainText.empty() ? item->preview : plainText;
+        if (!t.empty()) {
+            size_t bytes = (t.size() + 1) * sizeof(wchar_t);
+            success = PutBytesOnClipboard(CF_UNICODETEXT, t.c_str(), bytes);
         }
-        
-        CloseClipboard();
-        
-        if (success) {
-            // Store the text we're about to paste so we can ignore it if it's copied back
-            // Extract text from the item for comparison
-            if (!pasteAsPlainText) {
-                // For full format paste, extract text from CF_UNICODETEXT if available
-                const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
-                if (textData && textData->size() >= sizeof(wchar_t)) {
-                    size_t len = textData->size() / sizeof(wchar_t);
-                    if (len > 0) {
-                        const wchar_t* textPtr = (const wchar_t*)textData->data();
-                        size_t actualLen = len;
-                        for (size_t j = 0; j < len; j++) {
-                            if (textPtr[j] == L'\0') {
-                                actualLen = j;
-                                break;
-                            }
-                        }
-                        if (actualLen > 0) {
-                            lastPastedText = std::wstring(textPtr, actualLen);
-                        }
-                    }
-                } else {
-                    // Fallback to preview text
-                    lastPastedText = item->preview;
-                }
-            }
-            
-            // Update sequence number AFTER setting clipboard - this is the sequence number of our paste
-            lastSequenceNumber = GetClipboardSequenceNumber();
-            
-            // Restore focus to previous window before pasting
-            if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
-                SetForegroundWindow(previousFocusWindow);
-                SetFocus(previousFocusWindow);
-                Sleep(50); // Give window time to receive focus
-            }
-            
-            // Small delay before pasting
-            Sleep(50);
-            
-            SendCtrlV();
-            
-            // Keep isPasting flag true longer to prevent re-adding the pasted item
-            // Some applications copy the pasted content back to clipboard, so we need to wait
-            Sleep(500); // Increased delay to ignore clipboard updates from paste operation
-            
-            isPasting = false;
-        } else {
-            isPasting = false;
+    } else if (!item->formats.empty()) {
+        for (const auto& fp : item->formats) {
+            if (fp.second.empty()) continue;
+            if (PutBytesOnClipboard(fp.first, fp.second.data(), fp.second.size()))
+                success = true;
         }
-    } else {
-        isPasting = false;
+        if (!success && !plainText.empty()) {
+            size_t bytes = (plainText.size() + 1) * sizeof(wchar_t);
+            success = PutBytesOnClipboard(CF_UNICODETEXT, plainText.c_str(), bytes);
+        }
+    } else if (!plainText.empty()) {
+        size_t bytes = (plainText.size() + 1) * sizeof(wchar_t);
+        success = PutBytesOnClipboard(CF_UNICODETEXT, plainText.c_str(), bytes);
     }
+    CloseClipboard();
+
+    if (!success) {
+        isPasting = false;
+        return;
+    }
+
+    if (!plainText.empty())
+        lastPastedText = plainText;
+    else
+        lastPastedText = item->preview;
+    lastSequenceNumber = GetClipboardSequenceNumber();
+
+    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+        SetForegroundWindow(previousFocusWindow);
+        SetFocus(previousFocusWindow);
+        Sleep(40);
+    }
+    ReleaseHotkeyModifiersForPaste();
+    Sleep(20);
+
+    SendCtrlV();
+
+    // Keep isPasting set for a while: some apps echo what was pasted right back to the clipboard,
+    // and we want the duplicate detector to ignore that.
+    Sleep(420);
+    isPasting = false;
 }
 
 void ClipboardManager::PasteMultipleItems() {
-    if (multiSelectedIndices.empty()) {
-        return;
-    }
+    if (multiSelectedIndices.empty()) return;
 
     // Sort indices so pasting follows visible top-to-bottom order.
     std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
@@ -3098,23 +3369,29 @@ void ClipboardManager::PasteMultipleItems() {
         selectedItems.push_back(clipboardHistory[actualIndex].get());
     }
 
-    if (selectedItems.empty()) {
-        ClearMultiSelection();
-        return;
-    }
+    if (selectedItems.empty()) { ClearMultiSelection(); return; }
 
-    // Ctrl+Enter in multi-select keeps plain text behavior for quick text-only paste.
+    // Ctrl+Enter forces plain text mode and skips RTF/HTML.
     bool pasteAsPlainText = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
-    // Keep this true for the whole multi-paste session.
+    // Decide fast vs slow path. Fast path: every selected item is text/RTF/HTML only — we
+    // can combine them into ONE clipboard payload and paste once. Slow path: at least one
+    // item carries an image or other binary clipboard format and must be replayed in turn.
+    bool fastPath = true;
+    for (const ClipboardItem* it : selectedItems) {
+        if (!it) continue;
+        if (!ItemHasOnlyTextFormats(it)) { fastPath = false; break; }
+        std::wstring t = GetPlainTextForDirectPaste(it);
+        if (t.empty()) { fastPath = false; break; }
+    }
+
     isPasting = true;
 
     if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
         SetForegroundWindow(previousFocusWindow);
         SetFocus(previousFocusWindow);
-        Sleep(150);
+        Sleep(70);
     }
-
     ReleaseHotkeyModifiersForPaste();
 
     std::map<UINT, std::vector<BYTE>> backup;
@@ -3124,34 +3401,93 @@ void ClipboardManager::PasteMultipleItems() {
         return;
     }
 
-    std::wstring pastedTextAggregate;
+    if (fastPath) {
+        // ---- FAST PATH: combine all selected items into one clipboard payload ----
+        const wchar_t* sep = L"\r\n";
+        std::wstring combined;
+        bool anyRtfSource = false;
+        UINT cfRtf = CfRtf();
+        for (size_t i = 0; i < selectedItems.size(); i++) {
+            const ClipboardItem* it = selectedItems[i];
+            if (!it) continue;
+            std::wstring t = GetPlainTextForDirectPaste(it);
+            if (i > 0) combined += sep;
+            combined += t;
+            if (cfRtf != 0) {
+                const std::vector<BYTE>* rtf = it->GetFormatData(cfRtf);
+                if (rtf && !rtf->empty()) anyRtfSource = true;
+            }
+        }
+
+        bool clipboardSet = false;
+        if (OpenClipboardWithRetry(hwndMain, 30, 8)) {
+            EmptyClipboard();
+            if (!combined.empty()) {
+                size_t bytes = (combined.size() + 1) * sizeof(wchar_t);
+                if (PutBytesOnClipboard(CF_UNICODETEXT, combined.c_str(), bytes))
+                    clipboardSet = true;
+            }
+            if (!pasteAsPlainText && anyRtfSource && cfRtf != 0 && !combined.empty()) {
+                // Provide an RTF doc too so rich-text targets receive a real RTF stream.
+                std::string rtf = BuildRtfWrapFromUnicode(combined);
+                if (!rtf.empty())
+                    PutBytesOnClipboard(cfRtf, rtf.data(), rtf.size() + 1);
+            }
+            CloseClipboard();
+        }
+
+        if (!clipboardSet) {
+            RestoreClipboardSerialFormats(hwndMain, backup);
+            isPasting = false;
+            ClearMultiSelection();
+            return;
+        }
+
+        lastPastedText = combined;
+        lastSequenceNumber = GetClipboardSequenceNumber();
+        Sleep(30);
+        SendCtrlV();
+        Sleep(320);
+        RestoreClipboardSerialFormats(hwndMain, backup);
+        lastSequenceNumber = GetClipboardSequenceNumber();
+        Sleep(70);
+        isPasting = false;
+        ClearMultiSelection();
+        PlayClickSound();
+        return;
+    }
+
+    // ---- SLOW PATH: at least one non-text item; replay each item via swap+Ctrl+V ----
+    // Longer pacing than before because the previous timings were too aggressive on
+    // slower editors (Office apps, browsers) and dropped trailing items.
+    const DWORD kFocusMs           = 70;
+    const DWORD kAfterItemMs       = 200;
+    const DWORD kAfterSeparatorMs  = 140;
+    const DWORD kTailBeforeRestore = 200;
+    (void)kFocusMs;
 
     auto waitForClipboardReady = [&]() {
-        for (int attempt = 0; attempt < 20; attempt++) {
-            if (OpenClipboard(hwndMain)) {
-                CloseClipboard();
-                return true;
-            }
-            Sleep(15);
+        for (int attempt = 0; attempt < 32; attempt++) {
+            if (OpenClipboard(hwndMain)) { CloseClipboard(); return true; }
+            Sleep(8);
         }
         return false;
     };
+
+    std::wstring pastedTextAggregate;
 
     for (size_t i = 0; i < selectedItems.size(); i++) {
         const ClipboardItem* item = selectedItems[i];
         if (!item) continue;
 
         std::wstring plainText = GetPlainTextForDirectPaste(item);
-
         waitForClipboardReady();
 
         bool clipboardSet = false;
-        if (!pasteAsPlainText && !item->formats.empty()) {
+        if (!pasteAsPlainText && !item->formats.empty())
             clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
-        }
-        if (!clipboardSet && !plainText.empty()) {
+        if (!clipboardSet && !plainText.empty())
             clipboardSet = SetClipboardUnicodeOnly(hwndMain, plainText);
-        }
         if (!clipboardSet) continue;
 
         if (!plainText.empty()) {
@@ -3160,29 +3496,31 @@ void ClipboardManager::PasteMultipleItems() {
         }
 
         lastSequenceNumber = GetClipboardSequenceNumber();
+        Sleep(20);
         SendCtrlV();
-        Sleep(250);
+        Sleep(kAfterItemMs);
 
         if (i + 1 < selectedItems.size()) {
             waitForClipboardReady();
             if (SetClipboardUnicodeOnly(hwndMain, L"\r\n")) {
                 lastSequenceNumber = GetClipboardSequenceNumber();
+                Sleep(20);
                 SendCtrlV();
-                Sleep(250);
+                Sleep(kAfterSeparatorMs);
             }
         }
     }
 
+    Sleep(kTailBeforeRestore);
     RestoreClipboardSerialFormats(hwndMain, backup);
     lastSequenceNumber = GetClipboardSequenceNumber();
-    if (!pastedTextAggregate.empty()) {
+    if (!pastedTextAggregate.empty())
         lastPastedText = pastedTextAggregate;
-    }
 
-    Sleep(350);
+    Sleep(80);
     isPasting = false;
-
     ClearMultiSelection();
+    PlayClickSound();
 }
 
 void ClipboardManager::ToggleMultiSelect(int filteredIndex) {
@@ -3578,11 +3916,15 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
             isPasting = false;
             return false;
         }
+        // SendUnicodeTextAsKeystrokes handles batching, partial-send retries, and \r\n.
         bool ok = SendUnicodeTextAsKeystrokes(text);
-        if (ok)
+        if (ok) {
             lastPastedText = text;
+            // Give the receiving app a beat before the next event so trailing chars actually land.
+            Sleep(60);
+        }
         isPasting = false;
-        PlayClickSound();
+        if (ok) PlayClickSound();
         return ok;
     }
 
@@ -3610,8 +3952,9 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
 
     lastSequenceNumber = GetClipboardSequenceNumber();
 
+    Sleep(20);
     SendCtrlV();
-    Sleep(220);
+    Sleep(260);
     RestoreClipboardSerialFormats(hwndMain, backup);
     lastSequenceNumber = GetClipboardSequenceNumber();
 
@@ -4959,6 +5302,13 @@ void ClipboardManager::LoadHotkeyConfig() {
     RegReadHotkey(hKey, L"PasteFocusedModifiers",     L"PasteFocusedVkCode",    pasteFocusedHotkey);
     RegReadHotkey(hKey, L"PasteClipboardModifiers",   L"PasteClipboardVkCode",  pasteClipboardHotkey);
     RegCloseKey(hKey);
+
+    // Migration: the legacy default snippet hotkey was Ctrl+NumPad0. It has been removed,
+    // so users with that combo persisted from an older build get it cleared automatically.
+    if (snippetsHotkey.modifiers == MOD_CONTROL && snippetsHotkey.vkCode == VK_NUMPAD0) {
+        snippetsHotkey.modifiers = 0;
+        snippetsHotkey.vkCode = 0;
+    }
 }
 
 void ClipboardManager::SaveHotkeyConfig() {
@@ -4972,6 +5322,62 @@ void ClipboardManager::SaveHotkeyConfig() {
     RegWriteHotkey(hKey, L"PasteFocusedModifiers",     L"PasteFocusedVkCode",    pasteFocusedHotkey);
     RegWriteHotkey(hKey, L"PasteClipboardModifiers",   L"PasteClipboardVkCode",  pasteClipboardHotkey);
     RegCloseKey(hKey);
+}
+
+void ClipboardManager::SetTheme(int themeId) {
+    ApplyThemeId(themeId);
+    SaveThemeIdToRegistry(themeId);
+
+    // Update the class background brush so newly-erased regions (e.g. resize, system
+    // animations) use the new color. We swap with SetClassLongPtr and delete the previous
+    // brush to avoid GDI leaks.
+    auto refreshClassBrush = [](HWND hwnd, COLORREF c) {
+        if (!hwnd) return;
+        HBRUSH oldBrush = (HBRUSH)GetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND);
+        HBRUSH newBrush = CreateSolidBrush(c);
+        if (newBrush) {
+            SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, (LONG_PTR)newBrush);
+            if (oldBrush) DeleteObject(oldBrush);
+        }
+    };
+    refreshClassBrush(hwndList, Theme5250::BG);
+    refreshClassBrush(hwndPreview, Theme5250::BG);
+
+    // Force a full repaint of everything that consumes Theme5250::* in WM_PAINT.
+    if (hwndList) { InvalidateRect(hwndList, nullptr, TRUE); UpdateWindow(hwndList); }
+    if (hwndPreview && IsWindowVisible(hwndPreview)) {
+        InvalidateRect(hwndPreview, nullptr, TRUE); UpdateWindow(hwndPreview);
+    }
+    if (hwndSearch) { InvalidateRect(hwndSearch, nullptr, TRUE); UpdateWindow(hwndSearch); }
+}
+
+void ClipboardManager::SetThemeFontColor(COLORREF color) {
+    g_themeFontColor = color;
+    SaveThemeFontColorToRegistry(color);
+    // ApplyThemeId re-reads g_themeFontColor and updates TXT/SEL_BG accordingly.
+    ApplyThemeId(g_currentThemeId);
+    if (hwndList) { InvalidateRect(hwndList, nullptr, TRUE); UpdateWindow(hwndList); }
+    if (hwndPreview && IsWindowVisible(hwndPreview)) {
+        InvalidateRect(hwndPreview, nullptr, TRUE); UpdateWindow(hwndPreview);
+    }
+    if (hwndSearch) { InvalidateRect(hwndSearch, nullptr, TRUE); UpdateWindow(hwndSearch); }
+}
+
+void ClipboardManager::SetThemeFontFace(const std::wstring& face) {
+    std::wstring resolved = face;
+    if (resolved.empty() || !FontFamilyExists(resolved))
+        resolved = kDefaultThemeFontFace;
+    g_themeFontFace = resolved;
+    SaveThemeFontFaceToRegistry(resolved);
+    // Drop the cached HFONT so the next paint and the WM_SETFONT below pick up the new face.
+    ResetOverlayFontCache();
+    HFONT newFont = GetOverlayFont();
+    if (hwndSearch && newFont) SendMessage(hwndSearch, WM_SETFONT, (WPARAM)newFont, TRUE);
+    if (hwndList) { InvalidateRect(hwndList, nullptr, TRUE); UpdateWindow(hwndList); }
+    if (hwndPreview && IsWindowVisible(hwndPreview)) {
+        InvalidateRect(hwndPreview, nullptr, TRUE); UpdateWindow(hwndPreview);
+    }
+    if (hwndSearch) { InvalidateRect(hwndSearch, nullptr, TRUE); UpdateWindow(hwndSearch); }
 }
 
 void ClipboardManager::LoadSnippets() {
@@ -5088,73 +5494,69 @@ std::wstring ClipboardManager::ExpandSnippetPlaceholders(const std::wstring& con
 
 void ClipboardManager::PasteSnippet(int index) {
     if (index < 0 || index >= (int)snippets.size()) return;
-
     const Snippet& snip = snippets[index];
-    std::wstring text = ExpandSnippetPlaceholders(snip.content);
-    std::wstring plainText = snip.contentPlain.empty() ? text : ExpandSnippetPlaceholders(snip.contentPlain);
-    if (text.empty() && plainText.empty()) return;
+
+    std::wstring storedContent = ExpandSnippetPlaceholders(snip.content);
+    bool isRtf = IsRtfContent(storedContent);
+
+    std::string rtfBytes;
+    std::wstring plainText;
+    if (isRtf) {
+        // Rich snippet: stored byte-by-byte as a wide string. Recover the bytes; never
+        // expose those bytes as CF_UNICODETEXT — that's the bug that made snippets paste
+        // as RTF source text instead of formatted content.
+        rtfBytes = RtfBytesFromStoredWide(storedContent);
+        if (!snip.contentPlain.empty()) {
+            plainText = ExpandSnippetPlaceholders(snip.contentPlain);
+        } else {
+            // Legacy snippets without contentPlain: derive plain text from the RTF itself.
+            plainText = ExtractPlainFromRtfBytes(rtfBytes);
+        }
+    } else {
+        plainText = storedContent;
+    }
+
+    if (rtfBytes.empty() && plainText.empty()) return;
 
     isPasting = true;
-    Sleep(10);
 
-    UINT cfRtf = RegisterClipboardFormatA("Rich Text Format");
-    bool isRtf = IsRtfContent(text);
-
-    if (OpenClipboard(hwndMain)) {
-        EmptyClipboard();
-        bool success = false;
-        if (isRtf && cfRtf != 0) {
-            std::string rtfBytes;
-            for (wchar_t wc : text) rtfBytes += (char)(wc & 0xFF);
-            HGLOBAL hRtf = GlobalAlloc(GMEM_MOVEABLE, rtfBytes.size() + 1);
-            if (hRtf) {
-                char* pRtf = (char*)GlobalLock(hRtf);
-                if (pRtf) {
-                    memcpy(pRtf, rtfBytes.c_str(), rtfBytes.size() + 1);
-                    GlobalUnlock(hRtf);
-                    if (SetClipboardData(cfRtf, hRtf)) success = true;
-                    else GlobalFree(hRtf);
-                } else GlobalFree(hRtf);
-            }
-        }
-        if (!plainText.empty()) {
-            size_t dataSize = (plainText.length() + 1) * sizeof(wchar_t);
-            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
-            if (hMem) {
-                wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
-                if (pMem) {
-                    wcscpy_s(pMem, plainText.length() + 1, plainText.c_str());
-                    GlobalUnlock(hMem);
-                    if (SetClipboardData(CF_UNICODETEXT, hMem)) success = true;
-                } else GlobalFree(hMem);
-            } else GlobalFree(hMem);
-        } else if (!success && !text.empty()) {
-            size_t dataSize = (text.length() + 1) * sizeof(wchar_t);
-            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, dataSize);
-            if (hMem) {
-                wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
-                if (pMem) {
-                    wcscpy_s(pMem, text.length() + 1, text.c_str());
-                    GlobalUnlock(hMem);
-                    if (SetClipboardData(CF_UNICODETEXT, hMem)) success = true;
-                } else GlobalFree(hMem);
-            } else GlobalFree(hMem);
-        }
-        CloseClipboard();
-        if (success || !plainText.empty() || !text.empty()) {
-            lastPastedText = plainText.empty() ? text : plainText;
-            lastSequenceNumber = GetClipboardSequenceNumber();
-            if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
-                SetForegroundWindow(previousFocusWindow);
-                SetFocus(previousFocusWindow);
-                Sleep(50);
-            }
-            Sleep(50);
-            SendCtrlV();
-            Sleep(500);
-        }
+    if (!OpenClipboardWithRetry(hwndMain, 24, 8)) {
+        isPasting = false;
+        return;
     }
+    EmptyClipboard();
+
+    UINT cfRtf = CfRtf();
+    bool rtfSet = false;
+    bool plainSet = false;
+    if (isRtf && cfRtf != 0 && !rtfBytes.empty()) {
+        rtfSet = PutBytesOnClipboard(cfRtf, rtfBytes.data(), rtfBytes.size() + 1);
+    }
+    if (!plainText.empty()) {
+        size_t bytes = (plainText.size() + 1) * sizeof(wchar_t);
+        plainSet = PutBytesOnClipboard(CF_UNICODETEXT, plainText.c_str(), bytes);
+    }
+    CloseClipboard();
+
+    if (!rtfSet && !plainSet) {
+        isPasting = false;
+        return;
+    }
+
+    lastPastedText = plainText;
+    lastSequenceNumber = GetClipboardSequenceNumber();
+
+    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+        SetForegroundWindow(previousFocusWindow);
+        SetFocus(previousFocusWindow);
+        Sleep(40);
+    }
+    ReleaseHotkeyModifiersForPaste();
+    Sleep(30);
+    SendCtrlV();
+    Sleep(460);
     isPasting = false;
+    PlayClickSound();
 }
 
 void ClipboardManager::ShowSnippetsManagerDialog() {
@@ -5350,6 +5752,7 @@ LRESULT CALLBACK ClipboardManager::SnippetsManagerProc(HWND hwnd, UINT uMsg, WPA
 }
 
 std::wstring ClipboardManager::HotkeyToString(const HotkeyConfig& hk) {
+    if (hk.vkCode == 0) return L"(none)";
     std::wstring s;
     if (hk.modifiers & MOD_CONTROL) s += L"Ctrl+";
     if (hk.modifiers & MOD_ALT)     s += L"Alt+";
@@ -5395,6 +5798,10 @@ static const int IDC_HK_SNIPPETS         = 3002;
 static const int IDC_HK_COPY_FOCUSED     = 3003;
 static const int IDC_HK_PASTE_FOCUSED    = 3004;
 static const int IDC_HK_PASTE_CLIPBOARD  = 3005;
+static const int IDC_THEME_COMBO         = 3006;
+static const int IDC_FONT_COMBO          = 3007;
+static const int IDC_FONT_COLOR_BTN      = 3008;
+static const int IDC_FONT_COLOR_SWATCH   = 3009;
 static const int IDC_BTN_SAVE            = 3010;
 static const int IDC_BTN_CANCEL          = 3011;
 static const int IDC_BTN_DEFAULTS        = 3012;
@@ -5456,7 +5863,7 @@ void ClipboardManager::ShowSettingsDialog() {
         return;
     }
 
-    const int DLG_W = 480, DLG_H = 370;
+    const int DLG_W = 480, DLG_H = 500;
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
     int x = workArea.left + ((workArea.right - workArea.left) - DLG_W) / 2;
@@ -5471,7 +5878,7 @@ void ClipboardManager::ShowSettingsDialog() {
     RegisterClassW(&wc);
 
     hwndSettings = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        L"clip2_SettingsDialog", L"clip2 Settings \u2014 Keyboard Shortcuts",
+        L"clip2_SettingsDialog", L"clip2 Settings \u2014 Shortcuts & Theme",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         x, y, DLG_W, DLG_H, hwndMain, nullptr, GetModuleHandle(nullptr), nullptr);
 
@@ -5504,7 +5911,70 @@ void ClipboardManager::ShowSettingsDialog() {
         yPos += GAP;
     }
 
-    yPos += 10;
+    yPos += 14;
+    CreateHotkeyLabel(hwndSettings, L"Overlay theme (AMOLED neon):", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+    HWND hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        HK_X, yPos, HK_W, 200, hwndSettings, (HMENU)(INT_PTR)IDC_THEME_COMBO,
+        GetModuleHandle(nullptr), nullptr);
+    if (hCombo) {
+        SendMessageW(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+        for (int t = 0; t < THEME_COUNT; t++)
+            SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)kThemePresets[t].name);
+        SendMessageW(hCombo, CB_SETCURSEL, (WPARAM)g_currentThemeId, 0);
+    }
+    yPos += GAP;
+
+    // Font family: enumerate installed font face names (de-duplicated) and let the user
+    // pick anything available on the system.
+    CreateHotkeyLabel(hwndSettings, L"Overlay font:", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+    HWND hFontCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        HK_X, yPos, HK_W, 300, hwndSettings, (HMENU)(INT_PTR)IDC_FONT_COMBO,
+        GetModuleHandle(nullptr), nullptr);
+    if (hFontCombo) {
+        SendMessageW(hFontCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+        struct EnumCtx { HWND combo; std::set<std::wstring> seen; };
+        EnumCtx ctx{ hFontCombo, {} };
+        HDC hdc = GetDC(nullptr);
+        if (hdc) {
+            LOGFONTW lf = {};
+            lf.lfCharSet = DEFAULT_CHARSET;
+            EnumFontFamiliesExW(hdc, &lf,
+                [](const LOGFONTW* lpelfe, const TEXTMETRICW*, DWORD, LPARAM lp) -> int {
+                    EnumCtx* c = (EnumCtx*)lp;
+                    if (!lpelfe || lpelfe->lfFaceName[0] == L'@') return 1; // skip vertical fonts
+                    std::wstring face = lpelfe->lfFaceName;
+                    if (face.empty()) return 1;
+                    if (c->seen.insert(face).second)
+                        SendMessageW(c->combo, CB_ADDSTRING, 0, (LPARAM)face.c_str());
+                    return 1;
+                },
+                (LPARAM)&ctx, 0);
+            ReleaseDC(nullptr, hdc);
+        }
+        int sel = (int)SendMessageW(hFontCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)g_themeFontFace.c_str());
+        if (sel == CB_ERR)
+            sel = (int)SendMessageW(hFontCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)kDefaultThemeFontFace);
+        if (sel != CB_ERR) SendMessageW(hFontCombo, CB_SETCURSEL, (WPARAM)sel, 0);
+    }
+    yPos += GAP;
+
+    // Font color: small swatch + "Pick..." button that opens the standard color dialog.
+    CreateHotkeyLabel(hwndSettings, L"Font color:", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+    HWND hSwatch = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_OWNERDRAW,
+        HK_X, yPos, 60, ROW_H, hwndSettings, (HMENU)(INT_PTR)IDC_FONT_COLOR_SWATCH,
+        GetModuleHandle(nullptr), nullptr);
+    (void)hSwatch;
+    HWND hColorBtn = CreateWindowW(L"BUTTON", L"Pick color...",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        HK_X + 70, yPos, HK_W - 70, ROW_H, hwndSettings,
+        (HMENU)(INT_PTR)IDC_FONT_COLOR_BTN, GetModuleHandle(nullptr), nullptr);
+    if (hColorBtn) SendMessage(hColorBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+    yPos += GAP;
+
+    yPos += 6;
     const int BTN_W = 90, BTN_H = 30, BTN_GAP = 10;
     int btnX = DLG_W - 15 - BTN_W * 3 - BTN_GAP * 2 - 10;
 
@@ -5539,7 +6009,7 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
 
         if (id == IDC_BTN_DEFAULTS) {
             mgr->hotkeyConfig        = { MOD_CONTROL, VK_DECIMAL };
-            mgr->snippetsHotkey      = { MOD_CONTROL, VK_NUMPAD0 };
+            mgr->snippetsHotkey      = { 0, 0 };
             mgr->copyFocusedHotkey   = { MOD_CONTROL, VK_F10 };
             mgr->pasteFocusedHotkey  = { MOD_CONTROL, VK_F11 };
             mgr->pasteClipboardHotkey = { MOD_CONTROL | MOD_SHIFT, VK_F11 };
@@ -5554,6 +6024,66 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
                 HWND hCtrl = GetDlgItem(hwnd, r.id);
                 if (hCtrl) SetWindowTextW(hCtrl, HotkeyToString(*r.cfg).c_str());
             }
+            HWND hCombo = GetDlgItem(hwnd, IDC_THEME_COMBO);
+            if (hCombo) SendMessageW(hCombo, CB_SETCURSEL, (WPARAM)THEME_NEON_GREEN, 0);
+            mgr->SetTheme(THEME_NEON_GREEN);
+            // Reset font color override (back to preset) and font face (back to Consolas).
+            mgr->SetThemeFontColor(kThemeFontColorPreset);
+            mgr->SetThemeFontFace(kDefaultThemeFontFace);
+            HWND hFontCombo = GetDlgItem(hwnd, IDC_FONT_COMBO);
+            if (hFontCombo) {
+                int sel = (int)SendMessageW(hFontCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)kDefaultThemeFontFace);
+                if (sel != CB_ERR) SendMessageW(hFontCombo, CB_SETCURSEL, (WPARAM)sel, 0);
+            }
+            HWND hSwatch = GetDlgItem(hwnd, IDC_FONT_COLOR_SWATCH);
+            if (hSwatch) InvalidateRect(hSwatch, nullptr, TRUE);
+            return 0;
+        }
+
+        // Live preview when the theme combo changes — easier than waiting for Save.
+        if (id == IDC_THEME_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            HWND hCombo = (HWND)lParam;
+            int sel = (int)SendMessageW(hCombo, CB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < THEME_COUNT)
+                mgr->SetTheme(sel);
+            // The preset's accent might have changed; if the swatch is in "preset" mode,
+            // it needs a redraw to follow the new preset color.
+            HWND hSwatch = GetDlgItem(hwnd, IDC_FONT_COLOR_SWATCH);
+            if (hSwatch) InvalidateRect(hSwatch, nullptr, TRUE);
+            return 0;
+        }
+
+        // Live preview when the font face combo changes.
+        if (id == IDC_FONT_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            HWND hFontCombo = (HWND)lParam;
+            int sel = (int)SendMessageW(hFontCombo, CB_GETCURSEL, 0, 0);
+            if (sel >= 0) {
+                int len = (int)SendMessageW(hFontCombo, CB_GETLBTEXTLEN, (WPARAM)sel, 0);
+                if (len > 0 && len < LF_FACESIZE) {
+                    wchar_t buf[LF_FACESIZE] = {};
+                    SendMessageW(hFontCombo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)buf);
+                    mgr->SetThemeFontFace(buf);
+                }
+            }
+            return 0;
+        }
+
+        // Open the standard color dialog. Picking a color overrides the preset's TXT/SEL_BG.
+        if (id == IDC_FONT_COLOR_BTN && HIWORD(wParam) == BN_CLICKED) {
+            static COLORREF s_customColors[16] = {};
+            CHOOSECOLORW cc = {};
+            cc.lStructSize = sizeof(cc);
+            cc.hwndOwner = hwnd;
+            cc.lpCustColors = s_customColors;
+            cc.rgbResult = (g_themeFontColor == kThemeFontColorPreset)
+                ? kThemePresets[g_currentThemeId].txt
+                : g_themeFontColor;
+            cc.Flags = CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR;
+            if (ChooseColorW(&cc)) {
+                mgr->SetThemeFontColor(cc.rgbResult);
+                HWND hSwatch = GetDlgItem(hwnd, IDC_FONT_COLOR_SWATCH);
+                if (hSwatch) InvalidateRect(hSwatch, nullptr, TRUE);
+            }
             return 0;
         }
 
@@ -5561,8 +6091,35 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
             mgr->UnregisterHotkey();
             mgr->SaveHotkeyConfig();
             mgr->RegisterHotkey();
+            HWND hCombo = GetDlgItem(hwnd, IDC_THEME_COMBO);
+            if (hCombo) {
+                int sel = (int)SendMessageW(hCombo, CB_GETCURSEL, 0, 0);
+                if (sel >= 0 && sel < THEME_COUNT)
+                    mgr->SetTheme(sel);
+            }
+            // Font face/color have been applied + persisted live; nothing more to do for them.
             DestroyWindow(hwnd);
             return 0;
+        }
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (dis && dis->CtlID == IDC_FONT_COLOR_SWATCH) {
+            COLORREF c = (g_themeFontColor == kThemeFontColorPreset)
+                ? kThemePresets[g_currentThemeId].txt
+                : g_themeFontColor;
+            // Black background frames the accent so it reads true to the AMOLED look.
+            HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(dis->hDC, &dis->rcItem, bg);
+            DeleteObject(bg);
+            RECT inner = dis->rcItem;
+            InflateRect(&inner, -3, -3);
+            HBRUSH fg = CreateSolidBrush(c);
+            FillRect(dis->hDC, &inner, fg);
+            DeleteObject(fg);
+            return TRUE;
         }
         break;
     }

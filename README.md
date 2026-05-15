@@ -12,7 +12,8 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Quick Paste**: Press **1-9** or type number + Enter to paste items from the list
 - ✅ **Visual Feedback**: Click sound plays when items are copied
 - ✅ **System Tray Icon**: Always visible when running (uses ico2.ico)
-- ✅ **AS/400 5250 Theme**: Phosphor green on black, monospace font, sharp corners—classic terminal emulator look
+- ✅ **AMOLED Neon Themes**: Pure-black background with neon accents — switch between Neon Green (AS/400 5250 default), Red, Blue, Cyan, Purple, Yellow, Orange, and White from the Settings dialog
+- ✅ **Custom Font Color & Family**: Settings lets you override the overlay font color with the standard Windows color picker (any RGB value), and pick the overlay/search font from every font family installed on the system. Both are persisted and applied live
 - ✅ **Search Functionality**: Deep search across full content (Ctrl+F), including text after line breaks
 - ✅ **Image/Video Thumbnails**: Visual previews for images and videos
 - ✅ **Format Preservation**: Pastes with original formatting (bold, colors, etc.)
@@ -149,7 +150,18 @@ The executable will be created as `clip2.exe`.
 
 ## Changelog
 
-### Recent Features (Latest)
+### Theme Font Controls
+- ✅ **Custom overlay font color**: Settings → "Pick color..." opens the standard Windows color dialog, lets you choose any RGB value, and applies it live to the clipboard/snippets overlay (text + selection accent). Stored under `HKEY_CURRENT_USER\Software\clip2\ThemeFontColor`; clearing the override via Defaults restores the active preset's neon accent.
+- ✅ **All-system-font picker**: Settings → "Overlay font" lists every font family installed on the machine (enumerated via `EnumFontFamiliesExW`, de-duplicated, vertical `@`-prefixed faces skipped). Selected face is applied to both the overlay list and the search box and persisted under `HKEY_CURRENT_USER\Software\clip2\ThemeFontFace`. Default remains `Consolas` for the terminal look.
+
+### Latest Reliability & Theming Pass
+- ✅ **Reworked paste pipeline**: Single-item, multi-item, snippet, and keystroke paste now share a small set of helpers (clipboard transactions with retry, plain-text extraction, RTF byte serialization, focus restoration). This eliminates timing races between fragmented copies of the same logic.
+- ✅ **Reliable multi-item paste**: When every selected item is text/RTF/HTML, the manager now builds a single combined payload (Unicode + optional RTF wrapper) and sends one `Ctrl+V`, instead of rapidly swapping the clipboard between events. Items containing images or other binary formats still replay sequentially, but with longer settle times so trailing items never get dropped.
+- ✅ **Rich snippet paste**: RTF snippets keep their formatting in rich-text-aware targets (Word, Outlook, OneNote, browsers), while a clean Unicode fallback is published for plain-text targets. Legacy snippets without a stored plain version now derive plain text via a hidden Rich Edit instead of leaking RTF source as plain text.
+- ✅ **Robust keystroke paste**: The synthetic Unicode typing path uses smaller batches (12 chars), retries partial `SendInput` results from the next index instead of dropping the tail, converts `\r\n`/`\n`/`\t` to real `VK_RETURN`/`VK_TAB` events, and paces itself so long content arrives complete in slower editors.
+- ✅ **AMOLED neon theme switcher**: Settings → Overlay theme lets you live-preview and persist Neon Green / Red / Blue / Cyan / Purple / Yellow / Orange / White presets. Selection is stored in `HKEY_CURRENT_USER\Software\clip2\ThemeId` and applied at startup.
+
+### Recent Features
 - ✅ **Clipboard persistence**: History saved to `%APPDATA%\clip2\history.dat`; survives app restarts (up to 300 items)
 - ✅ **Snippets overlay**: **Ctrl+Right** / **Ctrl+Left** to switch between clipboard and snippets; single-click to paste snippets
 - ✅ **Rich Text snippets**: Manage Snippets uses Rich Edit; RTF content pasted with formatting preserved
