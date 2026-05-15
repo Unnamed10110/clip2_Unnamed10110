@@ -31,7 +31,7 @@ if(WIN32)
     )
     
     # Link necessary libraries (mf* for Media Foundation: decode MP3 to WAV for reliable click sound)
-    set(CLIP2_LIBS user32 gdi32 shell32 winmm comctl32 shlwapi ole32 oleaut32 mfplat mf mfreadwrite mfuuid)
+    set(CLIP2_LIBS user32 gdi32 shell32 winmm comctl32 shlwapi ole32 oleaut32 comdlg32 mfplat mf mfreadwrite mfuuid)
     # UIAutomation: "Copy from focused control" when app never puts content on clipboard
     set(UIAUTOMATION_SEARCH_PATHS "")
     if(DEFINED ENV{WindowsSdkDir})

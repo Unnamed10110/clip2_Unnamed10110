@@ -160,12 +160,22 @@ public:
     bool Initialize();
     void Run();
     void Stop();
+
+    struct HotkeyConfig {
+        UINT modifiers;  // MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN
+        UINT vkCode;     // Virtual key code
+    };
+
+    static std::wstring HotkeyToString(const HotkeyConfig& hk);
+    static bool HotkeyFromKeyMessage(UINT vk, HotkeyConfig& out);
     
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK ListWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SearchEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SettingsDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK SettingsHotkeyEditSubclass(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+        UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
     static ClipboardManager* instance;
     
     void CreateTrayIcon();
@@ -177,7 +187,8 @@ private:
     void UninstallKeyboardHook();
     static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
     void FocusListWindow();
-    void ShowListWindow();
+    void ShowListWindow(bool startInSnippetsMode = false);
+    void SetListSnippetsMode(bool wantSnippets);
     void HideListWindow();
     void UpdateListWindow();
     void ShowPreviewWindow(int itemIndex, int x, int y);
@@ -203,13 +214,14 @@ private:
     void LoadHotkeyConfig();
     void SaveHotkeyConfig();
     void ShowSettingsDialog();
+    void SetTheme(int themeId);                     // Apply + persist a theme preset and repaint UI.
+    void SetThemeFontColor(COLORREF color);          // Override (or clear, via sentinel) overlay font color.
+    void SetThemeFontFace(const std::wstring& face); // Switch overlay/search font face and repaint.
     // Read text from focused control via UI Automation (when app does not put anything on clipboard)
     bool CopyFromFocusedControlViaUIA();
-    
-    struct HotkeyConfig {
-        UINT modifiers;  // MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN
-        UINT vkCode;     // Virtual key code
-    };
+    // Paste from history into focused control: useClipboardSwap=false sends plain text as Unicode keystrokes (Ctrl+F11).
+    // useClipboardSwap=true puts item formats/text on clipboard and simulates Ctrl+V (Ctrl+Shift+F11).
+    bool PasteToFocusedControlWithoutClipboard(bool useClipboardSwap);
     
     HWND hwndMain;
     HWND hwndList;
@@ -240,7 +252,11 @@ private:
     int selectedIndex;  // Currently selected item index (in filtered list)
     int multiSelectAnchor;  // Anchor index for Shift+Arrow multi-selection (-1 if no anchor)
     WNDPROC originalSearchEditProc;  // Original window procedure for search edit control
-    HotkeyConfig hotkeyConfig;  // Current hotkey configuration
+    HotkeyConfig hotkeyConfig;           // Overlay toggle
+    HotkeyConfig snippetsHotkey;         // Snippets overlay toggle
+    HotkeyConfig copyFocusedHotkey;      // Copy from focused control (UIA)
+    HotkeyConfig pasteFocusedHotkey;     // Keystroke injection paste
+    HotkeyConfig pasteClipboardHotkey;   // Clipboard swap + Ctrl+V paste
     DWORD lastHotkeyTick;      // Debounce: last time overlay hotkey was handled
     HWND hwndSettings;  // Settings dialog window
     std::map<UINT, std::vector<BYTE>> immediateClipboardSnapshot;  // Captured in WM_CLIPBOARDUPDATE before app can clear
@@ -271,8 +287,12 @@ private:
     static const UINT WM_TRAYICON = WM_USER + 1;
     static const UINT WM_CLIPBOARD_HOTKEY = WM_USER + 2;
     static const UINT WM_PROCESS_CLIPBOARD = WM_USER + 3;
+    static const UINT WM_SNIPPETS_OVERLAY_HOTKEY = WM_USER + 5;
+    static const UINT WM_DISMISS_OVERLAY = WM_USER + 6;  // e.g. Esc from low-level hook
     static const int HOTKEY_ID_OVERLAY = 1;
     static const int HOTKEY_ID_COPY_FOCUSED = 2;  // Ctrl+F10: copy from focused control (UIA)
+    static const int HOTKEY_ID_PASTE_FOCUSED = 3;           // Ctrl+F11: keystroke injection (bypass Trillex / paste blocks)
+    static const int HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD = 4;  // Ctrl+Shift+F11: clipboard swap + Ctrl+V (VS Code, etc.)
     static const int MAX_ITEMS = 300;
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
