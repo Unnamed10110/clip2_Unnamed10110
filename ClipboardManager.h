@@ -30,9 +30,10 @@ struct ClipboardItem {
     HBITMAP previewBitmap;  // Larger preview for hover
     bool isImage;
     bool isVideo;
+    bool pinned;  // Pinned/favorite items stay on top, survive Clear, and always persist
     
     ClipboardItem(UINT fmt, const std::vector<BYTE>& d) 
-        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), isImage(false), isVideo(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]") {
+        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), isImage(false), isVideo(false), pinned(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]") {
         // CRITICAL: Store data first, before any processing
         if (d.empty() || d.size() > 200 * 1024 * 1024) {
             return;
@@ -200,6 +201,11 @@ private:
     void ClearMultiSelection();
     void DeleteItem(int filteredIndex);
     void TransformTextItem(int filteredIndex, int transformType);
+    void TogglePin(int filteredIndex);            // Pin/unpin an item (filtered index)
+    void TrimHistory();                           // Enforce maxItems cap without evicting pinned items
+    void CopyItemAsPlainText(int filteredIndex);  // Quick action: strip formatting -> plain Unicode on clipboard
+    void OpenItemUrl(int filteredIndex);          // Quick action: ShellExecute the item's URL
+    void SaveImageItemToFile(int filteredIndex);  // Quick action: write image item to a .bmp file
     bool IsTextItem(int actualIndex);
     void ProcessClipboard();
     void PlayClickSound();
@@ -217,6 +223,9 @@ private:
     void SetTheme(int themeId);                     // Apply + persist a theme preset and repaint UI.
     void SetThemeFontColor(COLORREF color);          // Override (or clear, via sentinel) overlay font color.
     void SetThemeFontFace(const std::wstring& face); // Switch overlay/search font face and repaint.
+    void SetThemeColorOverride(int slot, COLORREF color); // Override (or clear) one overlay element color.
+    void ResetThemeColorOverrides();                 // Clear all per-element color overrides.
+    void RefreshThemeVisuals();                      // Re-apply class brushes + repaint after a color change.
     // Read text from focused control via UI Automation (when app does not put anything on clipboard)
     bool CopyFromFocusedControlViaUIA();
     // Paste from history into focused control: useClipboardSwap=false sends plain text as Unicode keystrokes (Ctrl+F11).
@@ -293,7 +302,10 @@ private:
     static const int HOTKEY_ID_COPY_FOCUSED = 2;  // Ctrl+F10: copy from focused control (UIA)
     static const int HOTKEY_ID_PASTE_FOCUSED = 3;           // Ctrl+F11: keystroke injection (bypass Trillex / paste blocks)
     static const int HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD = 4;  // Ctrl+Shift+F11: clipboard swap + Ctrl+V (VS Code, etc.)
-    static const int MAX_ITEMS = 300;
+    static const int DEFAULT_MAX_ITEMS = 300;   // Default history cap when no user override exists
+    static const int MIN_MAX_ITEMS = 10;        // Lower clamp for the configurable history size
+    static const int MAX_MAX_ITEMS = 2000;      // Upper clamp for the configurable history size
+    int maxItems;                               // Runtime-configurable history cap (registry: MaxItems)
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
     
