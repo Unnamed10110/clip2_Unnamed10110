@@ -14,6 +14,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **System Tray Icon**: Always visible when running (uses ico2.ico)
 - ✅ **AMOLED Neon Themes**: Pure-black background with neon accents — switch between Neon Green (AS/400 5250 default), Red, Blue, Cyan, Purple, Yellow, Orange, and White from the Settings dialog
 - ✅ **Custom Font Color & Family**: Settings lets you override the overlay font color with the standard Windows color picker (any RGB value), and pick the overlay/search font from every font family installed on the system. Both are persisted and applied live
+- ✅ **Full Per-Element Colors**: Settings → "Element colors" exposes a swatch for every overlay color — Background, Text, Accent (selection), Selected text, Border, and Dim/secondary. Click a swatch to pick any RGB value, double-click to reset that element to the active preset. Changes apply live and persist (registry `HKEY_CURRENT_USER\Software\clip2\Color*`); "Defaults" clears them all
 - ✅ **Search Functionality**: Deep search across full content (Ctrl+F), including text after line breaks
 - ✅ **Image/Video Thumbnails**: Visual previews for images and videos
 - ✅ **Format Preservation**: Pastes with original formatting (bold, colors, etc.)
@@ -27,7 +28,13 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Movable Window**: Drag the list window to position it anywhere on screen
 - ✅ **Smart Paste Detection**: Prevents pasted items from being re-added to history
 - ✅ **Snippets/Templates**: Predefined text templates with placeholders; supports Rich Text (RTF)
-- ✅ **Clipboard Persistence**: History saved to disk; survives app restarts (up to 300 items)
+- ✅ **Pinned/Favorite Items**: Right-click → **Pin** to keep an item at the top; pinned items survive **Clear List** and are always persisted (shown with a left accent bar)
+- ✅ **Full Persistence**: History now persists images and files (not just text) across restarts
+- ✅ **Encrypted History**: `history.dat` is encrypted at rest with Windows DPAPI (per-user); legacy plaintext files are migrated automatically
+- ✅ **Configurable History Size**: Set the history cap in Settings (10–2000 items)
+- ✅ **Fuzzy Search**: Subsequence matching with ranking (best matches first) in clipboard and snippets overlays
+- ✅ **Quick Actions**: Right-click an item for **Copy as plain text**, **Open URL** (for http/https items), and **Save image to file...**
+- ✅ **Clipboard Persistence**: History saved to disk; survives app restarts
 - ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
 - ✅ **Snippets Overlay**: **Ctrl+Right** = Snippets, **Ctrl+Left** = Clipboard (when overlay is open)
 - ✅ **Copy from focused control**: When an app never puts content on the clipboard, use tray → **Copy from focused control** to read text from the focused control via UI Automation and add it to history (requires build with UIAutomation; see Technical Details)
@@ -59,7 +66,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 3. **Manual compilation** (MinGW):
    ```bash
    windres ClipboardManager.rc -o ClipboardManager.res
-   g++ -std=c++17 -O2 -mwindows ClipboardManager.cpp ClipboardManager.res -o ClipboardManager.exe -luser32 -lgdi32 -lshell32 -lwinmm
+   g++ -std=c++17 -O2 -mwindows ClipboardManager.cpp ClipboardManager.res -o ClipboardManager.exe -luser32 -lgdi32 -lshell32 -lwinmm -lcrypt32
    ```
 
 The executable will be created as `clip2.exe`.
@@ -115,7 +122,7 @@ The executable will be created as `clip2.exe`.
 
 ## Technical Details
 
-- **Maximum History**: 300 items
+- **Maximum History**: configurable (default 300, range 10–2000) via Settings; stored in `HKEY_CURRENT_USER\Software\clip2\MaxItems`
 - **Supported Formats**: Text, Unicode text, Rich Text Format (RTF), HTML, images (bitmap, DIB, DIBV5), files, and more
 - **Format Preservation**: All clipboard formats are preserved when pasting (bold, colors, sizes, etc.)
 - **Memory Limits**: 
@@ -129,14 +136,14 @@ The executable will be created as `clip2.exe`.
 - **Sound**: Embedded click.mp3 plays on copy (fallback to file in exe directory); MCI warm-up ensures first copy plays sound
 - **Navigation**: Arrow keys, Page Up/Down, Home/End for list navigation
 - **Auto-hide**: List automatically hides when focus moves to another window
-- **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat` (binary format; up to 300 text items; load on startup, save on exit)
+- **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat`. Encrypted at rest with Windows DPAPI (container magic `CLP3`); decrypted payload stores all formats per item (text, images, files) plus the pinned flag (`CLP2` version 2). Pinned items are always saved (exempt from the count cap); other items are saved up to the configured history size. Legacy `CLP2` v1 (text-only, plaintext) files load and are upgraded to the encrypted format on next save
 - **Snippets storage**: Registry `HKEY_CURRENT_USER\Software\clip2\Snippets`
 - **Search**: Full-text search up to 500KB per item; finds matches across line breaks
 - **Copy from focused control**: Uses Windows UI Automation to read selected (or full) text from the focused control when the app does not put anything on the clipboard. The tray menu item appears only if the project is built with the UIAutomation library (e.g. when the Windows SDK is available and CMake finds `UIAutomation`). If you build with MinGW and the menu item is missing, build with Visual Studio and the Windows SDK to enable it.
 
 ## Requirements
 
-- Windows API libraries: `user32`, `gdi32`, `shell32`, `winmm`, `comctl32`, `shlwapi`, `ole32`
+- Windows API libraries: `user32`, `gdi32`, `shell32`, `winmm`, `comctl32`, `shlwapi`, `ole32`, `crypt32`
 - C++17 standard
 - ico2.ico icon file (included)
 - click.mp3 sound file (embedded as resource, with file fallback)
