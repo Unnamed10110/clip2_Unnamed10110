@@ -1345,6 +1345,14 @@ static bool ItemHasOnlyTextFormats(const ClipboardItem* item) {
     return true;
 }
 
+// Trim trailing whitespace/newlines before joining multi-paste segments so separators
+// are predictable and we don't get double blank lines between items.
+static std::wstring TrimTrailingForMultiPasteJoin(std::wstring s) {
+    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n' || s.back() == L' ' || s.back() == L'\t'))
+        s.pop_back();
+    return s;
+}
+
 // Build a minimal RTF document wrapping `text` as a single paragraph block. Used to seed
 // rich-text-aware targets when concatenating multiple plain items.
 static std::string BuildRtfWrapFromUnicode(const std::wstring& text) {
@@ -1367,6 +1375,28 @@ static std::string BuildRtfWrapFromUnicode(const std::wstring& text) {
     }
     s += "}";
     return s;
+}
+
+// Put Unicode (+ optional RTF) on the clipboard. Line breaks stay in the payload — no
+// separate Enter keystroke or extra Ctrl+V for separators.
+static bool SetClipboardTextPayload(HWND hwnd, const std::wstring& text, bool includeRtf) {
+    if (text.empty()) return false;
+    if (!OpenClipboardWithRetry(hwnd, 30, 8)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    if (PutBytesOnClipboard(CF_UNICODETEXT, text.c_str(), bytes))
+        ok = true;
+    if (includeRtf && ok) {
+        UINT cfRtf = CfRtf();
+        if (cfRtf != 0) {
+            std::string rtf = BuildRtfWrapFromUnicode(text);
+            if (!rtf.empty())
+                PutBytesOnClipboard(cfRtf, rtf.data(), rtf.size() + 1);
+        }
+    }
+    CloseClipboard();
+    return ok;
 }
 
 // Type plain text into the focused control without using the clipboard (Unicode keyboard events).
@@ -3753,15 +3783,15 @@ void ClipboardManager::PasteMultipleItems() {
     // Ctrl+Enter forces plain text mode and skips RTF/HTML.
     bool pasteAsPlainText = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
-    // Decide fast vs slow path. Fast path: every selected item is text/RTF/HTML only — we
-    // can combine them into ONE clipboard payload and paste once. Slow path: at least one
-    // item carries an image or other binary clipboard format and must be replayed in turn.
+    // Fast path: every selected item has plain text we can read — combine into ONE clipboard
+    // payload with \r\n between items (line breaks live in the text, no Enter keystrokes).
+    // Extra non-text formats on an item are ignored; we paste the combined text only.
     bool fastPath = true;
     for (const ClipboardItem* it : selectedItems) {
-        if (!it) continue;
-        if (!ItemHasOnlyTextFormats(it)) { fastPath = false; break; }
-        std::wstring t = GetPlainTextForDirectPaste(it);
-        if (t.empty()) { fastPath = false; break; }
+        if (!it || TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it)).empty()) {
+            fastPath = false;
+            break;
+        }
     }
 
     isPasting = true;
@@ -3781,41 +3811,17 @@ void ClipboardManager::PasteMultipleItems() {
     }
 
     if (fastPath) {
-        // ---- FAST PATH: combine all selected items into one clipboard payload ----
-        const wchar_t* sep = L"\r\n";
+        // ---- FAST PATH: one clipboard payload, one Ctrl+V ----
         std::wstring combined;
-        bool anyRtfSource = false;
-        UINT cfRtf = CfRtf();
-        for (size_t i = 0; i < selectedItems.size(); i++) {
-            const ClipboardItem* it = selectedItems[i];
+        for (const ClipboardItem* it : selectedItems) {
             if (!it) continue;
-            std::wstring t = GetPlainTextForDirectPaste(it);
-            if (i > 0) combined += sep;
+            std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it));
+            if (t.empty()) continue;
+            if (!combined.empty()) combined += L"\r\n";
             combined += t;
-            if (cfRtf != 0) {
-                const std::vector<BYTE>* rtf = it->GetFormatData(cfRtf);
-                if (rtf && !rtf->empty()) anyRtfSource = true;
-            }
         }
 
-        bool clipboardSet = false;
-        if (OpenClipboardWithRetry(hwndMain, 30, 8)) {
-            EmptyClipboard();
-            if (!combined.empty()) {
-                size_t bytes = (combined.size() + 1) * sizeof(wchar_t);
-                if (PutBytesOnClipboard(CF_UNICODETEXT, combined.c_str(), bytes))
-                    clipboardSet = true;
-            }
-            if (!pasteAsPlainText && anyRtfSource && cfRtf != 0 && !combined.empty()) {
-                // Provide an RTF doc too so rich-text targets receive a real RTF stream.
-                std::string rtf = BuildRtfWrapFromUnicode(combined);
-                if (!rtf.empty())
-                    PutBytesOnClipboard(cfRtf, rtf.data(), rtf.size() + 1);
-            }
-            CloseClipboard();
-        }
-
-        if (!clipboardSet) {
+        if (combined.empty() || !SetClipboardTextPayload(hwndMain, combined, !pasteAsPlainText)) {
             RestoreClipboardSerialFormats(hwndMain, backup);
             isPasting = false;
             ClearMultiSelection();
@@ -3837,13 +3843,10 @@ void ClipboardManager::PasteMultipleItems() {
     }
 
     // ---- SLOW PATH: at least one non-text item; replay each item via swap+Ctrl+V ----
-    // Longer pacing than before because the previous timings were too aggressive on
-    // slower editors (Office apps, browsers) and dropped trailing items.
-    const DWORD kFocusMs           = 70;
+    // Line breaks between text items are embedded in the same payload (trailing \r\n), never
+    // as a separate clipboard+Ctrl+V "Enter" paste.
     const DWORD kAfterItemMs       = 200;
-    const DWORD kAfterSeparatorMs  = 140;
     const DWORD kTailBeforeRestore = 200;
-    (void)kFocusMs;
 
     auto waitForClipboardReady = [&]() {
         for (int attempt = 0; attempt < 32; attempt++) {
@@ -3859,35 +3862,36 @@ void ClipboardManager::PasteMultipleItems() {
         const ClipboardItem* item = selectedItems[i];
         if (!item) continue;
 
-        std::wstring plainText = GetPlainTextForDirectPaste(item);
+        std::wstring plainText = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(item));
+        // Embed the line break in this paste when another item follows (no separate Enter).
+        const bool moreItemsFollow = (i + 1 < selectedItems.size());
+        if (moreItemsFollow && !plainText.empty())
+            plainText += L"\r\n";
+
         waitForClipboardReady();
 
         bool clipboardSet = false;
-        if (!pasteAsPlainText && !item->formats.empty())
+        if (!plainText.empty() && ItemHasOnlyTextFormats(item)) {
+            clipboardSet = SetClipboardTextPayload(hwndMain, plainText, !pasteAsPlainText);
+        } else if (!pasteAsPlainText && !item->formats.empty()) {
             clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
+        }
         if (!clipboardSet && !plainText.empty())
             clipboardSet = SetClipboardUnicodeOnly(hwndMain, plainText);
         if (!clipboardSet) continue;
 
-        if (!plainText.empty()) {
-            if (!pastedTextAggregate.empty()) pastedTextAggregate += L"\n";
-            pastedTextAggregate += plainText;
+        {
+            std::wstring segment = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(item));
+            if (!segment.empty()) {
+                if (!pastedTextAggregate.empty()) pastedTextAggregate += L"\r\n";
+                pastedTextAggregate += segment;
+            }
         }
 
         lastSequenceNumber = GetClipboardSequenceNumber();
         Sleep(20);
         SendCtrlV();
         Sleep(kAfterItemMs);
-
-        if (i + 1 < selectedItems.size()) {
-            waitForClipboardReady();
-            if (SetClipboardUnicodeOnly(hwndMain, L"\r\n")) {
-                lastSequenceNumber = GetClipboardSequenceNumber();
-                Sleep(20);
-                SendCtrlV();
-                Sleep(kAfterSeparatorMs);
-            }
-        }
     }
 
     Sleep(kTailBeforeRestore);
