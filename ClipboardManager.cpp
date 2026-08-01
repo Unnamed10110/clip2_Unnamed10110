@@ -1283,6 +1283,56 @@ static void SendCtrlV() {
     SendInput(4, in, sizeof(INPUT));
 }
 
+// Synthetic Ctrl+<key> in one SendInput batch (same rationale as SendCtrlV).
+static void SendCtrlKey(WORD vk) {
+    INPUT in[4] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_LCONTROL;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = vk;
+    in[2].type = INPUT_KEYBOARD;
+    in[2].ki.wVk = vk;
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].type = INPUT_KEYBOARD;
+    in[3].ki.wVk = VK_LCONTROL;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
+}
+
+static void SendCtrlC() { SendCtrlKey('C'); }
+static void SendCtrlA() { SendCtrlKey('A'); }
+
+// Read plain text from the clipboard (CF_UNICODETEXT, falling back to CF_TEXT).
+// Returns empty string when no text is available.
+static std::wstring ReadClipboardUnicodeText(HWND hwnd) {
+    std::wstring result;
+    if (!OpenClipboard(hwnd)) return result;
+    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+    if (hData) {
+        const wchar_t* p = (const wchar_t*)GlobalLock(hData);
+        if (p) {
+            result = p;
+            GlobalUnlock(hData);
+        }
+    } else {
+        hData = GetClipboardData(CF_TEXT);
+        if (hData) {
+            const char* p = (const char*)GlobalLock(hData);
+            if (p) {
+                int len = MultiByteToWideChar(CP_ACP, 0, p, -1, nullptr, 0);
+                if (len > 1) {
+                    std::vector<wchar_t> buf(len);
+                    MultiByteToWideChar(CP_ACP, 0, p, -1, buf.data(), len);
+                    result = buf.data();
+                }
+                GlobalUnlock(hData);
+            }
+        }
+    }
+    CloseClipboard();
+    return result;
+}
+
 // Cached registered clipboard formats for rich text/HTML.
 static UINT CfRtf() {
     static UINT cf = 0;
@@ -1818,8 +1868,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 mgr->ShowListWindow();
 #ifdef HAVE_UIAUTOMATION
             } else if (cmd == 6) {
-                if (!mgr->CopyFromFocusedControlViaUIA())
-                    MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
+                mgr->CopyFromFocusedControlViaUIA();  // Fails silently when nothing can be captured.
 #endif
             } else if (cmd == 7) {
                 wchar_t exePath[MAX_PATH];
@@ -1861,8 +1910,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             mgr->ShowListWindow();
 #ifdef HAVE_UIAUTOMATION
         } else if (LOWORD(wParam) == 6) {
-            if (!mgr->CopyFromFocusedControlViaUIA())
-                MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
+            mgr->CopyFromFocusedControlViaUIA();  // Fails silently when nothing can be captured.
 #endif
         } else if (LOWORD(wParam) == 7) {
             wchar_t exePath[MAX_PATH];
@@ -1893,8 +1941,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         }
 #ifdef HAVE_UIAUTOMATION
         else if (wParam == ClipboardManager::HOTKEY_ID_COPY_FOCUSED) {
-            if (!mgr->CopyFromFocusedControlViaUIA())
-                MessageBoxW(hwnd, L"No text could be read from the focused control.", L"clip2", MB_OK | MB_ICONINFORMATION);
+            mgr->CopyFromFocusedControlViaUIA();  // Fails silently when nothing can be captured.
         }
 #endif
         else if (wParam == ClipboardManager::HOTKEY_ID_PASTE_FOCUSED) {
@@ -4140,9 +4187,8 @@ static bool IsPlaceholderOrNotAccessibleText(const std::wstring& s) {
     return false;
 }
 
-// Get text from a UI Automation element (selection or document range). Returns true if text was written.
-static bool GetTextFromElement(IUIAutomation* pAutomation, IUIAutomationElement* pElement, std::wstring& outText) {
-    if (!pAutomation || !pElement) return false;
+// Extract text via UIA TextPattern (current selection, then whole document range).
+static bool GetTextViaTextPattern(IUIAutomationElement* pElement, std::wstring& outText) {
     IUnknown* pPatternUnknown = nullptr;
     HRESULT hr = pElement->GetCurrentPattern(UIA_TextPatternId, (IUnknown**)&pPatternUnknown);
     if (FAILED(hr) || !pPatternUnknown) return false;
@@ -4185,54 +4231,161 @@ static bool GetTextFromElement(IUIAutomation* pAutomation, IUIAutomationElement*
     outText = std::move(text);
     return true;
 }
-#endif
 
-// Get text from the currently focused control via UI Automation (bypasses apps that never put content on clipboard).
-bool ClipboardManager::CopyFromFocusedControlViaUIA() {
-#ifdef HAVE_UIAUTOMATION
-    IUIAutomation* pAutomation = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
-                                  __uuidof(IUIAutomation), (void**)&pAutomation);
-    if (FAILED(hr) || !pAutomation) return false;
-
+// Extract text via UIA ValuePattern (edit boxes, combo boxes, browser URL bars, etc.).
+static bool GetTextViaValuePattern(IUIAutomationElement* pElement, std::wstring& outText) {
+    IUnknown* pUnknown = nullptr;
+    HRESULT hr = pElement->GetCurrentPattern(UIA_ValuePatternId, (IUnknown**)&pUnknown);
+    if (FAILED(hr) || !pUnknown) return false;
+    IUIAutomationValuePattern* pValue = nullptr;
+    hr = pUnknown->QueryInterface(__uuidof(IUIAutomationValuePattern), (void**)&pValue);
+    pUnknown->Release();
+    if (FAILED(hr) || !pValue) return false;
+    BSTR bstr = nullptr;
     std::wstring text;
-    IUIAutomationElement* pFocused = nullptr;
-    hr = pAutomation->GetFocusedElement(&pFocused);
-    if (SUCCEEDED(hr) && pFocused) {
-        GetTextFromElement(pAutomation, pFocused, text);
-        pFocused->Release();
+    if (SUCCEEDED(pValue->get_CurrentValue(&bstr)) && bstr) {
+        text = UiaBstrToWstring(bstr);
+        SysFreeString(bstr);
     }
-    // If focused element gave a placeholder (e.g. "The editor is not accessible at this time..."), try foreground window
-    if (IsPlaceholderOrNotAccessibleText(text)) {
-        text.clear();
-        HWND hFore = GetForegroundWindow();
-        if (hFore) {
-            IUIAutomationElement* pWindow = nullptr;
-            hr = pAutomation->ElementFromHandle(hFore, &pWindow);
-            if (SUCCEEDED(hr) && pWindow) {
-                GetTextFromElement(pAutomation, pWindow, text);
-                pWindow->Release();
+    pValue->Release();
+    if (text.empty()) return false;
+    outText = std::move(text);
+    return true;
+}
+
+// Extract text via the LegacyIAccessible pattern (MSAA-bridged / older controls).
+static bool GetTextViaLegacyPattern(IUIAutomationElement* pElement, std::wstring& outText) {
+    IUnknown* pUnknown = nullptr;
+    HRESULT hr = pElement->GetCurrentPattern(UIA_LegacyIAccessiblePatternId, (IUnknown**)&pUnknown);
+    if (FAILED(hr) || !pUnknown) return false;
+    IUIAutomationLegacyIAccessiblePattern* pLegacy = nullptr;
+    hr = pUnknown->QueryInterface(__uuidof(IUIAutomationLegacyIAccessiblePattern), (void**)&pLegacy);
+    pUnknown->Release();
+    if (FAILED(hr) || !pLegacy) return false;
+    BSTR bstr = nullptr;
+    std::wstring text;
+    if (SUCCEEDED(pLegacy->get_CurrentValue(&bstr)) && bstr) {
+        text = UiaBstrToWstring(bstr);
+        SysFreeString(bstr);
+    }
+    pLegacy->Release();
+    if (text.empty()) return false;
+    outText = std::move(text);
+    return true;
+}
+
+// Last resort: the element's Name property (labels, read-only/static text).
+static bool GetTextViaName(IUIAutomationElement* pElement, std::wstring& outText) {
+    BSTR bstr = nullptr;
+    std::wstring text;
+    if (SUCCEEDED(pElement->get_CurrentName(&bstr)) && bstr) {
+        text = UiaBstrToWstring(bstr);
+        SysFreeString(bstr);
+    }
+    if (text.empty()) return false;
+    outText = std::move(text);
+    return true;
+}
+
+// Get text from a single UI Automation element, trying every supported pattern in order
+// of usefulness. `includeName` controls whether the Name property is used as a last resort
+// (skipped when a descendant walk should get a chance first). Returns true if any text was written.
+static bool GetTextFromElement(IUIAutomation* pAutomation, IUIAutomationElement* pElement, std::wstring& outText, bool includeName = true) {
+    if (!pAutomation || !pElement) return false;
+    if (GetTextViaTextPattern(pElement, outText)) return true;
+    if (GetTextViaValuePattern(pElement, outText)) return true;
+    if (GetTextViaLegacyPattern(pElement, outText)) return true;
+    if (includeName && GetTextViaName(pElement, outText)) return true;
+    return false;
+}
+
+// When an element itself yields nothing, walk its descendants that support TextPattern or
+// ValuePattern and concatenate their text. Bounded in element count and total length so a
+// huge tree cannot stall the app. Returns true if any text was collected.
+static bool GetTextFromElementTree(IUIAutomation* pAutomation, IUIAutomationElement* pElement, std::wstring& outText) {
+    if (!pAutomation || !pElement) return false;
+
+    // Condition: supports TextPattern OR ValuePattern.
+    IUIAutomationCondition* pHasText = nullptr;
+    IUIAutomationCondition* pHasValue = nullptr;
+    IUIAutomationCondition* pOr = nullptr;
+    VARIANT vTrue; vTrue.vt = VT_BOOL; vTrue.boolVal = VARIANT_TRUE;
+    pAutomation->CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, vTrue, &pHasText);
+    pAutomation->CreatePropertyCondition(UIA_IsValuePatternAvailablePropertyId, vTrue, &pHasValue);
+    if (pHasText && pHasValue)
+        pAutomation->CreateOrCondition(pHasText, pHasValue, &pOr);
+
+    IUIAutomationCondition* pCond = pOr ? pOr : (pHasText ? pHasText : pHasValue);
+    if (!pCond) {
+        if (pHasText) pHasText->Release();
+        if (pHasValue) pHasValue->Release();
+        if (pOr) pOr->Release();
+        return false;
+    }
+
+    std::wstring collected;
+    IUIAutomationElementArray* pFound = nullptr;
+    if (SUCCEEDED(pElement->FindAll(TreeScope_Descendants, pCond, &pFound)) && pFound) {
+        int count = 0;
+        pFound->get_Length(&count);
+        const int kMaxElements = 200;
+        const size_t kMaxTotal = 1u << 20;  // 1M chars cap
+        if (count > kMaxElements) count = kMaxElements;
+        // Rich containers (chat views, web pages) expose the same text on many nested wrapper
+        // elements, so naive concatenation repeats each line dozens of times. Skip any chunk
+        // whose text is already contained in what we've collected. FindAll returns pre-order,
+        // so an ancestor block that already includes its children's text absorbs them here.
+        for (int i = 0; i < count && collected.size() < kMaxTotal; i++) {
+            IUIAutomationElement* pChild = nullptr;
+            if (SUCCEEDED(pFound->GetElement(i, &pChild)) && pChild) {
+                std::wstring t;
+                if (GetTextViaValuePattern(pChild, t) || GetTextViaTextPattern(pChild, t)) {
+                    if (!t.empty() && collected.find(t) == std::wstring::npos) {
+                        if (!collected.empty()) collected += L"\r\n";
+                        collected += t;
+                    }
+                }
+                pChild->Release();
             }
         }
+        pFound->Release();
     }
-    pAutomation->Release();
 
-    if (text.empty() || IsPlaceholderOrNotAccessibleText(text)) return false;
+    if (pHasText) pHasText->Release();
+    if (pHasValue) pHasValue->Release();
+    if (pOr) pOr->Release();
 
-    // Add to our history and set system clipboard so user can paste
+    if (collected.empty()) return false;
+    outText = std::move(collected);
+    return true;
+}
+
+// Full extraction for one element: direct patterns first, then descendant walk, then Name.
+static bool ExtractElementText(IUIAutomation* pAutomation, IUIAutomationElement* pElement, std::wstring& outText) {
+    if (!pAutomation || !pElement) return false;
+    if (GetTextFromElement(pAutomation, pElement, outText, /*includeName=*/false)) return true;
+    if (GetTextFromElementTree(pAutomation, pElement, outText)) return true;
+    return GetTextViaName(pElement, outText);
+}
+#endif
+
+// Shared tail for captured text: add it to history (refresh the list if open), optionally set the
+// system clipboard, and play the click sound. Used by both the UIA and synthetic-copy paths.
+void ClipboardManager::CommitCapturedText(const std::wstring& text, bool setClipboard) {
+    if (text.empty()) return;
+
     std::vector<BYTE> data((text.size() + 1) * sizeof(wchar_t));
     memcpy(data.data(), text.c_str(), (text.size() + 1) * sizeof(wchar_t));
-    std::unique_ptr<ClipboardItem> item;
     try {
-        item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, data);
+        auto item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, data);
+        clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
+        TrimHistory();
+        if (listVisible) { FilterItems(); UpdateListWindow(); }
     } catch (...) {
-        return true;  // We got text; clipboard set below may still work
+        // Even if history insertion fails, still try to set the clipboard below.
     }
-    clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
-    TrimHistory();
-    if (listVisible) { FilterItems(); UpdateListWindow(); }
 
-    if (hwndMain && OpenClipboard(hwndMain)) {
+    if (setClipboard && hwndMain && OpenClipboard(hwndMain)) {
         EmptyClipboard();
         size_t byteLen = (text.size() + 1) * sizeof(wchar_t);
         HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
@@ -4250,11 +4403,123 @@ bool ClipboardManager::CopyFromFocusedControlViaUIA() {
         CloseClipboard();
     }
     PlayClickSound();
+}
+
+// Universal fallback: drive the focused app with synthetic Ctrl+C (then Ctrl+A + Ctrl+C if nothing
+// new arrived) and read whatever lands on the clipboard. Works even for apps that expose no UIA text.
+bool ClipboardManager::CopyFocusedViaSyntheticCopy(std::wstring& outText) {
+    // Resolve the real target: never send keystrokes to clip2's own windows.
+    HWND hTarget = GetForegroundWindow();
+    if (hTarget == hwndList || hTarget == hwndMain || (hwndList && IsChild(hwndList, hTarget))) {
+        if (previousFocusWindow && IsWindow(previousFocusWindow) &&
+            previousFocusWindow != hwndList && previousFocusWindow != hwndMain) {
+            hTarget = previousFocusWindow;
+            DWORD tgtTid = GetWindowThreadProcessId(hTarget, nullptr);
+            DWORD curTid = GetCurrentThreadId();
+            if (tgtTid != curTid) AttachThreadInput(curTid, tgtTid, TRUE);
+            SetForegroundWindow(hTarget);
+            if (tgtTid != curTid) AttachThreadInput(curTid, tgtTid, FALSE);
+            Sleep(60);
+        } else {
+            return false;
+        }
+    }
+    if (!hTarget || !IsWindow(hTarget)) return false;
+
+    // Suppress our own clipboard monitor while we drive the copy.
+    isPasting = true;
+    // A held hotkey (e.g. Ctrl+F10) must not corrupt the injected Ctrl+C.
+    ReleaseAllModifierKeysForKeystrokePaste();
+
+    std::wstring priorText = ReadClipboardUnicodeText(hwndMain);
+    DWORD priorSeq = GetClipboardSequenceNumber();
+
+    auto tryCapture = [&](std::wstring& captured) -> bool {
+        for (int i = 0; i < 8; i++) {
+            Sleep(15);
+            DWORD seq = GetClipboardSequenceNumber();
+            if (seq != priorSeq) {
+                std::wstring t = ReadClipboardUnicodeText(hwndMain);
+                if (!t.empty() && t != priorText) { captured = t; return true; }
+            }
+        }
+        // Sequence may be unreliable in some apps; check the text directly as a fallback.
+        std::wstring t = ReadClipboardUnicodeText(hwndMain);
+        if (!t.empty() && t != priorText) { captured = t; return true; }
+        return false;
+    };
+
+    std::wstring captured;
+    SendCtrlC();
+    bool ok = tryCapture(captured);
+
+    if (!ok) {
+        // User approved: select-all then copy. This changes the target's current selection.
+        priorSeq = GetClipboardSequenceNumber();
+        SendCtrlA();
+        Sleep(40);
+        SendCtrlC();
+        ok = tryCapture(captured);
+    }
+
+    // Keep our sequence number in sync with whatever is now on the clipboard so the monitor
+    // does not re-process this as a fresh external copy.
+    lastSequenceNumber = GetClipboardSequenceNumber();
+    isPasting = false;
+
+    if (!ok || captured.empty()) return false;
+    outText = std::move(captured);
     return true;
-#else
-    (void)0;
-    return false;
+}
+
+// Get text from the currently focused control: expanded UI Automation first, then a universal
+// synthetic keyboard-copy fallback. Fails silently (returns false) when nothing can be captured.
+bool ClipboardManager::CopyFromFocusedControlViaUIA() {
+    std::wstring text;
+
+#ifdef HAVE_UIAUTOMATION
+    IUIAutomation* pAutomation = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                                  __uuidof(IUIAutomation), (void**)&pAutomation);
+    if (SUCCEEDED(hr) && pAutomation) {
+        IUIAutomationElement* pFocused = nullptr;
+        hr = pAutomation->GetFocusedElement(&pFocused);
+        if (SUCCEEDED(hr) && pFocused) {
+            ExtractElementText(pAutomation, pFocused, text);
+            pFocused->Release();
+        }
+        // If focused element gave a placeholder or nothing, try the foreground window's tree.
+        if (text.empty() || IsPlaceholderOrNotAccessibleText(text)) {
+            text.clear();
+            HWND hFore = GetForegroundWindow();
+            if (hFore) {
+                IUIAutomationElement* pWindow = nullptr;
+                hr = pAutomation->ElementFromHandle(hFore, &pWindow);
+                if (SUCCEEDED(hr) && pWindow) {
+                    ExtractElementText(pAutomation, pWindow, text);
+                    pWindow->Release();
+                }
+            }
+        }
+        pAutomation->Release();
+    }
+
+    if (IsPlaceholderOrNotAccessibleText(text)) text.clear();
 #endif
+
+    // UIA gave nothing usable: fall back to the universal synthetic keyboard copy.
+    if (text.empty()) {
+        std::wstring captured;
+        if (CopyFocusedViaSyntheticCopy(captured)) {
+            // Text is already on the clipboard from the synthetic copy; just record it.
+            CommitCapturedText(captured, /*setClipboard=*/false);
+            return true;
+        }
+        return false;
+    }
+
+    CommitCapturedText(text, /*setClipboard=*/true);
+    return true;
 }
 
 bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSwap) {

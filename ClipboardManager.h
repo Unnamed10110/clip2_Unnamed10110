@@ -228,6 +228,10 @@ private:
     void RefreshThemeVisuals();                      // Re-apply class brushes + repaint after a color change.
     // Read text from focused control via UI Automation (when app does not put anything on clipboard)
     bool CopyFromFocusedControlViaUIA();
+    // Universal fallback: synthetic Ctrl+C (then Ctrl+A + Ctrl+C) against the focused app; captured text lands on the clipboard.
+    bool CopyFocusedViaSyntheticCopy(std::wstring& outText);
+    // Shared tail for captured text: add to history, optionally set the system clipboard, play the click sound.
+    void CommitCapturedText(const std::wstring& text, bool setClipboard = true);
     // Paste from history into focused control: useClipboardSwap=false sends plain text as Unicode keystrokes (Ctrl+F11).
     // useClipboardSwap=true puts item formats/text on clipboard and simulates Ctrl+V (Ctrl+Shift+F11).
     bool PasteToFocusedControlWithoutClipboard(bool useClipboardSwap);
