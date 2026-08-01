@@ -1551,7 +1551,7 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager()
-    : hwndMain(nullptr), hwndList(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
@@ -1673,9 +1673,26 @@ bool ClipboardManager::Initialize() {
     DeleteObject(hRgn);
     
     ShowWindow(hwndList, SW_HIDE);
+
+    // Create the left "pinned" panel (same class/proc; distinguished by handle).
+    hwndPinned = CreateWindowEx(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"ClipboardManagerListClass",
+        L"clip2 - Pinned",
+        WS_POPUP,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        PINNED_WIDTH, WINDOW_HEIGHT,
+        nullptr, nullptr, GetModuleHandle(nullptr), nullptr
+    );
+    if (hwndPinned) {
+        HRGN hRgnP = CreateRectRgn(0, 0, PINNED_WIDTH + 1, WINDOW_HEIGHT + 1);
+        SetWindowRgn(hwndPinned, hRgnP, TRUE);
+        DeleteObject(hRgnP);
+        ShowWindow(hwndPinned, SW_HIDE);
+    }
     
     // Create search edit control (child of list window) - Dark theme style
-    hwndSearch = CreateWindowEx(
+    hwndMainSearch = CreateWindowEx(
         0, // Remove WS_EX_CLIENTEDGE for modern look, we'll draw border ourselves
         L"EDIT",
         L"",
@@ -1687,12 +1704,29 @@ bool ClipboardManager::Initialize() {
         nullptr
     );
     
-    if (hwndSearch) {
-        SendMessage(hwndSearch, WM_SETFONT, (WPARAM)GetOverlayFont(), TRUE);
-        SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
+    if (hwndMainSearch) {
+        SendMessage(hwndMainSearch, WM_SETFONT, (WPARAM)GetOverlayFont(), TRUE);
+        SendMessage(hwndMainSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
         // Subclass the edit control to handle Enter key
-        originalSearchEditProc = (WNDPROC)SetWindowLongPtr(hwndSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
-        ShowWindow(hwndSearch, SW_HIDE);  // Hide initially, show when list is visible
+        originalSearchEditProc = (WNDPROC)SetWindowLongPtr(hwndMainSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
+        ShowWindow(hwndMainSearch, SW_HIDE);  // Hide initially, show when list is visible
+    }
+    hwndSearch = hwndMainSearch;  // Active pane's search box (starts on the main list)
+
+    // Search edit for the pinned panel (same subclass proc).
+    if (hwndPinned) {
+        hwndPinnedSearch = CreateWindowEx(
+            0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL,
+            5, 30, PINNED_WIDTH - 10, 25,
+            hwndPinned, nullptr, GetModuleHandle(nullptr), nullptr
+        );
+        if (hwndPinnedSearch) {
+            SendMessage(hwndPinnedSearch, WM_SETFONT, (WPARAM)GetOverlayFont(), TRUE);
+            SendMessage(hwndPinnedSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search pinned (Ctrl+F)");
+            SetWindowLongPtr(hwndPinnedSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
+            ShowWindow(hwndPinnedSearch, SW_HIDE);
+        }
     }
     
     // Create preview window (initially hidden) with rounded borders
@@ -1796,6 +1830,10 @@ void ClipboardManager::Stop() {
     if (hwndPreview) {
         DestroyWindow(hwndPreview);
         hwndPreview = nullptr;
+    }
+    if (hwndPinned) {
+        DestroyWindow(hwndPinned);
+        hwndPinned = nullptr;
     }
     if (hwndList) {
         DestroyWindow(hwndList);
@@ -2018,23 +2056,25 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         return 0;
     
     case WM_TIMER:
-        // Check if foreground window is still our list window
+        // Check if foreground window is still part of our overlay (main list, pinned panel,
+        // their search boxes/children, or the preview popup).
         if (wParam == 1) { // Timer ID 1 for focus check
             if (mgr->listVisible && mgr->hwndList && IsWindowVisible(mgr->hwndList)) {
                 HWND fgWindow = GetForegroundWindow();
-                if (fgWindow != mgr->hwndList && fgWindow != mgr->hwndSearch) {
-                    if (mgr->hwndPreview && fgWindow == mgr->hwndPreview) {
-                        // Preview popup is still part of the overlay session
+                if (mgr->IsOverlayWindow(fgWindow)) {
+                    mgr->overlayGotForeground = true;  // we hold the foreground now
+                } else if (!mgr->overlayGotForeground) {
+                    // We haven't won the foreground yet (e.g. opened over the Start menu,
+                    // which briefly keeps it). Keep fighting for it instead of hiding, up
+                    // to ~3s, so the overlay doesn't flash and vanish.
+                    if (GetTickCount() - mgr->overlayShownTick < 3000) {
+                        mgr->FocusListWindow();
                     } else {
-                        // Check if foreground window is a child of our list
-                        bool isChild = false;
-                        if (fgWindow != nullptr) {
-                            isChild = IsChild(mgr->hwndList, fgWindow) != FALSE;
-                        }
-                        if (!isChild) {
-                            mgr->HideListWindow();
-                        }
+                        mgr->HideListWindow();
                     }
+                } else {
+                    // We had the foreground and lost it: the user switched away -> dismiss.
+                    mgr->HideListWindow();
                 }
             } else {
                 // Window is not visible or not supposed to be visible - stop timer
@@ -2207,6 +2247,19 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         RECT rect;
         GetClientRect(hwnd, &rect);
 
+        // ---- Resolve which pane this window is rendering -------------------------
+        // The live member state belongs to the focused pane; the other pane renders
+        // from its snapshot (read-only look: dimmed selection, no hover, no multi-select).
+        bool paneIsPinned = (hwnd == mgr->hwndPinned);
+        bool paneIsActive = (hwnd == mgr->ActiveListHwnd());
+        std::vector<int>& pFiltered = paneIsActive ? mgr->filteredIndices : mgr->inactivePane.filteredIndices;
+        int   pSelected  = paneIsActive ? mgr->selectedIndex : mgr->inactivePane.selectedIndex;
+        int   pScroll    = paneIsActive ? mgr->scrollOffset  : mgr->inactivePane.scrollOffset;
+        bool  pSnippets  = paneIsActive ? mgr->snippetsMode  : false;
+        int   pHover     = paneIsActive ? mgr->hoveredItemIndex : -1;
+        const std::wstring& pSearch = paneIsActive ? mgr->searchText : mgr->inactivePane.searchText;
+        HWND  pSearchBox = paneIsPinned ? mgr->hwndPinnedSearch : mgr->hwndMainSearch;
+
         // ---- Double buffering: render everything onto an off-screen bitmap first. ----
         HDC hdc = CreateCompatibleDC(hdcWindow);
         HBITMAP memBmp = CreateCompatibleBitmap(hdcWindow, rect.right, rect.bottom);
@@ -2247,11 +2300,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             DrawTextW(hdc, L"clip2", -1, &nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
             // Mode pill + live count on the right.
-            int total = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size()
-                                          : (int)mgr->filteredIndices.size();
-            std::wstring modeText = mgr->snippetsMode ? L"SNIPPETS" : L"CLIPBOARD";
+            int total = pSnippets ? (int)mgr->filteredSnippetIndices.size()
+                                  : (int)pFiltered.size();
+            std::wstring modeText = paneIsPinned ? L"PINNED" : (pSnippets ? L"SNIPPETS" : L"CLIPBOARD");
             std::wstring countText = std::to_wstring(total) + (total == 1 ? L" item" : L" items");
-            if (!mgr->numberInput.empty()) countText = L"#" + mgr->numberInput;
+            if (paneIsActive && !mgr->numberInput.empty()) countText = L"#" + mgr->numberInput;
 
             SelectObject(hdc, GetOverlayFontSmall());
             SIZE szMode{}, szCount{};
@@ -2294,8 +2347,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         }
 
         // ---- Search field --------------------------------------------------------
-        if (mgr->hwndSearch && IsWindowVisible(mgr->hwndSearch)) {
-            bool searchFocused = (GetFocus() == mgr->hwndSearch);
+        if (pSearchBox && IsWindowVisible(pSearchBox)) {
+            bool searchFocused = (GetFocus() == pSearchBox);
             RECT searchRect = { 6, SEARCH_TOP, rect.right - 6, SEARCH_BOT };
             HPEN hPen = CreatePen(PS_SOLID, 1, searchFocused ? Theme5250::TXT : dividerCol);
             HGDIOBJ op = SelectObject(hdc, hPen);
@@ -2307,36 +2360,39 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         }
 
         // ---- Scroll / paging math ------------------------------------------------
-        int totalItems = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
+        int totalItems = pSnippets ? (int)mgr->filteredSnippetIndices.size() : (int)pFiltered.size();
         int visibleHeight = listBottom - CONTENT_TOP;
-        mgr->itemsPerPage = std::max(1, visibleHeight / itemHeight);
-        int maxScroll = std::max(0, totalItems - mgr->itemsPerPage);
-        if (mgr->scrollOffset > maxScroll) mgr->scrollOffset = maxScroll;
-        if (mgr->scrollOffset < 0) mgr->scrollOffset = 0;
+        int itemsPerPage = std::max(1, visibleHeight / itemHeight);
+        if (paneIsActive) mgr->itemsPerPage = itemsPerPage;  // keyboard paging uses the active pane
+        int maxScroll = std::max(0, totalItems - itemsPerPage);
+        if (pScroll > maxScroll) pScroll = maxScroll;
+        if (pScroll < 0) pScroll = 0;
+        // Persist the clamped scroll back to the owning pane.
+        if (paneIsActive) mgr->scrollOffset = pScroll; else mgr->inactivePane.scrollOffset = pScroll;
 
         int yPos = CONTENT_TOP;
-        int startIndex = mgr->scrollOffset;
-        int endIndex = std::min(startIndex + mgr->itemsPerPage, totalItems);
+        int startIndex = pScroll;
+        int endIndex = std::min(startIndex + itemsPerPage, totalItems);
         int rowRight = rect.right - 9;  // leave room for scrollbar
 
         // Empty-state hint.
         if (totalItems == 0) {
             SetTextColor(hdc, BlendColor(Theme5250::BG, Theme5250::DIM, 220));
             RECT emptyRect = { 0, CONTENT_TOP, rect.right, listBottom };
-            std::wstring msg = mgr->searchText.empty()
-                ? (mgr->snippetsMode ? L"No snippets yet" : L"Clipboard history is empty")
+            std::wstring msg = pSearch.empty()
+                ? (paneIsPinned ? L"No pinned items" : (pSnippets ? L"No snippets yet" : L"Clipboard history is empty"))
                 : L"No matches";
             DrawTextW(hdc, msg.c_str(), -1, &emptyRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
-        if (mgr->snippetsMode) {
+        if (pSnippets) {
             for (int i = startIndex; i < endIndex && yPos + itemHeight <= listBottom; i++) {
                 if (i >= (int)mgr->filteredSnippetIndices.size()) break;
                 int actualIndex = mgr->filteredSnippetIndices[i];
                 const auto& snip = mgr->snippets[actualIndex];
 
-                bool isSelected = (i == mgr->selectedIndex && mgr->selectedIndex >= 0);
-                bool isHover = (i == mgr->hoveredItemIndex);
+                bool isSelected = (i == pSelected && pSelected >= 0);
+                bool isHover = (i == pHover);
                 RECT rowRect = { 6, yPos + 2, rowRight, yPos + itemHeight - 2 };
 
                 if (isSelected) {
@@ -2379,18 +2435,21 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             }
         } else {
             for (int i = startIndex; i < endIndex && yPos + itemHeight <= listBottom; i++) {
-                if (i >= (int)mgr->filteredIndices.size()) break;
-                int actualIndex = mgr->filteredIndices[i];
+                if (i >= (int)pFiltered.size()) break;
+                int actualIndex = pFiltered[i];
+                if (actualIndex < 0 || actualIndex >= (int)mgr->clipboardHistory.size()) continue;
                 const auto& item = mgr->clipboardHistory[actualIndex];
+                if (!item) continue;
 
-                bool isMultiSelected = mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
-                bool isSelected = (i == mgr->selectedIndex && mgr->selectedIndex >= 0);
-                bool isHover = (i == mgr->hoveredItemIndex);
+                bool isMultiSelected = paneIsActive && mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
+                bool isSelected = (i == pSelected && pSelected >= 0);
+                bool isHover = (i == pHover);
                 bool hot = isMultiSelected || isSelected;
                 RECT rowRect = { 6, yPos + 2, rowRight, yPos + itemHeight - 2 };
 
                 if (hot) {
-                    HBRUSH b = CreateSolidBrush(Theme5250::SEL_BG);
+                    // Dim the selection on the non-focused pane so it reads as inactive.
+                    HBRUSH b = CreateSolidBrush(paneIsActive ? Theme5250::SEL_BG : accentSoft);
                     HRGN rgn = CreateRoundRectRgn(rowRect.left, rowRect.top, rowRect.right, rowRect.bottom, 8, 8);
                     FillRgn(hdc, rgn, b);
                     DeleteObject(rgn);
@@ -2403,8 +2462,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     DeleteObject(b);
                 }
 
-                COLORREF fg = hot ? Theme5250::SEL_FG : Theme5250::TXT;
-                COLORREF meta = hot ? Theme5250::SEL_FG : BlendColor(Theme5250::BG, Theme5250::TXT, 150);
+                COLORREF fg = (hot && paneIsActive) ? Theme5250::SEL_FG : Theme5250::TXT;
+                COLORREF meta = (hot && paneIsActive) ? Theme5250::SEL_FG : BlendColor(Theme5250::BG, Theme5250::TXT, 150);
 
                 // Pinned accent bar at the very left of the row.
                 if (item->pinned) {
@@ -2482,7 +2541,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         }
 
         // ---- Scrollbar indicator -------------------------------------------------
-        if (totalItems > mgr->itemsPerPage) {
+        if (totalItems > itemsPerPage) {
             int trackTop = CONTENT_TOP + 2, trackBot = listBottom - 2;
             int trackH = trackBot - trackTop;
             int trackX = rect.right - 6;
@@ -2491,8 +2550,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 RECT track = { trackX, trackTop, trackX + 3, trackBot };
                 FillRect(hdc, &track, tb);
                 DeleteObject(tb);
-                int thumbH = std::max(20, trackH * mgr->itemsPerPage / totalItems);
-                int thumbY = trackTop + (maxScroll > 0 ? (trackH - thumbH) * mgr->scrollOffset / maxScroll : 0);
+                int thumbH = std::max(20, trackH * itemsPerPage / totalItems);
+                int thumbY = trackTop + (maxScroll > 0 ? (trackH - thumbH) * pScroll / maxScroll : 0);
                 HBRUSH thb = CreateSolidBrush(Theme5250::BORDER);
                 RECT thumb = { trackX, thumbY, trackX + 3, thumbY + thumbH };
                 FillRect(hdc, &thumb, thb);
@@ -2517,9 +2576,13 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             SelectObject(hdc, GetOverlayFontSmall());
             SetTextColor(hdc, BlendColor(Theme5250::BG, Theme5250::TXT, 170));
             RECT hintRect = { 12, footRect.top, rect.right - 12, footRect.bottom };
-            const wchar_t* hint = mgr->snippetsMode
-                ? L"Enter paste  \x2022  Ctrl+Left clipboard  \x2022  Ctrl+F search  \x2022  Esc close"
-                : L"1-9 quick  \x2022  Enter paste  \x2022  Ctrl+Right snippets  \x2022  Ctrl+F search  \x2022  Esc close";
+            const wchar_t* hint;
+            if (paneIsPinned)
+                hint = L"Tab \x2192 main  \x2022  Enter paste  \x2022  Ctrl+F search  \x2022  Esc close";
+            else if (pSnippets)
+                hint = L"Enter paste  \x2022  Ctrl+Left clipboard  \x2022  Ctrl+F search  \x2022  Esc close";
+            else
+                hint = L"Tab \x2192 pinned  \x2022  1-9 quick  \x2022  Enter paste  \x2022  Ctrl+Right snippets  \x2022  Esc close";
             DrawTextW(hdc, hint, -1, &hintRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(hdc, GetOverlayFont());
         }
@@ -2536,10 +2599,15 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     }
     
     case WM_KEYDOWN: {
-        // Ctrl+Right = Snippets mode, Ctrl+Left = Clipboard mode
+        // Tab toggles focus between the main list and the left pinned panel.
+        if (wParam == VK_TAB && mgr->hwndPinned) {
+            mgr->SwitchActivePane(!mgr->activeIsPinned);
+            return 0;
+        }
+        // Ctrl+Right = Snippets mode, Ctrl+Left = Clipboard mode (main list only)
         bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         if (ctrlPressed && (wParam == VK_RIGHT || wParam == VK_LEFT)) {
-            mgr->SetListSnippetsMode(wParam == VK_RIGHT);
+            if (!mgr->activeIsPinned) mgr->SetListSnippetsMode(wParam == VK_RIGHT);
             return 0;
         }
         // Handle Enter key first
@@ -2891,6 +2959,16 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
     case WM_MOUSEMOVE:
         {
+            // Hover/preview only applies to the focused pane (hovering the other panel
+            // must not steal keyboard focus). Still register for mouse-leave tracking.
+            if (hwnd != mgr->ActiveListHwnd()) {
+                TRACKMOUSEEVENT tmei = {};
+                tmei.cbSize = sizeof(TRACKMOUSEEVENT);
+                tmei.dwFlags = TME_LEAVE;
+                tmei.hwndTrack = hwnd;
+                TrackMouseEvent(&tmei);
+                break;
+            }
             // Track mouse movement for hover preview
             POINT pt;
             pt.x = LOWORD(lParam);
@@ -2899,10 +2977,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int itemIndex = mgr->GetItemAtPosition(pt.x, pt.y);
             bool hoverChanged = (mgr->hoveredItemIndex != itemIndex);
 
-            // Update the row hover highlight and repaint only when it changes.
+            // Update the row hover highlight and repaint only the active pane.
             if (hoverChanged) {
                 mgr->hoveredItemIndex = itemIndex;
-                mgr->UpdateListWindow();
+                mgr->UpdateListWindow(/*includeInactive=*/false);
             }
 
             if (mgr->snippetsMode) {
@@ -2937,12 +3015,14 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         mgr->HidePreviewWindow();
         if (mgr->hoveredItemIndex != -1) {
             mgr->hoveredItemIndex = -1;
-            mgr->UpdateListWindow();
+            mgr->UpdateListWindow(/*includeInactive=*/false);
         }
         break;
         
     case WM_LBUTTONDOWN:
         {
+            // Clicking a panel focuses it (its state becomes live).
+            mgr->EnsureActivePane(hwnd == mgr->hwndPinned);
             POINT pt;
             pt.x = LOWORD(lParam);
             pt.y = HIWORD(lParam);
@@ -2971,6 +3051,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
     case WM_LBUTTONDBLCLK:
         {
+            mgr->EnsureActivePane(hwnd == mgr->hwndPinned);
             POINT pt;
             pt.x = LOWORD(lParam);
             pt.y = HIWORD(lParam);
@@ -2993,12 +3074,23 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         }
         
     case WM_COMMAND:
-        // Handle search edit control text change
-        if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == mgr->hwndSearch) {
-            int length = GetWindowTextLength(mgr->hwndSearch);
+        // Handle search edit control text change (either pane's search box)
+        if (HIWORD(wParam) == EN_CHANGE &&
+            ((HWND)lParam == mgr->hwndMainSearch || (HWND)lParam == mgr->hwndPinnedSearch)) {
+            HWND box = (HWND)lParam;
+            // Only switch panes when the user is actually typing in that box.
+            // Programmatic SetWindowText (e.g. clearing both boxes on show) also fires
+            // EN_CHANGE — that must NOT steal the active pane over to the pinned panel.
+            if (GetFocus() == box) {
+                mgr->EnsureActivePane(box == mgr->hwndPinnedSearch);
+            } else if ((box == mgr->hwndPinnedSearch) != mgr->activeIsPinned) {
+                // Text changed on the inactive pane (programmatic clear) — ignore.
+                return 0;
+            }
+            int length = GetWindowTextLength(box);
             if (length > 0) {
                 wchar_t* buffer = new wchar_t[length + 1];
-                GetWindowText(mgr->hwndSearch, buffer, length + 1);
+                GetWindowText(box, buffer, length + 1);
                 mgr->searchText = buffer;
                 delete[] buffer;
             } else {
@@ -3016,6 +3108,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     case WM_RBUTTONDOWN:
     case WM_CONTEXTMENU:
         {
+            // Right-clicking a panel focuses it so the menu acts on that pane's items.
+            mgr->EnsureActivePane(hwnd == mgr->hwndPinned);
             // Show context menu on right-click
             POINT pt;
             POINT clientPt;
@@ -3175,19 +3269,27 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
     case WM_MOUSEWHEEL:
         {
-            int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
-            int oldOffset = mgr->scrollOffset;
-            
-            if (delta > 0) {
-                mgr->scrollOffset = std::max(0, mgr->scrollOffset - 3);
+            bool wheelActive = (hwnd == mgr->ActiveListHwnd());
+            // Scroll whichever panel the wheel is over, without stealing keyboard focus.
+            if (wheelActive) {
+                int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
+                int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
+                int oldOffset = mgr->scrollOffset;
+                mgr->scrollOffset = (delta > 0) ? std::max(0, mgr->scrollOffset - 3)
+                                                : std::min(maxScroll, mgr->scrollOffset + 3);
+                if (mgr->scrollOffset != oldOffset) mgr->UpdateListWindow(/*includeInactive=*/false);
             } else {
-                mgr->scrollOffset = std::min(maxScroll, mgr->scrollOffset + 3);
-            }
-            
-            if (mgr->scrollOffset != oldOffset) {
-                mgr->UpdateListWindow();
+                int listSize = (int)mgr->inactivePane.filteredIndices.size();
+                int maxScroll = std::max(0, listSize - std::max(1, mgr->itemsPerPage));
+                int oldOffset = mgr->inactivePane.scrollOffset;
+                mgr->inactivePane.scrollOffset = (delta > 0) ? std::max(0, mgr->inactivePane.scrollOffset - 3)
+                                                             : std::min(maxScroll, mgr->inactivePane.scrollOffset + 3);
+                if (mgr->inactivePane.scrollOffset != oldOffset) {
+                    // Repaint only the pane under the wheel (the inactive snapshot).
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    UpdateWindow(hwnd);
+                }
             }
             return 0;
         }
@@ -3223,16 +3325,15 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_KILLFOCUS:
         {
-            // Hide list when it loses focus (unless focus is moving to a child or the preview popup)
+            // Hide the overlay only when focus leaves ALL of our windows (main list,
+            // pinned panel, their search boxes, the preview). Moving focus between the
+            // two panels must not dismiss it. While we're still fighting for the initial
+            // foreground (overlayGotForeground == false), never hide from here: the
+            // focus-check timer keeps retrying the takeover instead.
             HWND hwndGettingFocus = (HWND)wParam;
-            
-            bool isChildWindow = false;
-            if (hwndGettingFocus != nullptr) {
-                isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
-            }
-            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
-            
-            if (!isChildWindow && !isPreviewWindow && hwndGettingFocus != hwnd) {
+            if (!mgr->overlayGotForeground) break;
+            if (GetTickCount() - mgr->overlayShownTick < 500) break;  // show grace period
+            if (!mgr->IsOverlayWindow(hwndGettingFocus)) {
                 mgr->HideListWindow();
             } else {
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -3242,31 +3343,24 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     
     case WM_ACTIVATE:
         if (wParam == WA_INACTIVE) {
-            HWND hwndGettingFocus = GetFocus();
-            bool isChildWindow = false;
-            if (hwndGettingFocus != nullptr) {
-                isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
-            }
-            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
-            
-            if (!isChildWindow && !isPreviewWindow) {
+            HWND other = (HWND)lParam;              // window gaining activation
+            if (!other) other = GetForegroundWindow();
+            if (!mgr->overlayGotForeground) break;  // still acquiring initial foreground
+            if (GetTickCount() - mgr->overlayShownTick < 500) break;
+            if (!mgr->IsOverlayWindow(other)) {
                 mgr->HideListWindow();
             }
         } else {
+            mgr->overlayGotForeground = true;
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         }
         break;
     
     case WM_NCACTIVATE:
         if (wParam == FALSE) {
-            HWND hwndGettingFocus = GetFocus();
-            bool isChildWindow = false;
-            if (hwndGettingFocus != nullptr) {
-                isChildWindow = IsChild(hwnd, hwndGettingFocus) != FALSE;
-            }
-            bool isPreviewWindow = mgr->hwndPreview && hwndGettingFocus == mgr->hwndPreview;
-            
-            if (!isChildWindow && !isPreviewWindow) {
+            HWND fg = GetForegroundWindow();
+            if (mgr->overlayGotForeground &&
+                GetTickCount() - mgr->overlayShownTick >= 500 && !mgr->IsOverlayWindow(fg)) {
                 mgr->HideListWindow();
             }
         }
@@ -3282,6 +3376,28 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
     if (!mgr) {
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }
+
+    // The list window that owns this search box (main or pinned panel).
+    HWND ownerList = GetParent(hwnd);
+    bool ownerIsPinned = (hwnd == mgr->hwndPinnedSearch);
+
+    // Focusing a panel's search box makes that panel the active pane (but keep focus on
+    // the search box the user just clicked, don't yank it to the list window).
+    // While the overlay is still acquiring its initial foreground, never let the pinned
+    // search box steal the active pane — focus must stay on the main overlay.
+    if (uMsg == WM_SETFOCUS) {
+        if (ownerIsPinned && !mgr->overlayGotForeground) {
+            SetFocus(mgr->hwndList ? mgr->hwndList : ownerList);
+            return 0;
+        }
+        mgr->EnsureActivePane(ownerIsPinned, /*focusListWindow=*/false);
+    }
+
+    // Tab toggles between panels from the search box too.
+    if (uMsg == WM_KEYDOWN && wParam == VK_TAB && mgr->hwndPinned) {
+        mgr->SwitchActivePane(!mgr->activeIsPinned);
+        return 0;
+    }
     
     // Handle Escape - close overlay from search box
     if (uMsg == WM_KEYDOWN && wParam == VK_ESCAPE) {
@@ -3295,17 +3411,17 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
         return 0;
     }
     
-    // Ctrl+Left / Ctrl+Right switch between Clipboard and Snippets (from search box too)
+    // Ctrl+Left / Ctrl+Right switch between Clipboard and Snippets (from search box too; main panel only)
     if (uMsg == WM_KEYDOWN && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (wParam == VK_LEFT || wParam == VK_RIGHT)) {
-        SetFocus(mgr->hwndList);
-        SendMessage(mgr->hwndList, WM_KEYDOWN, wParam, lParam);
+        SetFocus(ownerList);
+        SendMessage(ownerList, WM_KEYDOWN, wParam, lParam);
         return 0;
     }
     
     // In snippets mode, forward Up/Down to list so arrow keys move selection even when search has focus
     if (uMsg == WM_KEYDOWN && mgr->snippetsMode && (wParam == VK_UP || wParam == VK_DOWN)) {
-        SetFocus(mgr->hwndList);
-        SendMessage(mgr->hwndList, WM_KEYDOWN, wParam, lParam);
+        SetFocus(ownerList);
+        SendMessage(ownerList, WM_KEYDOWN, wParam, lParam);
         return 0;
     }
     
@@ -3468,9 +3584,7 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
             bool plainEsc = !isCtrlPressed && !isAltPressed && !isShiftPressed && !isWinPressed;
             if (plainEsc) {
                 HWND fg = GetForegroundWindow();
-                if (fg == mgr->hwndList || fg == mgr->hwndSearch ||
-                    (mgr->hwndPreview && fg == mgr->hwndPreview) ||
-                    (fg && mgr->hwndList && IsChild(mgr->hwndList, fg))) {
+                if (mgr->IsOverlayWindow(fg)) {
                     PostMessage(mgr->hwndMain, ClipboardManager::WM_DISMISS_OVERLAY, 0, 0);
                     return 1;
                 }
@@ -3537,54 +3651,74 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
     
     // Remember the window that had focus before we show our list
     previousFocusWindow = GetForegroundWindow();
+
+    // The main list always starts focused (the pinned panel is the inactive pane).
+    activeIsPinned = false;
+    hwndSearch = hwndMainSearch;
     
     // Reset scroll to top when showing
     scrollOffset = 0;
     // Clear number input when showing
     numberInput.clear();
-    // Clear search text when showing
+    // Clear search text when showing (both panes)
     searchText.clear();
-    if (hwndSearch) {
-        SetWindowText(hwndSearch, L"");
-    }
+    inactivePane = PaneState();
+    if (hwndMainSearch) SetWindowText(hwndMainSearch, L"");
+    if (hwndPinnedSearch) SetWindowText(hwndPinnedSearch, L"");
     if (startInSnippetsMode) {
         snippetsMode = true;
         if (hwndSearch) {
             SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search snippets (Ctrl+F) | Arrow keys to move, Enter to paste");
         }
         FilterSnippets();
-        if (!filteredSnippetIndices.empty()) {
-            selectedIndex = 0;
-        } else {
-            selectedIndex = -1;
-        }
+        selectedIndex = (filteredSnippetIndices.empty() ? -1 : 0);
     } else {
         snippetsMode = false;
-        FilterItems();
-        if (!filteredIndices.empty()) {
-            selectedIndex = 0;
-        } else {
-            selectedIndex = -1;
+        if (hwndSearch) {
+            SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
         }
+        FilterItems();
+        selectedIndex = (filteredIndices.empty() ? -1 : 0);
     }
+    RefreshInactivePane();  // populate the pinned panel snapshot
     ClearMultiSelection(); // Clear multi-selection when showing list
-    // Show search box
-    if (hwndSearch) {
-        ShowWindow(hwndSearch, SW_SHOW);
-    }
 
-    UpdateListWindow();
-    
-    // Position window at center-top of screen
+    // ---- Position the pinned panel + main list as a centered pair -----------
     RECT screenRect;
     GetWindowRect(GetDesktopWindow(), &screenRect);
-    int x = (screenRect.right - WINDOW_WIDTH) / 2;
     int y = screenRect.top + 50;
-    SetWindowPos(hwndList, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
-    
+    bool showPinned = (hwndPinned != nullptr);
+    if (showPinned) {
+        int totalW = PINNED_WIDTH + PANEL_GAP + WINDOW_WIDTH;
+        int startX = (screenRect.right - totalW) / 2;
+        if (startX < 8) startX = 8;
+        int pinnedX = startX;
+        int mainX = startX + PINNED_WIDTH + PANEL_GAP;
+        // Show the pinned panel WITHOUT activating it so keyboard focus stays on the main list.
+        SetWindowPos(hwndPinned, HWND_TOPMOST, pinnedX, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(hwndList, HWND_TOPMOST, mainX, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    } else {
+        int x = (screenRect.right - WINDOW_WIDTH) / 2;
+        SetWindowPos(hwndList, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+
+    // Show search boxes without activating (pinned search must never steal focus on open).
+    if (hwndMainSearch) ShowWindow(hwndMainSearch, SW_SHOWNA);
+    if (hwndPinnedSearch) ShowWindow(hwndPinnedSearch, SW_SHOWNA);
+
     ShowWindow(hwndList, SW_SHOW);
+    UpdateListWindow();
+
+    // Reassert main as the live pane after any side-effects from clearing search boxes.
+    activeIsPinned = false;
+    hwndSearch = hwndMainSearch;
+
+    overlayShownTick = GetTickCount();
+    overlayGotForeground = false;
     FocusListWindow();
-    // Make sure list window has focus (not search box) so arrow keys work immediately
+    // Make sure the main list window has focus (not search box, not pinned) so arrow keys work.
+    SetForegroundWindow(hwndList);
+    SetActiveWindow(hwndList);
     SetFocus(hwndList);
     listVisible = true;
     
@@ -3595,18 +3729,97 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
 void ClipboardManager::HideListWindow() {
     if (listVisible) {
         HidePreviewWindow();
-        // Clear search text when hiding
+        // Clear search text when hiding (both panes)
         searchText.clear();
-        if (hwndSearch) {
-            SetWindowText(hwndSearch, L"");
-            ShowWindow(hwndSearch, SW_HIDE);
+        inactivePane = PaneState();
+        if (hwndMainSearch) {
+            SetWindowText(hwndMainSearch, L"");
+            ShowWindow(hwndMainSearch, SW_HIDE);
         }
+        if (hwndPinnedSearch) {
+            SetWindowText(hwndPinnedSearch, L"");
+            ShowWindow(hwndPinnedSearch, SW_HIDE);
+        }
+        if (hwndPinned) ShowWindow(hwndPinned, SW_HIDE);
         ShowWindow(hwndList, SW_HIDE);
         listVisible = false;
+        activeIsPinned = false;
+        hwndSearch = hwndMainSearch;
         
         // Stop the focus check timer
         KillTimer(hwndMain, 1);
     }
+}
+
+HWND ClipboardManager::ActiveListHwnd() {
+    return activeIsPinned ? hwndPinned : hwndList;
+}
+
+// True when h is one of our overlay windows, one of their children, or the preview popup.
+bool ClipboardManager::IsOverlayWindow(HWND h) {
+    if (!h) return false;
+    if (h == hwndList || h == hwndPinned || h == hwndMainSearch || h == hwndPinnedSearch || h == hwndPreview)
+        return true;
+    if (hwndList && IsChild(hwndList, h)) return true;
+    if (hwndPinned && IsChild(hwndPinned, h)) return true;
+    return false;
+}
+
+// Recompute the non-focused pane's snapshot list (used only for rendering it read-only).
+void ClipboardManager::RefreshInactivePane() {
+    // The inactive pane's filter is the opposite of the active pane.
+    bool inactiveIsPinned = !activeIsPinned;
+    ComputeFilteredForPane(inactiveIsPinned, inactivePane.searchText, inactivePane.filteredIndices);
+    int n = (int)inactivePane.filteredIndices.size();
+    if (n == 0) { inactivePane.selectedIndex = -1; inactivePane.scrollOffset = 0; }
+    else {
+        if (inactivePane.selectedIndex < 0) inactivePane.selectedIndex = 0;
+        if (inactivePane.selectedIndex >= n) inactivePane.selectedIndex = n - 1;
+        if (inactivePane.scrollOffset < 0) inactivePane.scrollOffset = 0;
+        if (inactivePane.scrollOffset > std::max(0, n - 1)) inactivePane.scrollOffset = std::max(0, n - 1);
+    }
+}
+
+// Move keyboard focus / live state between the main list and the pinned panel.
+void ClipboardManager::SwitchActivePane(bool toPinned, bool focusListWindow) {
+    if (!hwndPinned) return;                 // pinned panel unavailable
+    if (activeIsPinned == toPinned) return;  // already there
+
+    // Save the current (live) pane into the snapshot slot.
+    PaneState cur;
+    cur.filteredIndices = filteredIndices;
+    cur.selectedIndex = selectedIndex;
+    cur.scrollOffset = scrollOffset;
+    cur.searchText = searchText;
+
+    // Load the target pane's snapshot into the live members.
+    filteredIndices = inactivePane.filteredIndices;
+    selectedIndex = inactivePane.selectedIndex;
+    scrollOffset = inactivePane.scrollOffset;
+    searchText = inactivePane.searchText;
+
+    inactivePane = cur;
+    activeIsPinned = toPinned;
+    snippetsMode = false;  // pinned panel is clipboard-only; leaving snippets resets it
+    ClearMultiSelection();
+    multiSelectAnchor = -1;
+    numberInput.clear();
+
+    hwndSearch = toPinned ? hwndPinnedSearch : hwndMainSearch;
+
+    // Recompute the now-active list fresh (content may have changed while it was inactive).
+    FilterItems();
+    if (hwndSearch) {
+        SendMessage(hwndSearch, EM_SETCUEBANNER, TRUE,
+                    (LPARAM)(toPinned ? L"Search pinned (Ctrl+F)" : L"Search... (Ctrl+F)"));
+    }
+    HWND target = ActiveListHwnd();
+    if (focusListWindow && target) { SetForegroundWindow(target); SetFocus(target); }
+    UpdateListWindow();
+}
+
+void ClipboardManager::EnsureActivePane(bool wantPinned, bool focusListWindow) {
+    if (activeIsPinned != wantPinned) SwitchActivePane(wantPinned, focusListWindow);
 }
 
 int ClipboardManager::GetItemAtPosition(int x, int y) {
@@ -3702,14 +3915,24 @@ void ClipboardManager::ShowPreviewWindow(int itemIndex, int mouseX, int mouseY) 
 }
 
 void ClipboardManager::HidePreviewWindow() {
+    // Do not clear hoveredItemIndex here — hiding the image preview (e.g. when moving
+    // onto a text row) must not wipe the row hover highlight or force a full dual-pane repaint.
     if (hwndPreview) {
         ShowWindow(hwndPreview, SW_HIDE);
-        hoveredItemIndex = -1;
     }
 }
 
 void ClipboardManager::FocusListWindow() {
-    if (!hwndList) {
+    // Until the overlay has actually won the foreground once, always force the MAIN list
+    // (never the pinned panel). Retry timers during acquisition must not revive a stale
+    // activeIsPinned=true left over from programmatic search-box clears.
+    if (!overlayGotForeground) {
+        activeIsPinned = false;
+        hwndSearch = hwndMainSearch;
+    }
+    HWND target = ActiveListHwnd();
+    if (!target) target = hwndList;
+    if (!target) {
         return;
     }
 
@@ -3721,21 +3944,58 @@ void ClipboardManager::FocusListWindow() {
         AttachThreadInput(fgThread, currentThread, TRUE);
     }
 
-    SetWindowPos(hwndList, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    SetForegroundWindow(hwndList);
-    SetActiveWindow(hwndList);
-    SetFocus(hwndList);
-    BringWindowToTop(hwndList);
+    // Some foreground apps (and the shell / Start menu) hold the Windows "foreground
+    // lock", which makes SetForegroundWindow silently fail (the overlay shows but never
+    // activates, and the focus-check timer then hides it). Temporarily drop the lock
+    // timeout, and nudge Windows with a synthetic Alt keypress so it honors the request.
+    DWORD savedLockTimeout = 0;
+    SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, &savedLockTimeout, 0);
+    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)0, SPIF_SENDCHANGE);
+
+    // The "phantom Alt" trick: pressing/releasing Alt makes the current process eligible
+    // to set the foreground window (works around the Start menu / shell foreground lock).
+    keybd_event(VK_MENU, 0, 0, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+
+    // Keep the pinned panel just under the main list in Z-order, both topmost — never activate it.
+    if (hwndPinned && IsWindowVisible(hwndPinned)) {
+        SetWindowPos(hwndPinned, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    SetWindowPos(target, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    BringWindowToTop(target);
+    // A few attempts: some shells release the foreground only after their fade-out.
+    for (int i = 0; i < 3; i++) {
+        SetForegroundWindow(target);
+        SetActiveWindow(target);
+        SetFocus(target);
+        if (GetForegroundWindow() == target) break;
+        Sleep(10);
+    }
+    if (GetForegroundWindow() == target) overlayGotForeground = true;
+
+    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
+                         (PVOID)(UINT_PTR)savedLockTimeout, SPIF_SENDCHANGE);
 
     if (fgThread != 0 && fgThread != currentThread) {
         AttachThreadInput(fgThread, currentThread, FALSE);
     }
 }
 
-void ClipboardManager::UpdateListWindow() {
-    if (hwndList) {
-        InvalidateRect(hwndList, nullptr, TRUE);
-        UpdateWindow(hwndList);
+void ClipboardManager::UpdateListWindow(bool includeInactive) {
+    // Hover/selection-only updates pass includeInactive=false so the other pane
+    // is not invalidated (that was causing the pinned panel to flicker).
+    HWND active = ActiveListHwnd();
+    if (!active) active = hwndList;
+    if (active) {
+        InvalidateRect(active, nullptr, FALSE);
+        UpdateWindow(active);
+    }
+    if (includeInactive && hwndPinned && IsWindowVisible(hwndPinned)) {
+        HWND inactive = (active == hwndList) ? hwndPinned : hwndList;
+        if (inactive) {
+            InvalidateRect(inactive, nullptr, FALSE);
+            UpdateWindow(inactive);
+        }
     }
 }
 
@@ -6003,50 +6263,48 @@ void ClipboardManager::SaveClipboardHistory() {
     } catch (...) {}
 }
 
-void ClipboardManager::FilterItems() {
-    filteredIndices.clear();
-    ClearMultiSelection(); // Clear multi-selection when filtering
-    
-    if (searchText.empty()) {
-        // No filter - show all items in chronological order.
+// Build a filtered index list for one pane. When pinnedOnly is true, only pinned items are
+// included (left panel). The main list keeps normal history order — pinning does not move items.
+void ClipboardManager::ComputeFilteredForPane(bool pinnedOnly, const std::wstring& search, std::vector<int>& out) {
+    out.clear();
+    auto isPinned = [this](int idx) {
+        return idx >= 0 && idx < (int)clipboardHistory.size() &&
+               clipboardHistory[idx] && clipboardHistory[idx]->pinned;
+    };
+
+    if (search.empty()) {
         for (size_t i = 0; i < clipboardHistory.size(); i++) {
-            filteredIndices.push_back((int)i);
+            if (pinnedOnly && !isPinned((int)i)) continue;
+            out.push_back((int)i);
         }
     } else {
-        // Fuzzy filter + ranking (case-insensitive). Best matches first.
-        std::wstring searchLower = searchText;
+        std::wstring searchLower = search;
         std::transform(searchLower.begin(), searchLower.end(), searchLower.begin(), ::towlower);
-        
+
         struct Scored { int index; int score; int order; };
         std::vector<Scored> scored;
         for (size_t i = 0; i < clipboardHistory.size(); i++) {
+            if (pinnedOnly && !isPinned((int)i)) continue;
             const auto& item = clipboardHistory[i];
-            
-            // Score full text content (handles line breaks, not just first 50 chars).
             int best = FuzzyScore(searchLower, item->GetFullSearchableText());
-            // Also consider preview / format name / file type so images and files are findable.
             best = std::max(best, FuzzyScore(searchLower, item->preview));
             best = std::max(best, FuzzyScore(searchLower, item->formatName));
             best = std::max(best, FuzzyScore(searchLower, item->fileType));
-            
-            if (best > 0) {
-                scored.push_back({ (int)i, best, (int)i });
-            }
+            if (best > 0) scored.push_back({ (int)i, best, (int)i });
         }
-        // Stable sort: higher score first, then original (chronological) order.
         std::stable_sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
             if (a.score != b.score) return a.score > b.score;
             return a.order < b.order;
         });
-        for (const auto& s : scored) filteredIndices.push_back(s.index);
+        for (const auto& s : scored) out.push_back(s.index);
     }
+}
 
-    // Pinned items always float to the top, preserving their relative order.
-    std::stable_partition(filteredIndices.begin(), filteredIndices.end(), [this](int idx) {
-        return idx >= 0 && idx < (int)clipboardHistory.size() &&
-               clipboardHistory[idx] && clipboardHistory[idx]->pinned;
-    });
-    
+void ClipboardManager::FilterItems() {
+    ClearMultiSelection(); // Clear multi-selection when filtering
+
+    ComputeFilteredForPane(activeIsPinned, searchText, filteredIndices);
+
     // Reset scroll offset and selection when filtering
     scrollOffset = 0;
     if (filteredIndices.empty()) {
@@ -6054,6 +6312,7 @@ void ClipboardManager::FilterItems() {
     } else {
         selectedIndex = 0;
     }
+    RefreshInactivePane();
     UpdateListWindow();
 }
 
@@ -6226,13 +6485,16 @@ void ClipboardManager::RefreshThemeVisuals() {
         }
     };
     refreshClassBrush(hwndList, Theme5250::BG);
+    refreshClassBrush(hwndPinned, Theme5250::BG);
     refreshClassBrush(hwndPreview, Theme5250::BG);
 
     if (hwndList) { InvalidateRect(hwndList, nullptr, TRUE); UpdateWindow(hwndList); }
+    if (hwndPinned) { InvalidateRect(hwndPinned, nullptr, TRUE); UpdateWindow(hwndPinned); }
     if (hwndPreview && IsWindowVisible(hwndPreview)) {
         InvalidateRect(hwndPreview, nullptr, TRUE); UpdateWindow(hwndPreview);
     }
-    if (hwndSearch) { InvalidateRect(hwndSearch, nullptr, TRUE); UpdateWindow(hwndSearch); }
+    if (hwndMainSearch) { InvalidateRect(hwndMainSearch, nullptr, TRUE); UpdateWindow(hwndMainSearch); }
+    if (hwndPinnedSearch) { InvalidateRect(hwndPinnedSearch, nullptr, TRUE); UpdateWindow(hwndPinnedSearch); }
 }
 
 void ClipboardManager::SetTheme(int themeId) {
@@ -6275,12 +6537,15 @@ void ClipboardManager::SetThemeFontFace(const std::wstring& face) {
     // Drop the cached HFONT so the next paint and the WM_SETFONT below pick up the new face.
     ResetOverlayFontCache();
     HFONT newFont = GetOverlayFont();
-    if (hwndSearch && newFont) SendMessage(hwndSearch, WM_SETFONT, (WPARAM)newFont, TRUE);
+    if (hwndMainSearch && newFont) SendMessage(hwndMainSearch, WM_SETFONT, (WPARAM)newFont, TRUE);
+    if (hwndPinnedSearch && newFont) SendMessage(hwndPinnedSearch, WM_SETFONT, (WPARAM)newFont, TRUE);
     if (hwndList) { InvalidateRect(hwndList, nullptr, TRUE); UpdateWindow(hwndList); }
+    if (hwndPinned) { InvalidateRect(hwndPinned, nullptr, TRUE); UpdateWindow(hwndPinned); }
     if (hwndPreview && IsWindowVisible(hwndPreview)) {
         InvalidateRect(hwndPreview, nullptr, TRUE); UpdateWindow(hwndPreview);
     }
-    if (hwndSearch) { InvalidateRect(hwndSearch, nullptr, TRUE); UpdateWindow(hwndSearch); }
+    if (hwndMainSearch) { InvalidateRect(hwndMainSearch, nullptr, TRUE); UpdateWindow(hwndMainSearch); }
+    if (hwndPinnedSearch) { InvalidateRect(hwndPinnedSearch, nullptr, TRUE); UpdateWindow(hwndPinnedSearch); }
 }
 
 void ClipboardManager::LoadSnippets() {
