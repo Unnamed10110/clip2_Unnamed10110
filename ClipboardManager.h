@@ -191,7 +191,16 @@ private:
     void ShowListWindow(bool startInSnippetsMode = false);
     void SetListSnippetsMode(bool wantSnippets);
     void HideListWindow();
-    void UpdateListWindow();
+    void UpdateListWindow(bool includeInactive = true);
+    // Left "pinned" panel support. The live member state (filteredIndices, selectedIndex,
+    // scrollOffset, searchText, snippetsMode, multi-select...) always belongs to whichever
+    // pane is focused; the other pane keeps a lightweight snapshot for rendering.
+    HWND ActiveListHwnd();                       // hwndPinned when activeIsPinned else hwndList
+    bool IsOverlayWindow(HWND h);                // any overlay window / child / preview
+    void SwitchActivePane(bool toPinned, bool focusListWindow = true);  // move state/focus between panels
+    void EnsureActivePane(bool wantPinned, bool focusListWindow = true); // switch only if needed
+    void RefreshInactivePane();                  // recompute the non-focused pane's snapshot list
+    void ComputeFilteredForPane(bool pinnedOnly, const std::wstring& search, std::vector<int>& out);
     void ShowPreviewWindow(int itemIndex, int x, int y);
     void HidePreviewWindow();
     int GetItemAtPosition(int x, int y);
@@ -228,14 +237,31 @@ private:
     void RefreshThemeVisuals();                      // Re-apply class brushes + repaint after a color change.
     // Read text from focused control via UI Automation (when app does not put anything on clipboard)
     bool CopyFromFocusedControlViaUIA();
+    // Universal fallback: synthetic Ctrl+C (then Ctrl+A + Ctrl+C) against the focused app; captured text lands on the clipboard.
+    bool CopyFocusedViaSyntheticCopy(std::wstring& outText);
+    // Shared tail for captured text: add to history, optionally set the system clipboard, play the click sound.
+    void CommitCapturedText(const std::wstring& text, bool setClipboard = true);
     // Paste from history into focused control: useClipboardSwap=false sends plain text as Unicode keystrokes (Ctrl+F11).
     // useClipboardSwap=true puts item formats/text on clipboard and simulates Ctrl+V (Ctrl+Shift+F11).
     bool PasteToFocusedControlWithoutClipboard(bool useClipboardSwap);
     
     HWND hwndMain;
     HWND hwndList;
+    HWND hwndPinned;          // Left panel showing only pinned items (same class/proc as hwndList)
     HWND hwndPreview;
-    HWND hwndSearch;
+    HWND hwndSearch;          // Active pane's search edit (points at hwndMainSearch or hwndPinnedSearch)
+    HWND hwndMainSearch;      // Search edit child of hwndList
+    HWND hwndPinnedSearch;    // Search edit child of hwndPinned
+    bool activeIsPinned;      // Which pane currently owns the live state / keyboard focus
+    struct PaneState {
+        std::vector<int> filteredIndices;
+        int selectedIndex = 0;
+        int scrollOffset = 0;
+        std::wstring searchText;
+    };
+    PaneState inactivePane;   // Snapshot of the non-focused pane (for rendering + restore on switch)
+    DWORD overlayShownTick;   // Tick when overlay was last shown (grace period before focus-hide)
+    bool overlayGotForeground;// True once the overlay actually became foreground after showing
     NOTIFYICONDATA nid;
     UINT wmTaskbarCreated;
     bool isRunning;
@@ -308,6 +334,8 @@ private:
     int maxItems;                               // Runtime-configurable history cap (registry: MaxItems)
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
+    static const int PINNED_WIDTH = 320;   // Width of the left pinned panel
+    static const int PANEL_GAP = 12;       // Gap between the pinned panel and the main list
     
     // Text transformation types
     enum TextTransform {

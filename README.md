@@ -28,7 +28,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Movable Window**: Drag the list window to position it anywhere on screen
 - ✅ **Smart Paste Detection**: Prevents pasted items from being re-added to history
 - ✅ **Snippets/Templates**: Predefined text templates with placeholders; supports Rich Text (RTF)
-- ✅ **Pinned/Favorite Items**: Right-click → **Pin** to keep an item at the top; pinned items survive **Clear List** and are always persisted (shown with a left accent bar)
+- ✅ **Pinned/Favorite Items**: Right-click → **Pin** to add an item to the left pinned panel; in the main list they keep their normal history position. Pinned items survive **Clear List** and are always persisted (shown with a left accent bar)
 - ✅ **Full Persistence**: History now persists images and files (not just text) across restarts
 - ✅ **Encrypted History**: `history.dat` is encrypted at rest with Windows DPAPI (per-user); legacy plaintext files are migrated automatically
 - ✅ **Configurable History Size**: Set the history cap in Settings (10–2000 items)
