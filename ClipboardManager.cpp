@@ -1147,6 +1147,20 @@ std::wstring ClipboardItem::GetFullSearchableText() const {
     return L"";
 }
 
+// Prefer native DIB over CF_BITMAP so two WM_CLIPBOARDUPDATE events for the same
+// image (common on Windows) land on the same bytes — BITMAP→DIB conversion often differs
+// from the delayed CF_DIB payload and used to create a second history entry.
+static const UINT kClipboardPriorityFormats[] = {
+    CF_HDROP, CF_UNICODETEXT, CF_TEXT, CF_DIBV5, CF_DIB, CF_BITMAP,
+    CF_ENHMETAFILE, CF_METAFILEPICT
+};
+
+static UINT CfPng() {
+    static UINT cf = 0;
+    if (cf == 0) cf = RegisterClipboardFormatW(L"PNG");
+    return cf;
+}
+
 // Get normalized text from an item for duplicate detection (content up to first null, trimmed).
 // So "text" copied twice with different trailing nulls still counts as duplicate.
 static std::wstring GetNormalizedTextForDuplicateCheck(const ClipboardItem* item) {
@@ -1177,6 +1191,77 @@ static std::wstring GetNormalizedTextForDuplicateCheck(const ClipboardItem* item
         }
     }
     return L"";
+}
+
+// True when both items carry the same image payload (DIB/DIBV5/PNG), even if the
+// surrounding format set differs (second DRAWCLIPBOARD often adds more formats).
+static bool AreDuplicateImages(const ClipboardItem* a, const ClipboardItem* b) {
+    if (!a || !b) return false;
+    if (!a->isImage && !b->isImage) return false;
+
+    auto sameBytes = [](const std::vector<BYTE>* x, const std::vector<BYTE>* y) -> bool {
+        if (!x || !y || x->empty() || y->empty() || x->size() != y->size()) return false;
+        if (x->size() > 16 * 1024 * 1024) return false;  // skip huge memcmp
+        return memcmp(x->data(), y->data(), x->size()) == 0;
+    };
+
+    const UINT imgFmts[] = { CF_DIBV5, CF_DIB, CfPng() };
+    for (UINT fmt : imgFmts) {
+        if (fmt == 0) continue;
+        if (sameBytes(a->GetFormatData(fmt), b->GetFormatData(fmt)))
+            return true;
+    }
+
+    // Same raster size fingerprint: covers BITMAP→DIB vs native CF_DIB mismatches
+    // when Windows fires clipboard update twice for one copy.
+    auto dibFp = [](const ClipboardItem* it, LONG& w, LONG& h, size_t& sz) -> bool {
+        const std::vector<BYTE>* d = it->GetFormatData(CF_DIBV5);
+        if (!d) d = it->GetFormatData(CF_DIB);
+        if (!d || d->size() < sizeof(BITMAPINFOHEADER)) return false;
+        const BITMAPINFOHEADER* bih = (const BITMAPINFOHEADER*)d->data();
+        if (bih->biSize < sizeof(BITMAPINFOHEADER)) return false;
+        w = bih->biWidth < 0 ? -bih->biWidth : bih->biWidth;
+        h = bih->biHeight < 0 ? -bih->biHeight : bih->biHeight;
+        sz = d->size();
+        return w > 0 && h > 0;
+    };
+    LONG aw = 0, ah = 0, bw = 0, bh = 0;
+    size_t asz = 0, bsz = 0;
+    if (dibFp(a, aw, ah, asz) && dibFp(b, bw, bh, bsz) && aw == bw && ah == bh) {
+        if (asz == bsz) return true;
+        // Same dimensions but different encoding (e.g. BITMAP→DIB vs native CF_DIB):
+        // treat as duplicate when the previous image was captured moments ago.
+        auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now() - b->timestamp).count();
+        if (ageMs >= 0 && ageMs < 750) return true;
+    }
+    return false;
+}
+
+static bool AreDuplicateClipboardItems(const ClipboardItem* a, const ClipboardItem* b) {
+    if (!a || !b) return false;
+
+    // Exact format-set match (legacy path).
+    if (!a->formats.empty() && a->formats.size() == b->formats.size()) {
+        bool allMatch = true;
+        const size_t MAX_COMPARE = 10 * 1024 * 1024;
+        for (const auto& fp : a->formats) {
+            const std::vector<BYTE>* other = b->GetFormatData(fp.first);
+            if (!other || other->size() != fp.second.size() || fp.second.size() > MAX_COMPARE ||
+                (fp.second.size() > 0 && memcmp(fp.second.data(), other->data(), fp.second.size()) != 0)) {
+                allMatch = false;
+                break;
+            }
+        }
+        if (allMatch) return true;
+    }
+
+    std::wstring aText = GetNormalizedTextForDuplicateCheck(a);
+    std::wstring bText = GetNormalizedTextForDuplicateCheck(b);
+    if (!aText.empty() && aText == bText) return true;
+
+    if (AreDuplicateImages(a, b)) return true;
+    return false;
 }
 
 // Plain text from a history item for direct injection (paste without system clipboard).
@@ -4875,10 +4960,6 @@ bool ClipboardManager::TryCaptureClipboardImmediately() {
     if (!hwndMain) return false;
     if (!OpenClipboard(hwndMain)) return false;
 
-    const UINT priorityFormats[] = {
-        CF_HDROP, CF_UNICODETEXT, CF_TEXT, CF_BITMAP, CF_DIBV5, CF_DIB,
-        CF_ENHMETAFILE, CF_METAFILEPICT
-    };
     auto isHandleBased = [](UINT fmt) {
         return fmt == CF_BITMAP || fmt == CF_PALETTE || fmt == CF_METAFILEPICT ||
                fmt == CF_ENHMETAFILE || fmt == 0x0082 || fmt == 0x008E || fmt == 0x0083;
@@ -4886,7 +4967,7 @@ bool ClipboardManager::TryCaptureClipboardImmediately() {
 
     try {
         UINT primaryFormat = 0;
-        for (UINT pf : priorityFormats) {
+        for (UINT pf : kClipboardPriorityFormats) {
             if (IsClipboardFormatAvailable(pf)) { primaryFormat = pf; break; }
         }
         if (primaryFormat == 0) primaryFormat = EnumClipboardFormats(0);
@@ -4965,11 +5046,9 @@ bool ClipboardManager::TryCaptureClipboardImmediately() {
 // Process a previously captured snapshot (bypasses apps that clear the clipboard after copy).
 void ClipboardManager::ProcessClipboardFromSnapshot() {
     if (immediateClipboardSnapshot.empty()) return;
-    const UINT priorityFormats[] = {
-        CF_HDROP, CF_UNICODETEXT, CF_TEXT, CF_DIB, CF_DIBV5, CF_ENHMETAFILE, CF_METAFILEPICT
-    };
     UINT primaryFormat = 0;
-    for (UINT pf : priorityFormats) {
+    for (UINT pf : kClipboardPriorityFormats) {
+        if (pf == CF_BITMAP) continue;  // snapshot stores BITMAP as CF_DIB already
         auto it = immediateClipboardSnapshot.find(pf);
         if (it != immediateClipboardSnapshot.end() && !it->second.empty()) {
             primaryFormat = pf;
@@ -5025,30 +5104,10 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
         } catch (...) {}
     }
     bool isDuplicate = false;
-    if (!clipboardHistory.empty() && item && item->formats.size() > 0 && clipboardHistory[0]->formats.size() > 0) {
+    if (!clipboardHistory.empty() && item) {
         try {
-            const auto& lastItem = clipboardHistory[0];
-            if (item->formats.size() == lastItem->formats.size()) {
-                bool allMatch = true;
-                const size_t MAX_COMPARE = 10 * 1024 * 1024;
-                for (const auto& fp : item->formats) {
-                    const std::vector<BYTE>* lastData = lastItem->GetFormatData(fp.first);
-                    if (!lastData || lastData->size() != fp.second.size() || fp.second.size() > MAX_COMPARE ||
-                        (fp.second.size() > 0 && memcmp(fp.second.data(), lastData->data(), fp.second.size()) != 0)) {
-                        allMatch = false;
-                        break;
-                    }
-                }
-                if (allMatch) isDuplicate = true;
-            }
+            isDuplicate = AreDuplicateClipboardItems(item.get(), clipboardHistory[0].get());
         } catch (...) {}
-    }
-    // Same text copied twice (e.g. Ctrl+C twice on "text") → treat as duplicate even if raw bytes differ
-    if (!isDuplicate && !clipboardHistory.empty() && item) {
-        std::wstring newNorm = GetNormalizedTextForDuplicateCheck(item.get());
-        std::wstring lastNorm = GetNormalizedTextForDuplicateCheck(clipboardHistory[0].get());
-        if (!newNorm.empty() && newNorm == lastNorm)
-            isDuplicate = true;
     }
     if (!isDuplicate && !isPastPaste && item) {
         try {
@@ -5550,19 +5609,9 @@ void ClipboardManager::ProcessClipboard() {
         // Successfully opened clipboard - process it quickly
         try {
             // Determine primary format (for display) - process in priority order
-            UINT priorityFormats[] = {
-                CF_HDROP,        // Files
-                CF_UNICODETEXT,  // Unicode text
-                CF_TEXT,         // ANSI text
-                CF_BITMAP,       // Bitmap
-                CF_DIBV5,        // DIB v5
-                CF_DIB,          // DIB
-                CF_ENHMETAFILE,  // Enhanced metafile
-                CF_METAFILEPICT  // Metafile picture
-            };
-            
+            // (native DIB before CF_BITMAP — see kClipboardPriorityFormats)
             UINT primaryFormat = 0;
-            for (UINT priorityFormat : priorityFormats) {
+            for (UINT priorityFormat : kClipboardPriorityFormats) {
                 if (IsClipboardFormatAvailable(priorityFormat)) {
                     primaryFormat = priorityFormat;
                     break;
@@ -5811,80 +5860,13 @@ void ClipboardManager::ProcessClipboard() {
                         }
                     }
                     
-                    // Check if this is a duplicate of the last item
+                    // Check if this is a duplicate of the last item (text, images, or full format set).
+                    // Image copies often fire WM_CLIPBOARDUPDATE twice with different format counts.
                     bool isDuplicate = false;
                     if (!clipboardHistory.empty() && item) {
                         try {
-                            // Make a copy of the reference to avoid invalidation issues
-                            const auto& lastItem = clipboardHistory[0];
-                            if (lastItem && item->formats.size() > 0 && lastItem->formats.size() > 0) {
-                                // Compare formats - must have same number of formats
-                                if (item->formats.size() == lastItem->formats.size()) {
-                                    // Check if all formats match
-                                    bool allFormatsMatch = true;
-                                    const size_t MAX_COMPARE_SIZE = 10 * 1024 * 1024; // Limit comparison to 10MB per format
-                                    
-                                    for (const auto& formatPair : item->formats) {
-                                        UINT fmt = formatPair.first;
-                                        const std::vector<BYTE>& newData = formatPair.second;
-                                        
-                                        // Skip detailed comparison for very large formats (like RTF) - compare only text formats
-                                        // This prevents crashes when Word includes large RTF data
-                                        // Only do detailed comparison for text formats and the primary format
-                                        bool isTextFormat = (fmt == CF_UNICODETEXT || fmt == CF_TEXT || fmt == CF_OEMTEXT);
-                                        bool isPrimaryFormat = (fmt == item->format || fmt == lastItem->format);
-                                        
-                                        if (!isTextFormat && !isPrimaryFormat) {
-                                            // For non-text, non-primary formats, just check if format exists
-                                            const std::vector<BYTE>* lastData = lastItem->GetFormatData(fmt);
-                                            if (!lastData) {
-                                                allFormatsMatch = false;
-                                                break;
-                                            }
-                                            continue; // Skip detailed comparison for non-primary formats
-                                        }
-                                        
-                                        // Validate newData
-                                        if (newData.empty() || newData.size() > MAX_COMPARE_SIZE) {
-                                            allFormatsMatch = false;
-                                            break;
-                                        }
-                                        
-                                        const std::vector<BYTE>* lastData = lastItem->GetFormatData(fmt);
-                                        if (!lastData || lastData->empty() || lastData->size() != newData.size() || lastData->size() > MAX_COMPARE_SIZE) {
-                                            allFormatsMatch = false;
-                                            break;
-                                        }
-                                        
-                                        // Validate pointers and size before memcmp
-                                        size_t compareSize = std::min(newData.size(), lastData->size());
-                                        if (compareSize > 0 && compareSize <= MAX_COMPARE_SIZE && 
-                                            newData.data() && lastData->data()) {
-                                            // Compare data byte-by-byte
-                                            if (memcmp(newData.data(), lastData->data(), compareSize) != 0) {
-                                                allFormatsMatch = false;
-                                                break;
-                                            }
-                                        } else {
-                                            allFormatsMatch = false;
-                                            break;
-                                        }
-                                    }
-                                    
-                                    if (allFormatsMatch) {
-                                        isDuplicate = true;
-                                    }
-                                }
-                            }
-                            // Same text copied twice (e.g. Ctrl+C twice on "text") → treat as duplicate even if raw bytes differ
-                            if (!isDuplicate && item) {
-                                std::wstring newNorm = GetNormalizedTextForDuplicateCheck(item.get());
-                                std::wstring lastNorm = GetNormalizedTextForDuplicateCheck(clipboardHistory[0].get());
-                                if (!newNorm.empty() && newNorm == lastNorm)
-                                    isDuplicate = true;
-                            }
+                            isDuplicate = AreDuplicateClipboardItems(item.get(), clipboardHistory[0].get());
                         } catch (...) {
-                            // Error during duplicate check, treat as not duplicate and continue
                             isDuplicate = false;
                         }
                     }
