@@ -28,12 +28,14 @@ struct ClipboardItem {
     std::chrono::system_clock::time_point timestamp;
     HBITMAP thumbnail;
     HBITMAP previewBitmap;  // Larger preview for hover
+    bool thumbnailAttempted;   // Lazy: tried building the 48x48 thumbnail already
+    bool previewAttempted;     // Lazy: tried building the hover preview already
     bool isImage;
     bool isVideo;
     bool pinned;  // Pinned/favorite items stay on top, survive Clear, and always persist
     
     ClipboardItem(UINT fmt, const std::vector<BYTE>& d) 
-        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), isImage(false), isVideo(false), pinned(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]") {
+        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), thumbnailAttempted(false), previewAttempted(false), isImage(false), isVideo(false), pinned(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]") {
         // CRITICAL: Store data first, before any processing
         if (d.empty() || d.size() > 200 * 1024 * 1024) {
             return;
@@ -105,19 +107,17 @@ struct ClipboardItem {
             preview = L"[" + formatName + L"]";
         }
         
-        // Skip thumbnail generation for text - it's not needed and can cause crashes
-        if (fmt != CF_TEXT && fmt != CF_UNICODETEXT && fmt != CF_OEMTEXT) {
-            try {
-                GenerateThumbnail();
-            } catch (...) {
-                // Ignore thumbnail errors
-            }
-        }
+        // Thumbnails are built lazily (EnsureThumbnail) the first time a row needs one,
+        // so captures never pay for image decoding up front.
+
+        RebuildSearchIndex();
     }
     
     // Add additional format
     void AddFormat(UINT fmt, const std::vector<BYTE>& d) {
         formats[fmt] = d;
+        if (fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT)
+            RebuildSearchIndex();  // body text changed
     }
     
     // Get data for a specific format
@@ -131,6 +131,12 @@ struct ClipboardItem {
     
     // Get full text content for search (handles line breaks; empty for non-text)
     std::wstring GetFullSearchableText() const;
+
+    // ---- Search index (built once per item, not per keystroke) ----
+    std::wstring searchPreviewLower;            // lowercase preview + formatName + fileType
+    std::wstring searchBodyLower;               // lowercase full searchable text (<= 500KB)
+    std::vector<unsigned char> trigramBloom;    // 1KB bloom filter of text trigrams (no false negatives)
+    void RebuildSearchIndex();                  // call after any text-format mutation
     
     ~ClipboardItem() {
         if (thumbnail) {
@@ -143,13 +149,15 @@ struct ClipboardItem {
         }
     }
     
-    HBITMAP GetPreviewBitmap();  // Generate larger preview on demand
-    
+    HBITMAP GetPreviewBitmap();  // Generate larger hover preview on demand (lazy)
+    void EnsureThumbnail();      // Generate the 48x48 thumbnail on first need (lazy)
+
 private:
     std::wstring GetFormatName(UINT fmt);
     std::wstring GetFileType(UINT fmt);
     std::wstring GetPreview(const std::vector<BYTE>& data, UINT fmt);
     void GenerateThumbnail();
+    void GeneratePreviewBitmap();  // large hover preview (<= 500x500), DIB items only
     HBITMAP CreateBitmapFromData();
 };
 
@@ -208,6 +216,14 @@ private:
     int GetItemAtPosition(int x, int y);
     void PasteItem(int index);
     void PasteMultipleItems();
+    // Smart paste: put a derived plain-text payload on the clipboard and Ctrl+V it.
+    void PasteTransformedText(const std::wstring& text);
+    // One-key smart paste modes (SMART_PASTE_*). Returns false (silently) when not applicable.
+    bool SmartPasteItem(int filteredIndex, int mode);
+    // Modal edit dialog. saveAsNew=false (E): edit then paste. saveAsNew=true (X): save edits as a new history item.
+    void ShowEditPasteDialog(bool saveAsNew = false);
+    static LRESULT CALLBACK EditPasteDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK EditPasteEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     void ToggleMultiSelect(int filteredIndex);
     void ClearMultiSelection();
     void DeleteItem(int filteredIndex);
@@ -224,8 +240,13 @@ private:
     void ClearClipboardHistory();
     void LoadClipboardHistory();
     void SaveClipboardHistory();
+    void MarkHistoryDirty();   // Debounced persistence: schedules a save ~1.5s after the last mutation
     void FilterItems();
     void FilterSnippets();
+    // While typing a paste number (#N), temporarily move that item to the top of the
+    // active list so it can be previewed / acted on. Restores natural order when cleared.
+    void ApplyNumberInputPromotion();
+    int OriginalItemNumber(int displayFilteredIndex) const;  // 1-based label from unpromoted order
     void SetStartupWithWindows(bool enable);
     bool IsStartupWithWindows();
     void LoadHotkeyConfig();
@@ -267,6 +288,8 @@ private:
     bool hasSavedOverlayPos;  // True when overlayPosX/Y come from a prior drag or registry
     int overlayPosX;          // Last main-list top-left X (virtual-screen coords)
     int overlayPosY;          // Last main-list top-left Y
+    bool historyDirty;        // History changed since the last save (debounced via TIMER_SAVE_HISTORY)
+    static const UINT_PTR TIMER_SAVE_HISTORY = 2;  // hwndMain timer id (1 = overlay focus check)
     NOTIFYICONDATA nid;
     UINT wmTaskbarCreated;
     bool isRunning;
@@ -278,7 +301,8 @@ private:
     int itemsPerPage;
     std::wstring numberInput;
     std::wstring searchText;
-    std::vector<int> filteredIndices;  // Indices of items matching search
+    std::vector<int> filteredIndicesBase;  // Search/history order (before number-input promotion)
+    std::vector<int> filteredIndices;      // Display order (may temporarily promote a typed #)
     std::vector<int> filteredSnippetIndices;  // Indices of snippets matching search (when snippetsMode)
     std::set<int> multiSelectedIndices;  // Indices of items selected for multi-paste (filtered indices)
     bool snippetsMode;  // When true, overlay shows snippets instead of clipboard
@@ -299,6 +323,8 @@ private:
     HotkeyConfig pasteClipboardHotkey;   // Clipboard swap + Ctrl+V paste
     DWORD lastHotkeyTick;      // Debounce: last time overlay hotkey was handled
     HWND hwndSettings;  // Settings dialog window
+    HWND hwndEditPaste; // Edit dialog window (paste mode or save-as-new mode)
+    bool editPasteSaveAsNew; // True when the edit dialog should commit a new history item (X)
     std::map<UINT, std::vector<BYTE>> immediateClipboardSnapshot;  // Captured in WM_CLIPBOARDUPDATE before app can clear
     bool hasImmediateClipboardSnapshot;
     struct Snippet {
@@ -350,6 +376,16 @@ private:
         TRANSFORM_REMOVE_LINE_BREAKS = 203,
         TRANSFORM_TRIM_WHITESPACE = 204,
         TRANSFORM_PLAIN_TEXT = 205  // Remove formatting, keep only plain text
+    };
+
+    // Smart paste modes (also used as context-menu command IDs)
+    enum SmartPasteMode {
+        SMART_PASTE_URL_CLEAN = 120,   // U: strip tracking params from URL, paste
+        SMART_PASTE_MARKDOWN = 121,    // M: paste as Markdown link
+        SMART_PASTE_FILEPATH = 122,    // P: paste as file path(s)
+        SMART_PASTE_HTML_PLAIN = 123,  // H: HTML -> plain text, paste
+        SMART_PASTE_EDIT = 124,        // E: edit/merge before paste (menu entry)
+        SMART_PASTE_EDIT_SAVE = 125    // X: edit and save as a new history item
     };
 };
 
