@@ -9,7 +9,7 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Universal Clipboard Support**: Captures text, rich text, images, files, and more
 - ✅ **LIFO History**: Most recently copied item appears first (up to 1000 items)
 - ✅ **Hotkey Access**: Press **Ctrl+NumPadDot** to show/hide the clipboard list
-- ✅ **Quick Paste**: Press **1-9** or type number + Enter to paste items from the list
+- ✅ **Number Paste**: Type an item number to bring it to the top of the list in real time, then **Enter** to paste (or interact with it first — preview, right-click, smart paste, etc.)
 - ✅ **Visual Feedback**: Click sound plays when items are copied
 - ✅ **System Tray Icon**: Always visible when running (uses ico2.ico)
 - ✅ **AMOLED Neon Themes**: Pure-black background with neon accents — switch between Neon Green (AS/400 5250 default), Red, Blue, Cyan, Purple, Yellow, Orange, and White from the Settings dialog
@@ -38,6 +38,13 @@ A minimalistic and superfast clipboard manager for Windows with OLED theme and u
 - ✅ **Fast Performance**: Optimized for minimal CPU usage and memory footprint
 - ✅ **Snippets Overlay**: **Ctrl+Right** = Snippets, **Ctrl+Left** = Clipboard (when overlay is open)
 - ✅ **Copy from focused control**: When an app never puts content on the clipboard, use tray → **Copy from focused control** to read text from the focused control via UI Automation and add it to history (requires build with UIAutomation; see Technical Details)
+- ✅ **Smart Paste Modes**: With the overlay open, one key pastes a derived version of the selected item — **U** = URL with tracking params stripped (`utm_*`, `fbclid`, `gclid`, ...), **M** = Markdown link (`[title](url)` for URLs, `[name](path)` for a single file), **P** = file path(s) as text, **H** = HTML converted to plain text. Also available via right-click → **Paste as**. Keys fail silently when the item doesn't fit the mode
+- ✅ **Edit / Merge Before Paste**: Press **E** (or right-click → **Edit & Paste...**) to open a small editor prefilled with the selected item — or with all multi-selected items joined line-by-line — tweak the text, then **Ctrl+Enter** or the **Paste** button pastes the edited result (history is not modified)
+- ✅ **Edit & Save as New**: Press **X** (or right-click → **Edit & Save as new...**) to edit the selection the same way, then **Save** / **Ctrl+Enter** adds the result as a new history item at the top (original unchanged) and puts it on the system clipboard
+- ✅ **Debounced Incremental Saves**: History is saved ~1.5 s after the last change (copy, delete, pin, transform, clear) instead of only at exit — mutations can no longer be lost to a crash. Writes are atomic (temp file + rename)
+- ✅ **Blob Sidecar Storage**: Clipboard formats ≥ 256 KB (large images, file lists) are stored once as content-addressed files under `%APPDATA%\clip2\blobs\`, so pinning or deleting a text item no longer rewrites megabytes of unchanged image data; unreferenced blobs are garbage-collected after each save
+- ✅ **Indexed Search**: Each item caches a lowercase copy of its text plus a trigram bloom filter; typing in the search box scores only candidate items instead of re-extracting and re-lowercasing every item's full text per keystroke — search stays instant with hundreds of large items
+- ✅ **Lazy Thumbnails & Previews**: Image thumbnails are decoded only when their row first becomes visible in the active panel, and the large hover preview only on first hover; the pinned-panel snapshot draws lightweight type badges, so painting never decodes images
 
 ## Building
 
@@ -82,10 +89,13 @@ The executable will be created as `clip2.exe`.
    - Images and videos show thumbnails
 
 3. **Paste an item**: 
-   - With the list visible, press **1-9** for quick paste, or type number + **Enter** for multi-digit selection
-   - Use **Arrow keys** to navigate and **Enter** to paste selected item
+   - Type an item number (e.g. `12`) — that item jumps to the top so you can preview or act on it; press **Enter** to paste
+   - Use **Arrow keys** to navigate and **Enter** to paste the selected item
    - **Double-click** an item to paste it
    - Hold **Ctrl** while pasting for plain text mode
+   - **Smart paste**: **U** clean URL, **M** Markdown link, **P** file path, **H** HTML → plain text (also right-click → **Paste as**)
+   - **Edit before paste**: **E** opens an editor with the selection (or the joined multi-selection); **Ctrl+Enter** pastes the edited text
+   - **Edit & save as new**: **X** opens the same editor; **Ctrl+Enter** / **Save** keeps the edits as a new clipboard item (original stays)
 
 4. **Search**: Press **Ctrl+F** to focus the search box and filter items
    - Search looks through the **full content** of each item, including text after line breaks
@@ -136,9 +146,9 @@ The executable will be created as `clip2.exe`.
 - **Sound**: Embedded click.mp3 plays on copy (fallback to file in exe directory); MCI warm-up ensures first copy plays sound
 - **Navigation**: Arrow keys, Page Up/Down, Home/End for list navigation
 - **Auto-hide**: List automatically hides when focus moves to another window
-- **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat`. Encrypted at rest with Windows DPAPI (container magic `CLP3`); decrypted payload stores all formats per item (text, images, files) plus the pinned flag (`CLP2` version 2). Pinned items are always saved (exempt from the count cap); other items are saved up to the configured history size. Legacy `CLP2` v1 (text-only, plaintext) files load and are upgraded to the encrypted format on next save
+- **Clipboard persistence**: Saved to `%APPDATA%\clip2\history.dat`. Encrypted at rest with Windows DPAPI (container magic `CLP3`); decrypted payload stores all formats per item (text, images, files) plus the pinned flag (`CLP2` version 2). Pinned items are always saved (exempt from the count cap); other items are saved up to the configured history size. Legacy `CLP2` v1 (text-only, plaintext) files load and are upgraded to the encrypted format on next save. Saves are debounced (~1.5 s after the last history change), flushed at exit, and written atomically (`history.dat.tmp` + rename). Formats ≥ 256 KB live as content-addressed sidecar files in `%APPDATA%\clip2\blobs\<sha1>` referenced from the encrypted index; unreferenced blobs are deleted after each successful save
 - **Snippets storage**: Registry `HKEY_CURRENT_USER\Software\clip2\Snippets`
-- **Search**: Full-text search up to 500KB per item; finds matches across line breaks
+- **Search**: Full-text search up to 500KB per item; finds matches across line breaks. Backed by a per-item index (cached lowercase text + trigram bloom filter) so only candidate items are fuzzy-scored per keystroke
 - **Copy from focused control**: Uses Windows UI Automation to read selected (or full) text from the focused control when the app does not put anything on the clipboard. The tray menu item appears only if the project is built with the UIAutomation library (e.g. when the Windows SDK is available and CMake finds `UIAutomation`). If you build with MinGW and the menu item is missing, build with Visual Studio and the Windows SDK to enable it.
 
 ## Requirements

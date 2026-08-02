@@ -290,13 +290,40 @@ static void SaveMaxItemsToRegistry(int value) {
     RegCloseKey(hKey);
 }
 
+// Overlay position is stored as signed ints bit-cast into REG_DWORD (multi-monitor may be negative).
+static bool LoadOverlayPosFromRegistry(int& outX, int& outY) {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+    DWORD x = 0, y = 0, sz = sizeof(DWORD), type = REG_DWORD;
+    LONG rcx = RegQueryValueExW(hKey, L"OverlayPosX", nullptr, &type, (LPBYTE)&x, &sz);
+    sz = sizeof(DWORD); type = REG_DWORD;
+    LONG rcy = RegQueryValueExW(hKey, L"OverlayPosY", nullptr, &type, (LPBYTE)&y, &sz);
+    RegCloseKey(hKey);
+    if (rcx != ERROR_SUCCESS || rcy != ERROR_SUCCESS) return false;
+    outX = (int)x;
+    outY = (int)y;
+    return true;
+}
+
+static void SaveOverlayPosToRegistry(int x, int y) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD vx = (DWORD)x, vy = (DWORD)y;
+    RegSetValueExW(hKey, L"OverlayPosX", 0, REG_DWORD, (BYTE*)&vx, sizeof(DWORD));
+    RegSetValueExW(hKey, L"OverlayPosY", 0, REG_DWORD, (BYTE*)&vy, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
 // Case-insensitive fuzzy match with ranking. Returns a positive score on match, 0 on no match.
 // Exact substring matches score highest; subsequence matches score by contiguity and word-start bonuses.
-static int FuzzyScore(const std::wstring& needleLower, const std::wstring& haystack) {
+// FuzzyScoreLower assumes the haystack is ALREADY lowercase (cached per item) so per-keystroke
+// scoring never re-lowercases large bodies.
+static int FuzzyScoreLower(const std::wstring& needleLower, const std::wstring& hay) {
     if (needleLower.empty()) return 1;
-    if (haystack.empty()) return 0;
-    std::wstring hay = haystack;
-    std::transform(hay.begin(), hay.end(), hay.begin(), ::towlower);
+    if (hay.empty()) return 0;
 
     // Exact substring is the strongest signal.
     size_t pos = hay.find(needleLower);
@@ -339,6 +366,51 @@ static int FuzzyScore(const std::wstring& needleLower, const std::wstring& hayst
         if (!found) return 0;
     }
     return score;
+}
+
+static int FuzzyScore(const std::wstring& needleLower, const std::wstring& haystack) {
+    if (needleLower.empty()) return 1;
+    if (haystack.empty()) return 0;
+    std::wstring hay = haystack;
+    std::transform(hay.begin(), hay.end(), hay.begin(), ::towlower);
+    return FuzzyScoreLower(needleLower, hay);
+}
+
+// ---- Trigram bloom index (search candidate gate) ---------------------------
+// Each item carries a 1KB bloom filter of every character trigram in its text.
+// A needle (>= 3 chars) can only exact-substring-match an item's body when all of
+// its trigrams are present, so non-candidates skip the expensive body scoring.
+// Bloom filters can give false positives (extra scoring work) but never false
+// negatives (missed matches).
+static const unsigned int kTrigramBloomBytes = 1024;
+
+static inline unsigned int TrigramHashBit(wchar_t a, wchar_t b, wchar_t c) {
+    unsigned int h = 2166136261u;
+    h = (h ^ (unsigned int)a) * 16777619u;
+    h = (h ^ (unsigned int)b) * 16777619u;
+    h = (h ^ (unsigned int)c) * 16777619u;
+    return h & (kTrigramBloomBytes * 8 - 1);
+}
+
+void ClipboardItem::RebuildSearchIndex() {
+    searchPreviewLower = preview + L" " + formatName + L" " + fileType;
+    std::transform(searchPreviewLower.begin(), searchPreviewLower.end(), searchPreviewLower.begin(), ::towlower);
+
+    searchBodyLower = GetFullSearchableText();
+    std::transform(searchBodyLower.begin(), searchBodyLower.end(), searchBodyLower.begin(), ::towlower);
+    // Trim trailing NULs that come from stored CF_UNICODETEXT terminators.
+    while (!searchBodyLower.empty() && searchBodyLower.back() == L'\0')
+        searchBodyLower.pop_back();
+
+    trigramBloom.assign(kTrigramBloomBytes, 0);
+    auto addTrigrams = [this](const std::wstring& s) {
+        for (size_t i = 0; i + 2 < s.size(); i++) {
+            unsigned int bit = TrigramHashBit(s[i], s[i + 1], s[i + 2]);
+            trigramBloom[bit >> 3] |= (unsigned char)(1u << (bit & 7));
+        }
+    };
+    addTrigrams(searchBodyLower);
+    addTrigrams(searchPreviewLower);
 }
 
 // Shared font handle used by the overlay paint loop and the search box. Re-created on
@@ -912,46 +984,8 @@ void ClipboardItem::GenerateThumbnail() {
                         SelectObject(hdcThumb, oldThumb);
                         thumbnail = hThumb;
                         hThumb = nullptr; // Don't delete, we're using it
-                        
-                        // Generate larger preview bitmap for hover preview (max 500x500 for quality)
-                        const int previewMaxSize = 500;
-                        HDC hdcPreview = CreateCompatibleDC(hdcScreen);
-                        if (hdcPreview) {
-                            float previewScale = std::min((float)previewMaxSize / srcW, (float)previewMaxSize / srcH);
-                            int previewW = (int)(srcW * previewScale);
-                            int previewH = (int)(srcH * previewScale);
-                            
-                            // Limit to reasonable size to prevent memory issues
-                            if (previewW > 0 && previewH > 0 && previewW <= 1000 && previewH <= 1000) {
-                                HBITMAP hPreview = CreateCompatibleBitmap(hdcScreen, previewW, previewH);
-                                if (hPreview) {
-                                    HGDIOBJ oldPreview = SelectObject(hdcPreview, hPreview);
-                                    
-                                    // Fill background - Black OLED theme
-                                    RECT bgRect = {0, 0, previewW, previewH};
-                                    FillRect(hdcPreview, &bgRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
-                                    
-                                    // Stretch original bitmap to preview size with high quality
-                                    hdcSrc = CreateCompatibleDC(hdcScreen);
-                                    if (hdcSrc) {
-                                        oldSrc = SelectObject(hdcSrc, hBitmap);
-                                        SetStretchBltMode(hdcPreview, HALFTONE);
-                                        StretchBlt(hdcPreview, 0, 0, previewW, previewH, hdcSrc, 0, 0, srcW, srcH, SRCCOPY);
-                                        SelectObject(hdcSrc, oldSrc);
-                                        DeleteDC(hdcSrc);
-                                    }
-                                    
-                                    SelectObject(hdcPreview, oldPreview);
-                                    
-                                    // Delete old preview bitmap if it exists
-                                    if (previewBitmap) {
-                                        DeleteObject(previewBitmap);
-                                    }
-                                    previewBitmap = hPreview;
-                                }
-                            }
-                            DeleteDC(hdcPreview);
-                        }
+                        // The larger hover preview is built lazily in GeneratePreviewBitmap()
+                        // on first hover, not here.
                     } else {
                         SelectObject(hdcThumb, oldThumb);
                         DeleteObject(hThumb);
@@ -1009,11 +1043,76 @@ void ClipboardItem::GenerateThumbnail() {
     }
 }
 
+// Build the 48x48 row thumbnail the first time a visible row needs it. The result
+// (including "couldn't build one") is cached so we never decode the same item twice.
+void ClipboardItem::EnsureThumbnail() {
+    if (thumbnail || thumbnailAttempted) return;
+    thumbnailAttempted = true;
+    try {
+        GenerateThumbnail();
+    } catch (...) {}
+}
+
+// Build the large (<= 500x500) hover preview on first hover, for DIB/bitmap items.
+void ClipboardItem::GeneratePreviewBitmap() {
+    try {
+        if (format != CF_BITMAP && format != CF_DIB && format != CF_DIBV5) return;
+
+        HDC hdcScreen = GetDC(nullptr);
+        if (!hdcScreen) return;
+        HBITMAP hBitmap = CreateBitmapFromData();
+        if (!hBitmap) {
+            ReleaseDC(nullptr, hdcScreen);
+            return;
+        }
+
+        BITMAP bm = {0};
+        if (GetObject(hBitmap, sizeof(BITMAP), &bm) && bm.bmWidth > 0 && bm.bmHeight > 0 &&
+            bm.bmWidth < 10000 && bm.bmHeight < 10000) {
+            const int previewMaxSize = 500;
+            int srcW = bm.bmWidth, srcH = bm.bmHeight;
+            float previewScale = std::min((float)previewMaxSize / srcW, (float)previewMaxSize / srcH);
+            int previewW = (int)(srcW * previewScale);
+            int previewH = (int)(srcH * previewScale);
+            if (previewW > 0 && previewH > 0 && previewW <= 1000 && previewH <= 1000) {
+                HDC hdcPreview = CreateCompatibleDC(hdcScreen);
+                if (hdcPreview) {
+                    HBITMAP hPreview = CreateCompatibleBitmap(hdcScreen, previewW, previewH);
+                    if (hPreview) {
+                        HGDIOBJ oldPreview = SelectObject(hdcPreview, hPreview);
+                        RECT bgRect = {0, 0, previewW, previewH};
+                        FillRect(hdcPreview, &bgRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+                        HDC hdcSrc = CreateCompatibleDC(hdcScreen);
+                        if (hdcSrc) {
+                            HGDIOBJ oldSrc = SelectObject(hdcSrc, hBitmap);
+                            SetStretchBltMode(hdcPreview, HALFTONE);
+                            StretchBlt(hdcPreview, 0, 0, previewW, previewH, hdcSrc, 0, 0, srcW, srcH, SRCCOPY);
+                            SelectObject(hdcSrc, oldSrc);
+                            DeleteDC(hdcSrc);
+                        }
+                        SelectObject(hdcPreview, oldPreview);
+                        if (previewBitmap) DeleteObject(previewBitmap);
+                        previewBitmap = hPreview;
+                    }
+                    DeleteDC(hdcPreview);
+                }
+            }
+        }
+        DeleteObject(hBitmap);
+        ReleaseDC(nullptr, hdcScreen);
+    } catch (...) {}
+}
+
 HBITMAP ClipboardItem::GetPreviewBitmap() {
-    // Return larger preview bitmap if available, otherwise fall back to thumbnail
+    // Lazily build the larger preview on first request (first hover).
+    if (!previewBitmap && !previewAttempted) {
+        previewAttempted = true;
+        GeneratePreviewBitmap();
+    }
     if (previewBitmap) {
         return previewBitmap;
     }
+    EnsureThumbnail();  // fall back to the (also lazy) row thumbnail
     return thumbnail;
 }
 
@@ -1107,6 +1206,271 @@ static std::wstring GetPlainTextForDirectPaste(const ClipboardItem* item) {
     if (!item->preview.empty() && item->preview[0] != L'[')
         return item->preview;
     return L"";
+}
+
+// ============================ Smart paste helpers ============================
+
+static std::wstring TrimWhitespaceCopy(const std::wstring& s) {
+    size_t a = s.find_first_not_of(L" \t\r\n");
+    if (a == std::wstring::npos) return L"";
+    size_t b = s.find_last_not_of(L" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static bool LooksLikeHttpUrl(const std::wstring& s) {
+    return s.rfind(L"http://", 0) == 0 || s.rfind(L"https://", 0) == 0;
+}
+
+// Remove common tracking parameters (utm_*, fbclid, gclid, ...) from a URL's query string.
+static std::wstring StripUrlTrackingParams(const std::wstring& url) {
+    size_t q = url.find(L'?');
+    if (q == std::wstring::npos) return url;
+
+    // Separate the fragment (#...) so it survives untouched.
+    std::wstring fragment;
+    std::wstring query = url.substr(q + 1);
+    size_t hash = query.find(L'#');
+    if (hash != std::wstring::npos) {
+        fragment = query.substr(hash);
+        query = query.substr(0, hash);
+    }
+
+    static const wchar_t* kExact[] = {
+        L"fbclid", L"gclid", L"gclsrc", L"dclid", L"msclkid", L"mc_eid", L"mc_cid",
+        L"igshid", L"igsh", L"si", L"ref_src", L"ref_url", L"_ga", L"_gl", L"yclid",
+        L"wbraid", L"gbraid", L"vero_id", L"oly_anon_id", L"oly_enc_id", L"s_kwcid",
+        L"spm", L"scid", L"mkt_tok", L"twclid", L"ttclid"
+    };
+
+    std::wstring rebuilt;
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        size_t amp = query.find(L'&', pos);
+        std::wstring param = (amp == std::wstring::npos) ? query.substr(pos)
+                                                         : query.substr(pos, amp - pos);
+        if (!param.empty()) {
+            std::wstring name = param.substr(0, param.find(L'='));
+            std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+            bool tracking = (name.rfind(L"utm_", 0) == 0);
+            if (!tracking) {
+                for (const wchar_t* k : kExact) {
+                    if (name == k) { tracking = true; break; }
+                }
+            }
+            if (!tracking) {
+                if (!rebuilt.empty()) rebuilt += L'&';
+                rebuilt += param;
+            }
+        }
+        if (amp == std::wstring::npos) break;
+        pos = amp + 1;
+    }
+
+    std::wstring out = url.substr(0, q);
+    if (!rebuilt.empty()) out += L'?' + rebuilt;
+    out += fragment;
+    return out;
+}
+
+// Decode the small set of HTML entities that matter for plain-text extraction.
+static void AppendDecodedHtmlEntity(std::wstring& out, const std::wstring& entity) {
+    if (entity == L"amp") out += L'&';
+    else if (entity == L"lt") out += L'<';
+    else if (entity == L"gt") out += L'>';
+    else if (entity == L"quot") out += L'"';
+    else if (entity == L"apos" || entity == L"#39") out += L'\'';
+    else if (entity == L"nbsp") out += L' ';
+    else if (entity.size() > 1 && entity[0] == L'#') {
+        long code = 0;
+        if (entity[1] == L'x' || entity[1] == L'X')
+            code = wcstol(entity.c_str() + 2, nullptr, 16);
+        else
+            code = wcstol(entity.c_str() + 1, nullptr, 10);
+        if (code > 0 && code < 0x110000) {
+            if (code <= 0xFFFF) out += (wchar_t)code;
+            else {
+                code -= 0x10000;
+                out += (wchar_t)(0xD800 + (code >> 10));
+                out += (wchar_t)(0xDC00 + (code & 0x3FF));
+            }
+        }
+    } else {
+        out += L'&'; out += entity; out += L';';  // unknown entity: keep literal
+    }
+}
+
+// Convert an HTML fragment to readable plain text: strip tags (skipping script/style
+// contents), turn block-level closers and <br> into newlines, decode entities, and
+// collapse whitespace runs.
+static std::wstring HtmlToPlainText(const std::wstring& html) {
+    std::wstring out;
+    out.reserve(html.size() / 2);
+    size_t i = 0;
+    const size_t n = html.size();
+    while (i < n) {
+        wchar_t c = html[i];
+        if (c == L'<') {
+            size_t end = html.find(L'>', i + 1);
+            if (end == std::wstring::npos) break;
+            std::wstring tag = html.substr(i + 1, end - i - 1);
+            std::wstring tagLower = tag;
+            std::transform(tagLower.begin(), tagLower.end(), tagLower.begin(), ::towlower);
+            // Skip script/style blocks entirely.
+            if (tagLower.rfind(L"script", 0) == 0 || tagLower.rfind(L"style", 0) == 0) {
+                std::wstring closer = tagLower.rfind(L"script", 0) == 0 ? L"</script" : L"</style";
+                std::wstring htmlLower;  // search case-insensitively from here
+                size_t close = std::wstring::npos;
+                for (size_t j = end + 1; j + closer.size() <= n; j++) {
+                    bool match = true;
+                    for (size_t k = 0; k < closer.size(); k++) {
+                        if (towlower(html[j + k]) != closer[k]) { match = false; break; }
+                    }
+                    if (match) { close = j; break; }
+                }
+                (void)htmlLower;
+                if (close == std::wstring::npos) break;
+                size_t closeEnd = html.find(L'>', close);
+                i = (closeEnd == std::wstring::npos) ? n : closeEnd + 1;
+                continue;
+            }
+            // Block-level breaks become newlines.
+            if (tagLower.rfind(L"br", 0) == 0 || tagLower.rfind(L"/p", 0) == 0 ||
+                tagLower.rfind(L"/div", 0) == 0 || tagLower.rfind(L"/li", 0) == 0 ||
+                tagLower.rfind(L"/tr", 0) == 0 || tagLower.rfind(L"/h", 0) == 0 ||
+                tagLower.rfind(L"/table", 0) == 0 || tagLower.rfind(L"/ul", 0) == 0 ||
+                tagLower.rfind(L"/ol", 0) == 0 || tagLower.rfind(L"/blockquote", 0) == 0) {
+                if (!out.empty() && out.back() != L'\n') out += L'\n';
+            }
+            i = end + 1;
+            continue;
+        }
+        if (c == L'&') {
+            size_t semi = html.find(L';', i + 1);
+            if (semi != std::wstring::npos && semi - i <= 10) {
+                AppendDecodedHtmlEntity(out, html.substr(i + 1, semi - i - 1));
+                i = semi + 1;
+                continue;
+            }
+        }
+        if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+        // Collapse runs of spaces (but keep intentional newlines from block tags).
+        if (c == L' ' && !out.empty() && (out.back() == L' ' || out.back() == L'\n')) {
+            i++;
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    // Collapse 3+ newlines to 2 and trim.
+    std::wstring collapsed;
+    collapsed.reserve(out.size());
+    int nl = 0;
+    for (wchar_t c : out) {
+        if (c == L'\n') {
+            if (++nl <= 2) collapsed += L"\r\n";
+        } else {
+            nl = 0;
+            collapsed += c;
+        }
+    }
+    return TrimWhitespaceCopy(collapsed);
+}
+
+// Extract the fragment from a CF "HTML Format" payload (UTF-8 with StartFragment/EndFragment
+// header offsets) and return it as a wide string. Falls back to the whole payload.
+static std::wstring ExtractHtmlFragment(const std::vector<BYTE>& bytes) {
+    if (bytes.empty()) return L"";
+    std::string s((const char*)bytes.data(), bytes.size());
+    // Trim trailing NULs.
+    while (!s.empty() && s.back() == '\0') s.pop_back();
+
+    auto readOffset = [&](const char* key) -> long {
+        size_t p = s.find(key);
+        if (p == std::string::npos) return -1;
+        return atol(s.c_str() + p + strlen(key));
+    };
+    long start = readOffset("StartFragment:");
+    long end = readOffset("EndFragment:");
+    std::string frag;
+    if (start >= 0 && end > start && (size_t)end <= s.size()) {
+        frag = s.substr(start, end - start);
+    } else {
+        size_t m = s.find("<!--StartFragment-->");
+        size_t e = s.find("<!--EndFragment-->");
+        if (m != std::string::npos && e != std::string::npos && e > m)
+            frag = s.substr(m + 20, e - m - 20);
+        else
+            frag = s;
+    }
+    if (frag.empty()) return L"";
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, frag.data(), (int)frag.size(), nullptr, 0);
+    if (wlen <= 0) return L"";
+    std::wstring w(wlen, 0);
+    MultiByteToWideChar(CP_UTF8, 0, frag.data(), (int)frag.size(), &w[0], wlen);
+    return w;
+}
+
+// Parse a CF_HDROP payload (DROPFILES) into individual file paths.
+static std::vector<std::wstring> ExtractHdropPaths(const std::vector<BYTE>& bytes) {
+    std::vector<std::wstring> paths;
+    if (bytes.size() < sizeof(DROPFILES)) return paths;
+    const DROPFILES* df = (const DROPFILES*)bytes.data();
+    if (df->pFiles >= bytes.size()) return paths;
+    if (df->fWide) {
+        const wchar_t* p = (const wchar_t*)(bytes.data() + df->pFiles);
+        const wchar_t* limit = (const wchar_t*)(bytes.data() + bytes.size());
+        while (p < limit && *p) {
+            std::wstring path;
+            while (p < limit && *p) path += *p++;
+            if (p < limit) p++;  // skip NUL
+            if (!path.empty()) paths.push_back(path);
+        }
+    } else {
+        const char* p = (const char*)(bytes.data() + df->pFiles);
+        const char* limit = (const char*)(bytes.data() + bytes.size());
+        while (p < limit && *p) {
+            std::string path;
+            while (p < limit && *p) path += *p++;
+            if (p < limit) p++;
+            if (!path.empty()) {
+                int wlen = MultiByteToWideChar(CP_ACP, 0, path.c_str(), (int)path.size(), nullptr, 0);
+                if (wlen > 0) {
+                    std::wstring w(wlen, 0);
+                    MultiByteToWideChar(CP_ACP, 0, path.c_str(), (int)path.size(), &w[0], wlen);
+                    paths.push_back(w);
+                }
+            }
+        }
+    }
+    return paths;
+}
+
+// Normalize text that represents a file path: strip quotes, decode file:// URLs,
+// convert forward slashes. Returns empty when it doesn't look like a path.
+static std::wstring NormalizeFilePathText(const std::wstring& raw) {
+    std::wstring t = TrimWhitespaceCopy(raw);
+    if (t.size() >= 2 && t.front() == L'"' && t.back() == L'"')
+        t = t.substr(1, t.size() - 2);
+    if (t.rfind(L"file:///", 0) == 0) {
+        t = t.substr(8);
+        // Percent-decode the common cases (%20 etc.).
+        std::wstring dec;
+        for (size_t i = 0; i < t.size(); i++) {
+            if (t[i] == L'%' && i + 2 < t.size()) {
+                wchar_t hex[3] = { t[i + 1], t[i + 2], 0 };
+                long v = wcstol(hex, nullptr, 16);
+                if (v > 0) { dec += (wchar_t)v; i += 2; continue; }
+            }
+            dec += t[i];
+        }
+        t = dec;
+    }
+    std::replace(t.begin(), t.end(), L'/', L'\\');
+    // Accept drive-letter paths and UNC paths.
+    bool drivePath = t.size() >= 3 && iswalpha(t[0]) && t[1] == L':' && t[2] == L'\\';
+    bool uncPath = t.rfind(L"\\\\", 0) == 0 && t.size() > 2;
+    if (!drivePath && !uncPath) return L"";
+    return t;
 }
 
 static void SendKeyUpIfDown(WORD vk) {
@@ -1551,7 +1915,7 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager()
-    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
@@ -1595,6 +1959,7 @@ bool ClipboardManager::Initialize() {
     LoadThemeColorsFromRegistry();
     ApplyThemeId(LoadThemeIdFromRegistry());
     maxItems = LoadMaxItemsFromRegistry(DEFAULT_MAX_ITEMS, MIN_MAX_ITEMS, MAX_MAX_ITEMS);
+    hasSavedOverlayPos = LoadOverlayPosFromRegistry(overlayPosX, overlayPosY);
 
     // Register window class for main window
     WNDCLASS wc = {};
@@ -1815,7 +2180,11 @@ void ClipboardManager::Run() {
 
 void ClipboardManager::Stop() {
     isRunning = false;
-    SaveClipboardHistory();
+    if (hwndMain) KillTimer(hwndMain, TIMER_SAVE_HISTORY);
+    if (historyDirty) {
+        historyDirty = false;
+        SaveClipboardHistory();  // flush pending debounced save
+    }
     HideListWindow();
     RemoveTrayIcon();
     UninstallKeyboardHook();
@@ -1827,6 +2196,10 @@ void ClipboardManager::Stop() {
     }
     
     // Clean shutdown
+    if (hwndEditPaste) {
+        DestroyWindow(hwndEditPaste);
+        hwndEditPaste = nullptr;
+    }
     if (hwndPreview) {
         DestroyWindow(hwndPreview);
         hwndPreview = nullptr;
@@ -2080,6 +2453,13 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 // Window is not visible or not supposed to be visible - stop timer
                 KillTimer(hwnd, 1);
             }
+        } else if (wParam == TIMER_SAVE_HISTORY) {
+            // Debounced history persistence: fire once after the last mutation.
+            KillTimer(hwnd, TIMER_SAVE_HISTORY);
+            if (mgr->historyDirty) {
+                mgr->historyDirty = false;
+                mgr->SaveClipboardHistory();
+            }
         }
         return 0;
         
@@ -2236,6 +2616,28 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
         return hit;
     }
+
+    case WM_MOVING: {
+        // Keep the sibling panel locked beside the dragged one so the pair moves as a unit.
+        LPRECT pr = (LPRECT)lParam;
+        if (!pr) break;
+        if (hwnd == mgr->hwndList && mgr->hwndPinned && IsWindowVisible(mgr->hwndPinned)) {
+            SetWindowPos(mgr->hwndPinned, nullptr,
+                         pr->left - ClipboardManager::PINNED_WIDTH - ClipboardManager::PANEL_GAP, pr->top,
+                         0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (hwnd == mgr->hwndPinned && mgr->hwndList && IsWindowVisible(mgr->hwndList)) {
+            SetWindowPos(mgr->hwndList, nullptr,
+                         pr->left + ClipboardManager::PINNED_WIDTH + ClipboardManager::PANEL_GAP, pr->top,
+                         0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        break;
+    }
+
+    case WM_EXITSIZEMOVE:
+        // User finished dragging — persist the main list's top-left for the next open.
+        mgr->SaveOverlayPosition();
+        break;
+
     case WM_ERASEBKGND:
         if (hwnd == mgr->hwndList) return 1;  // fully painted in WM_PAINT (double-buffered): skip erase flicker
         break;
@@ -2475,8 +2877,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
 
                 int contentLeft = rowRect.left + 10;
 
-                // Thumbnail or a type badge.
-                if (item->thumbnail) {
+                // Thumbnail or a type badge. Thumbnails are built lazily for visible rows
+                // of the ACTIVE pane only; the inactive snapshot always draws the cheap
+                // badge (no image decode, no per-row temp DC / BitBlt).
+                if (paneIsActive) item->EnsureThumbnail();
+                if (paneIsActive && item->thumbnail) {
                     int thumbSize = 36;
                     int thumbY = yPos + (itemHeight - thumbSize) / 2;
                     HDC hdcMem = CreateCompatibleDC(hdc);
@@ -2511,10 +2916,14 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     contentLeft += bW + 10;
                 }
 
-                // Index number.
+                // Index number — keep the original 1-based label even when a typed #
+                // has temporarily promoted an item to the top of the active list.
+                int labelNum = (paneIsActive && !mgr->numberInput.empty())
+                                   ? mgr->OriginalItemNumber(i)
+                                   : (i + 1);
                 RECT numRect = { contentLeft, rowRect.top, contentLeft + 28, rowRect.bottom };
                 SetTextColor(hdc, meta);
-                DrawTextW(hdc, (std::to_wstring(i + 1)).c_str(), -1, &numRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(hdc, (std::to_wstring(labelNum)).c_str(), -1, &numRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 contentLeft += 34;
 
                 // Metadata (format + relative time), right-aligned.
@@ -2582,7 +2991,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             else if (pSnippets)
                 hint = L"Enter paste  \x2022  Ctrl+Left clipboard  \x2022  Ctrl+F search  \x2022  Esc close";
             else
-                hint = L"Tab \x2192 pinned  \x2022  1-9 quick  \x2022  Enter paste  \x2022  Ctrl+Right snippets  \x2022  Esc close";
+                hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H smart  \x2022  E paste-edit  \x2022  X save-edit  \x2022  Esc";
             DrawTextW(hdc, hint, -1, &hintRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(hdc, GetOverlayFont());
         }
@@ -2634,21 +3043,26 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     mgr->HideListWindow();
                 }
             } else {
-                // Clipboard mode
+                // Clipboard mode. Typed # promotes that item to the top and selects it —
+                // Enter pastes the selection (the promoted item), not a raw display index.
                 if (!mgr->numberInput.empty()) {
                     try {
                         int itemNumber = std::stoi(mgr->numberInput);
-                        int index = itemNumber - 1;
-                        if (index >= 0 && index < (int)mgr->filteredIndices.size()) {
-                            mgr->PasteItem(index);
+                        int baseIndex = itemNumber - 1;
+                        if (baseIndex >= 0 && baseIndex < (int)mgr->filteredIndicesBase.size() &&
+                            mgr->selectedIndex >= 0 &&
+                            mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                            mgr->PasteItem(mgr->selectedIndex);
                             mgr->numberInput.clear();
                             mgr->HideListWindow();
                         } else {
                             mgr->numberInput.clear();
+                            mgr->ApplyNumberInputPromotion();
                             mgr->UpdateListWindow();
                         }
                     } catch (...) {
                         mgr->numberInput.clear();
+                        mgr->ApplyNumberInputPromotion();
                         mgr->UpdateListWindow();
                     }
                 } else {
@@ -2667,19 +3081,13 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         if (wParam == VK_BACK && !mgr->snippetsMode) {
             if (!mgr->numberInput.empty()) {
                 mgr->numberInput.pop_back();
+                mgr->ApplyNumberInputPromotion();
                 mgr->UpdateListWindow();
             }
             return 0;
         }
-        // Quick paste for single digits 1-9 (clipboard mode only; snippets mode uses search + Enter)
-        if (!mgr->snippetsMode && wParam >= 0x31 && wParam <= 0x39 && mgr->numberInput.empty()) {
-            int index = (wParam - 0x31);
-            if (index < (int)mgr->filteredIndices.size()) {
-                mgr->PasteItem(index);
-                mgr->HideListWindow();
-            }
-            return 0;
-        }
+        // Digits 1-9 accumulate into numberInput (see WM_CHAR) so the matching item can
+        // rise to the top for preview/interaction; paste with Enter.
         // In snippets mode: forward Backspace to search box (printable keys go via WM_CHAR)
         if (mgr->snippetsMode && mgr->hwndSearch) {
             HWND focusedWindow = GetFocus();
@@ -2695,6 +3103,30 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 SetFocus(mgr->hwndSearch);
                 // Select all text in search box
                 SendMessage(mgr->hwndSearch, EM_SETSEL, 0, -1);
+            }
+            return 0;
+        }
+        // Smart paste one-key modes + edit (clipboard mode, no Ctrl).
+        // U = clean URL, M = Markdown link, P = file path, H = HTML->plain,
+        // E = edit then paste, X = edit and save as a new history item.
+        if (!mgr->snippetsMode && !ctrlPressed &&
+            (wParam == 'U' || wParam == 'M' || wParam == 'P' || wParam == 'H' || wParam == 'E' || wParam == 'X')) {
+            if (wParam == 'E') {
+                mgr->ShowEditPasteDialog(/*saveAsNew=*/false);
+                return 0;
+            }
+            if (wParam == 'X') {
+                mgr->ShowEditPasteDialog(/*saveAsNew=*/true);
+                return 0;
+            }
+            int smartMode = (wParam == 'U') ? SMART_PASTE_URL_CLEAN
+                          : (wParam == 'M') ? SMART_PASTE_MARKDOWN
+                          : (wParam == 'P') ? SMART_PASTE_FILEPATH
+                                            : SMART_PASTE_HTML_PLAIN;
+            if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                if (mgr->SmartPasteItem(mgr->selectedIndex, smartMode)) {
+                    mgr->HideListWindow();
+                }
             }
             return 0;
         }
@@ -2905,10 +3337,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             PostMessage(mgr->hwndSearch, WM_CHAR, wParam, lParam);
             return 0;
         }
-        // Clipboard mode: numeric input for quick paste
-        if (wParam >= '0' && wParam <= '9') {
+        // Clipboard mode: numeric input — promote the matching item to the top live.
+        if (!mgr->snippetsMode && wParam >= '0' && wParam <= '9') {
             if (mgr->numberInput.length() < 4) {
                 mgr->numberInput += (wchar_t)wParam;
+                mgr->ApplyNumberInputPromotion();
                 mgr->UpdateListWindow();
             }
             return 0;
@@ -3200,6 +3633,15 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 if (isImageItem) {
                     AppendMenu(hMenu, MF_STRING, 113, L"Save image to file...");
                 }
+                // Smart paste modes (each fails silently when not applicable to the item).
+                HMENU hSmartMenu = CreatePopupMenu();
+                AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_URL_CLEAN, L"Clean URL (strip tracking)\tU");
+                AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_MARKDOWN, L"Markdown link\tM");
+                AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_FILEPATH, L"File path\tP");
+                AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_HTML_PLAIN, L"HTML \x2192 plain text\tH");
+                AppendMenu(hMenu, MF_STRING | MF_POPUP, (UINT_PTR)hSmartMenu, L"Paste as");
+                AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT, L"Edit && Paste...\tE");
+                AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT_SAVE, L"Edit && Save as new...\tX");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
             
@@ -3259,6 +3701,16 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 mgr->HideListWindow();
             } else if (cmd == 113 && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->SaveImageItemToFile(clickedItemIndex);
+            } else if (cmd >= SMART_PASTE_URL_CLEAN && cmd <= SMART_PASTE_HTML_PLAIN && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
+                if (mgr->SmartPasteItem(clickedItemIndex, (int)cmd)) {
+                    mgr->HideListWindow();
+                }
+            } else if (cmd == SMART_PASTE_EDIT && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
+                mgr->selectedIndex = clickedItemIndex;
+                mgr->ShowEditPasteDialog(/*saveAsNew=*/false);
+            } else if (cmd == SMART_PASTE_EDIT_SAVE && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
+                mgr->selectedIndex = clickedItemIndex;
+                mgr->ShowEditPasteDialog(/*saveAsNew=*/true);
             } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_PLAIN_TEXT && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->TransformTextItem(clickedItemIndex, cmd);
             }
@@ -3683,23 +4135,28 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
     RefreshInactivePane();  // populate the pinned panel snapshot
     ClearMultiSelection(); // Clear multi-selection when showing list
 
-    // ---- Position the pinned panel + main list as a centered pair -----------
+    // ---- Position the pinned panel + main list (restore last drag position if any) -----------
     RECT screenRect;
     GetWindowRect(GetDesktopWindow(), &screenRect);
-    int y = screenRect.top + 50;
-    bool showPinned = (hwndPinned != nullptr);
-    if (showPinned) {
-        int totalW = PINNED_WIDTH + PANEL_GAP + WINDOW_WIDTH;
-        int startX = (screenRect.right - totalW) / 2;
-        if (startX < 8) startX = 8;
-        int pinnedX = startX;
-        int mainX = startX + PINNED_WIDTH + PANEL_GAP;
-        // Show the pinned panel WITHOUT activating it so keyboard focus stays on the main list.
-        SetWindowPos(hwndPinned, HWND_TOPMOST, pinnedX, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-        SetWindowPos(hwndList, HWND_TOPMOST, mainX, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    int mainX, mainY;
+    if (hasSavedOverlayPos) {
+        mainX = overlayPosX;
+        mainY = overlayPosY;
+        ClampOverlayPosition(mainX, mainY);
     } else {
-        int x = (screenRect.right - WINDOW_WIDTH) / 2;
-        SetWindowPos(hwndList, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+        // Default: centered pair near the top of the primary screen.
+        int totalW = (hwndPinned ? (PINNED_WIDTH + PANEL_GAP) : 0) + WINDOW_WIDTH;
+        mainX = (screenRect.right - totalW) / 2 + (hwndPinned ? (PINNED_WIDTH + PANEL_GAP) : 0);
+        if (mainX < 8) mainX = 8;
+        mainY = screenRect.top + 50;
+    }
+    if (hwndPinned) {
+        int pinnedX = mainX - PINNED_WIDTH - PANEL_GAP;
+        // Show the pinned panel WITHOUT activating it so keyboard focus stays on the main list.
+        SetWindowPos(hwndPinned, HWND_TOPMOST, pinnedX, mainY, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(hwndList, HWND_TOPMOST, mainX, mainY, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    } else {
+        SetWindowPos(hwndList, HWND_TOPMOST, mainX, mainY, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
     }
 
     // Show search boxes without activating (pinned search must never steal focus on open).
@@ -3729,6 +4186,7 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
 void ClipboardManager::HideListWindow() {
     if (listVisible) {
         HidePreviewWindow();
+        SaveOverlayPosition();  // remember where the user left the overlay
         // Clear search text when hiding (both panes)
         searchText.clear();
         inactivePane = PaneState();
@@ -3749,6 +4207,37 @@ void ClipboardManager::HideListWindow() {
         // Stop the focus check timer
         KillTimer(hwndMain, 1);
     }
+}
+
+void ClipboardManager::ClampOverlayPosition(int& mainX, int& mainY) const {
+    // Keep at least 80px of the main list visible somewhere on the virtual screen.
+    const int margin = 80;
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vw <= 0 || vh <= 0) return;
+
+    if (mainX + WINDOW_WIDTH < vx + margin) mainX = vx + margin - WINDOW_WIDTH;
+    if (mainX > vx + vw - margin) mainX = vx + vw - margin;
+    if (mainY + WINDOW_HEIGHT < vy + margin) mainY = vy + margin - WINDOW_HEIGHT;
+    if (mainY > vy + vh - margin) mainY = vy + vh - margin;
+}
+
+void ClipboardManager::SaveOverlayPosition() {
+    if (!hwndList || !IsWindow(hwndList)) return;
+    RECT r{};
+    if (!GetWindowRect(hwndList, &r)) return;
+    overlayPosX = r.left;
+    overlayPosY = r.top;
+    hasSavedOverlayPos = true;
+    // Keep the pinned panel docked to the left of the main list at the same Y.
+    if (hwndPinned && IsWindowVisible(hwndPinned)) {
+        SetWindowPos(hwndPinned, nullptr,
+                     overlayPosX - PINNED_WIDTH - PANEL_GAP, overlayPosY,
+                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    SaveOverlayPosToRegistry(overlayPosX, overlayPosY);
 }
 
 HWND ClipboardManager::ActiveListHwnd() {
@@ -4067,6 +4556,120 @@ void ClipboardManager::PasteItem(int index) {
     // and we want the duplicate detector to ignore that.
     Sleep(420);
     isPasting = false;
+}
+
+// Put derived plain text on the clipboard and paste it into the previously focused window.
+void ClipboardManager::PasteTransformedText(const std::wstring& text) {
+    if (text.empty()) return;
+
+    isPasting = true;
+    if (!SetClipboardTextPayload(hwndMain, text, /*includeRtf=*/false)) {
+        isPasting = false;
+        return;
+    }
+    lastPastedText = text;
+    lastSequenceNumber = GetClipboardSequenceNumber();
+
+    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+        SetForegroundWindow(previousFocusWindow);
+        SetFocus(previousFocusWindow);
+        Sleep(40);
+    }
+    ReleaseHotkeyModifiersForPaste();
+    Sleep(20);
+
+    SendCtrlV();
+
+    Sleep(420);
+    isPasting = false;
+}
+
+// One-key smart paste. Builds the derived text for the mode; silently returns false
+// when the item doesn't fit the mode (wrong content type) so nothing is pasted.
+bool ClipboardManager::SmartPasteItem(int filteredIndex, int mode) {
+    if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) return false;
+    int actualIndex = filteredIndices[filteredIndex];
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) return false;
+    const ClipboardItem* item = clipboardHistory[actualIndex].get();
+    if (!item) return false;
+
+    std::wstring plain = TrimWhitespaceCopy(GetPlainTextForDirectPaste(item));
+    std::wstring out;
+
+    switch (mode) {
+    case SMART_PASTE_URL_CLEAN: {
+        if (!LooksLikeHttpUrl(plain)) return false;
+        // Only the URL itself (first whitespace-delimited token) is cleaned.
+        size_t ws = plain.find_first_of(L" \t\r\n");
+        std::wstring url = (ws == std::wstring::npos) ? plain : plain.substr(0, ws);
+        out = StripUrlTrackingParams(url);
+        break;
+    }
+    case SMART_PASTE_MARKDOWN: {
+        if (LooksLikeHttpUrl(plain)) {
+            size_t ws = plain.find_first_of(L" \t\r\n");
+            std::wstring url = StripUrlTrackingParams(
+                (ws == std::wstring::npos) ? plain : plain.substr(0, ws));
+            // Title: link text from the HTML fragment's first <a> when present, else host.
+            std::wstring title;
+            const std::vector<BYTE>* htmlData = item->GetFormatData(CfHtml());
+            if (htmlData) {
+                std::wstring frag = ExtractHtmlFragment(*htmlData);
+                size_t a = frag.find(L"<a ");
+                if (a != std::wstring::npos) {
+                    size_t open = frag.find(L'>', a);
+                    size_t close = frag.find(L"</a>", a);
+                    if (open != std::wstring::npos && close != std::wstring::npos && close > open)
+                        title = TrimWhitespaceCopy(HtmlToPlainText(frag.substr(open + 1, close - open - 1)));
+                }
+            }
+            if (title.empty()) {
+                size_t schemeEnd = url.find(L"://");
+                size_t hostStart = (schemeEnd == std::wstring::npos) ? 0 : schemeEnd + 3;
+                size_t hostEnd = url.find_first_of(L"/?#", hostStart);
+                title = url.substr(hostStart, (hostEnd == std::wstring::npos ? url.size() : hostEnd) - hostStart);
+            }
+            out = L"[" + title + L"](" + url + L")";
+        } else {
+            const std::vector<BYTE>* drop = item->GetFormatData(CF_HDROP);
+            if (!drop) return false;
+            std::vector<std::wstring> paths = ExtractHdropPaths(*drop);
+            if (paths.size() != 1) return false;
+            const std::wstring& p = paths[0];
+            size_t slash = p.find_last_of(L'\\');
+            std::wstring name = (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+            out = L"[" + name + L"](" + p + L")";
+        }
+        break;
+    }
+    case SMART_PASTE_FILEPATH: {
+        const std::vector<BYTE>* drop = item->GetFormatData(CF_HDROP);
+        if (drop) {
+            std::vector<std::wstring> paths = ExtractHdropPaths(*drop);
+            for (const auto& p : paths) {
+                if (!out.empty()) out += L"\r\n";
+                out += p;
+            }
+        } else {
+            out = NormalizeFilePathText(plain);
+        }
+        break;
+    }
+    case SMART_PASTE_HTML_PLAIN: {
+        const std::vector<BYTE>* htmlData = item->GetFormatData(CfHtml());
+        if (htmlData) {
+            out = HtmlToPlainText(ExtractHtmlFragment(*htmlData));
+        }
+        if (out.empty()) out = plain;  // no HTML on the item: plain text is the honest result
+        break;
+    }
+    default:
+        return false;
+    }
+
+    if (out.empty()) return false;
+    PasteTransformedText(out);
+    return true;
 }
 
 void ClipboardManager::PasteMultipleItems() {
@@ -4420,6 +5023,7 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
         try {
             clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
             TrimHistory();
+            MarkHistoryDirty();
             if (listVisible) { FilterItems(); UpdateListWindow(); }
         } catch (...) {}
     }
@@ -4640,6 +5244,7 @@ void ClipboardManager::CommitCapturedText(const std::wstring& text, bool setClip
         auto item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, data);
         clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
         TrimHistory();
+        MarkHistoryDirty();
         if (listVisible) { FilterItems(); UpdateListWindow(); }
     } catch (...) {
         // Even if history insertion fails, still try to set the clipboard below.
@@ -5264,6 +5869,7 @@ void ClipboardManager::ProcessClipboard() {
                             
                             // Limit to maxItems (never evicting pinned items)
                             TrimHistory();
+                            MarkHistoryDirty();
                             
                             // Update filter if list is visible
                             if (listVisible) {
@@ -5665,7 +6271,7 @@ void ClipboardManager::TogglePin(int filteredIndex) {
     if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) return;
     if (!clipboardHistory[actualIndex]) return;
     clipboardHistory[actualIndex]->pinned = !clipboardHistory[actualIndex]->pinned;
-    SaveClipboardHistory();
+    MarkHistoryDirty();
     FilterItems();
     UpdateListWindow();
 }
@@ -5763,6 +6369,7 @@ void ClipboardManager::DeleteItem(int filteredIndex) {
     
     // Remove the item from clipboardHistory
     clipboardHistory.erase(clipboardHistory.begin() + actualIndex);
+    MarkHistoryDirty();
     
     // Rebuild filteredIndices - adjust all indices that were after the deleted item
     // and filter again to account for the removed item
@@ -5979,6 +6586,7 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
     clipboardHistory[actualIndex]->preview = transformedText.length() > 50 
         ? transformedText.substr(0, 50) + L"..." 
         : transformedText;
+    clipboardHistory[actualIndex]->RebuildSearchIndex();  // body + preview changed
     
     // Copy transformed text to clipboard
     // Store the transformed text so we can ignore it if it's copied back
@@ -6015,6 +6623,8 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
     
     isPasting = false;
     
+    MarkHistoryDirty();
+
     // Update the display to show the transformed preview
     FilterItems(); // Rebuild filtered indices in case search is active
     UpdateListWindow(); // Refresh the UI to show updated preview
@@ -6027,6 +6637,7 @@ void ClipboardManager::ClearClipboardHistory() {
         if (item && item->pinned) kept.push_back(std::move(item));
     }
     clipboardHistory.swap(kept);
+    MarkHistoryDirty();
 
     // Reset related UI state
     scrollOffset = 0;
@@ -6052,12 +6663,78 @@ void ClipboardManager::ClearClipboardHistory() {
 namespace {
     const DWORD kPersistFormatCap = 16 * 1024 * 1024;  // per-format byte cap
     const DWORD kPersistItemCap   = 16 * 1024 * 1024;  // per-item total byte cap
+    const DWORD kBlobThreshold    = 256 * 1024;        // formats >= this go to content-addressed sidecars
+    const DWORD kBlobSizeMarker   = 0xFFFFFFFF;        // record size sentinel: 20-byte SHA1 follows
 
     void AppendBytes(std::vector<BYTE>& buf, const void* p, size_t n) {
         const BYTE* b = (const BYTE*)p;
         buf.insert(buf.end(), b, b + n);
     }
     void AppendDword(std::vector<BYTE>& buf, DWORD v) { AppendBytes(buf, &v, sizeof(DWORD)); }
+
+    std::wstring GetClip2DataDir() {
+        wchar_t appData[MAX_PATH];
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) return L"";
+        std::wstring dir = std::wstring(appData) + L"\\clip2";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
+    }
+
+    bool Sha1Digest(const BYTE* data, size_t len, BYTE out[20]) {
+        HCRYPTPROV hProv = 0;
+        HCRYPTHASH hHash = 0;
+        if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+            return false;
+        bool ok = false;
+        if (CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
+            if (CryptHashData(hHash, data, (DWORD)len, 0)) {
+                DWORD dlen = 20;
+                if (CryptGetHashParam(hHash, HP_HASHVAL, out, &dlen, 0) && dlen == 20)
+                    ok = true;
+            }
+            CryptDestroyHash(hHash);
+        }
+        CryptReleaseContext(hProv, 0);
+        return ok;
+    }
+
+    std::wstring DigestToHex(const BYTE digest[20]) {
+        wchar_t buf[41];
+        for (int i = 0; i < 20; i++)
+            swprintf(buf + i * 2, 3, L"%02x", digest[i]);
+        return std::wstring(buf, 40);
+    }
+
+    bool WriteFileAtomic(const std::wstring& path, const void* data, size_t len) {
+        std::wstring tmp = path + L".tmp";
+        HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        BOOL ok = WriteFile(h, data, (DWORD)len, &written, nullptr) && written == (DWORD)len;
+        CloseHandle(h);
+        if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    bool ReadWholeFile(const std::wstring& path, std::vector<BYTE>& out, LONGLONG maxBytes) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER fsize;
+        if (!GetFileSizeEx(h, &fsize) || fsize.QuadPart <= 0 || fsize.QuadPart > maxBytes) {
+            CloseHandle(h);
+            return false;
+        }
+        out.resize((size_t)fsize.QuadPart);
+        DWORD read = 0;
+        BOOL ok = ReadFile(h, out.data(), (DWORD)out.size(), &read, nullptr) && read == out.size();
+        CloseHandle(h);
+        if (!ok) out.clear();
+        return ok != FALSE && !out.empty();
+    }
 
     bool DpapiProtect(const std::vector<BYTE>& in, std::vector<BYTE>& out) {
         DATA_BLOB din; din.cbData = (DWORD)in.size(); din.pbData = const_cast<BYTE*>(in.data());
@@ -6179,6 +6856,22 @@ void ClipboardManager::LoadClipboardHistory() {
                 for (DWORD f = 0; f < formatCount; f++) {
                     DWORD fmt = 0, size = 0;
                     if (!readDword(fmt) || !readDword(size)) { ok = false; break; }
+                    if (size == kBlobSizeMarker) {
+                        // Blob reference: 20-byte SHA1 of a content-addressed sidecar file.
+                        if (off + 20 > len) { ok = false; break; }
+                        BYTE digest[20];
+                        memcpy(digest, p + off, 20);
+                        off += 20;
+                        std::wstring dir = GetClip2DataDir();
+                        if (!dir.empty()) {
+                            std::vector<BYTE> blobBytes;
+                            std::wstring blobPath = dir + L"\\blobs\\" + DigestToHex(digest);
+                            if (ReadWholeFile(blobPath, blobBytes, (LONGLONG)kPersistFormatCap))
+                                fmts[fmt] = std::move(blobBytes);
+                            // Missing blob: skip this format, keep the rest of the item.
+                        }
+                        continue;
+                    }
                     if (off + size > len) { ok = false; break; }
                     if (size > 0 && size <= kPersistFormatCap)
                         fmts[fmt] = std::vector<BYTE>(p + off, p + off + size);
@@ -6193,13 +6886,20 @@ void ClipboardManager::LoadClipboardHistory() {
     } catch (...) {}
 }
 
+// Schedule a debounced save: the actual disk write happens once, ~1.5s after the
+// last history mutation, instead of rewriting history.dat on every change.
+void ClipboardManager::MarkHistoryDirty() {
+    historyDirty = true;
+    if (hwndMain) SetTimer(hwndMain, TIMER_SAVE_HISTORY, 1500, nullptr);  // restarts the countdown
+}
+
 void ClipboardManager::SaveClipboardHistory() {
     try {
-        wchar_t appData[MAX_PATH];
-        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appData))) return;
-        std::wstring path = std::wstring(appData) + L"\\clip2";
-        CreateDirectoryW(path.c_str(), nullptr);
-        path += L"\\history.dat";
+        std::wstring dir = GetClip2DataDir();
+        if (dir.empty()) return;
+        std::wstring path = dir + L"\\history.dat";
+        std::wstring blobDir = dir + L"\\blobs";
+        CreateDirectoryW(blobDir.c_str(), nullptr);
 
         // Decide which items to save: all pinned first (exempt from the count cap),
         // then the most recent unpinned items up to maxItems.
@@ -6214,10 +6914,13 @@ void ClipboardManager::SaveClipboardHistory() {
             }
         }
 
-        // Build the inner plaintext payload.
+        // Build the inner plaintext payload. Large formats (images, files) are stored as
+        // content-addressed sidecar blobs so unchanged data is never rewritten — the index
+        // file stays small and fast to save.
+        std::set<std::wstring> referencedBlobs;
         std::vector<BYTE> payload;
         AppendBytes(payload, "CLP2", 4);
-        AppendDword(payload, 2);  // version 2 (all formats + pinned)
+        AppendDword(payload, 2);  // version 2 (all formats + pinned; big formats via blob refs)
         size_t countPos = payload.size();
         AppendDword(payload, 0);  // placeholder for count
         DWORD savedCount = 0;
@@ -6239,27 +6942,53 @@ void ClipboardManager::SaveClipboardHistory() {
             AppendDword(payload, (DWORD)keep.size());
             for (const auto& kv : keep) {
                 AppendDword(payload, (DWORD)kv.first);
-                AppendDword(payload, (DWORD)kv.second->size());
-                AppendBytes(payload, kv.second->data(), kv.second->size());
+                BYTE digest[20];
+                if (kv.second->size() >= kBlobThreshold && Sha1Digest(kv.second->data(), kv.second->size(), digest)) {
+                    // Blob reference: size sentinel + SHA1. Write the blob only when new.
+                    std::wstring hex = DigestToHex(digest);
+                    std::wstring blobPath = blobDir + L"\\" + hex;
+                    if (GetFileAttributesW(blobPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                        WriteFileAtomic(blobPath, kv.second->data(), kv.second->size());
+                    }
+                    referencedBlobs.insert(hex);
+                    AppendDword(payload, kBlobSizeMarker);
+                    AppendBytes(payload, digest, 20);
+                } else {
+                    AppendDword(payload, (DWORD)kv.second->size());
+                    AppendBytes(payload, kv.second->data(), kv.second->size());
+                }
             }
             savedCount++;
         }
         memcpy(payload.data() + countPos, &savedCount, sizeof(DWORD));
 
         // Encrypt at rest with DPAPI; fall back to plaintext only if encryption fails.
-        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return;
-        DWORD written = 0;
+        // Write atomically (tmp + rename) so a crash mid-save cannot corrupt history.dat.
         std::vector<BYTE> blob;
         if (DpapiProtect(payload, blob)) {
-            DWORD blobLen = (DWORD)blob.size();
-            WriteFile(h, "CLP3", 4, &written, nullptr);
-            WriteFile(h, &blobLen, 4, &written, nullptr);
-            WriteFile(h, blob.data(), blobLen, &written, nullptr);
+            std::vector<BYTE> fileBuf;
+            fileBuf.reserve(blob.size() + 8);
+            AppendBytes(fileBuf, "CLP3", 4);
+            AppendDword(fileBuf, (DWORD)blob.size());
+            AppendBytes(fileBuf, blob.data(), blob.size());
+            if (!WriteFileAtomic(path, fileBuf.data(), fileBuf.size())) return;
         } else {
-            WriteFile(h, payload.data(), (DWORD)payload.size(), &written, nullptr);
+            if (!WriteFileAtomic(path, payload.data(), payload.size())) return;
         }
-        CloseHandle(h);
+
+        // Garbage-collect sidecar blobs no longer referenced by the saved index.
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW((blobDir + L"\\*").c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring name = fd.cFileName;
+                if (name.size() == 40 && referencedBlobs.find(name) == referencedBlobs.end()) {
+                    DeleteFileW((blobDir + L"\\" + name).c_str());
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
     } catch (...) {}
 }
 
@@ -6281,15 +7010,30 @@ void ClipboardManager::ComputeFilteredForPane(bool pinnedOnly, const std::wstrin
         std::wstring searchLower = search;
         std::transform(searchLower.begin(), searchLower.end(), searchLower.begin(), ::towlower);
 
+        // Candidate gate: with a needle of >= 3 chars, an item's body can only contain the
+        // needle as a substring when every needle trigram is in the item's bloom filter.
+        // Preview fields are always scored (cheap), so short/fuzzy matches still surface.
+        std::vector<unsigned int> needleBits;
+        for (size_t i = 0; i + 2 < searchLower.size(); i++)
+            needleBits.push_back(TrigramHashBit(searchLower[i], searchLower[i + 1], searchLower[i + 2]));
+        auto bodyCandidate = [&needleBits](const ClipboardItem* item) {
+            if (needleBits.empty()) return true;  // needle < 3 chars: no gate
+            if (item->trigramBloom.size() != kTrigramBloomBytes) return true;  // no index built
+            for (unsigned int bit : needleBits) {
+                if (!(item->trigramBloom[bit >> 3] & (1u << (bit & 7))))
+                    return false;
+            }
+            return true;
+        };
+
         struct Scored { int index; int score; int order; };
         std::vector<Scored> scored;
         for (size_t i = 0; i < clipboardHistory.size(); i++) {
             if (pinnedOnly && !isPinned((int)i)) continue;
             const auto& item = clipboardHistory[i];
-            int best = FuzzyScore(searchLower, item->GetFullSearchableText());
-            best = std::max(best, FuzzyScore(searchLower, item->preview));
-            best = std::max(best, FuzzyScore(searchLower, item->formatName));
-            best = std::max(best, FuzzyScore(searchLower, item->fileType));
+            int best = FuzzyScoreLower(searchLower, item->searchPreviewLower);
+            if (bodyCandidate(item.get()))
+                best = std::max(best, FuzzyScoreLower(searchLower, item->searchBodyLower));
             if (best > 0) scored.push_back({ (int)i, best, (int)i });
         }
         std::stable_sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
@@ -6300,17 +7044,65 @@ void ClipboardManager::ComputeFilteredForPane(bool pinnedOnly, const std::wstrin
     }
 }
 
+// Rebuild the visible list from the unpromoted search order, then (if the user is
+// typing a paste number) temporarily move that item to the top and select it.
+void ClipboardManager::ApplyNumberInputPromotion() {
+    filteredIndices = filteredIndicesBase;
+
+    if (snippetsMode || numberInput.empty() || filteredIndices.empty()) {
+        if (selectedIndex >= (int)filteredIndices.size())
+            selectedIndex = filteredIndices.empty() ? -1 : (int)filteredIndices.size() - 1;
+        return;
+    }
+
+    int itemNumber = 0;
+    try {
+        itemNumber = std::stoi(numberInput);
+    } catch (...) {
+        return;
+    }
+    int baseIndex = itemNumber - 1;  // 1-based → 0-based into the unpromoted list
+    if (baseIndex < 0 || baseIndex >= (int)filteredIndicesBase.size())
+        return;
+
+    int historyIndex = filteredIndicesBase[baseIndex];
+    // Move the matching entry to the front of the display list.
+    filteredIndices.erase(
+        std::remove(filteredIndices.begin(), filteredIndices.end(), historyIndex),
+        filteredIndices.end());
+    filteredIndices.insert(filteredIndices.begin(), historyIndex);
+
+    selectedIndex = 0;
+    scrollOffset = 0;
+    ClearMultiSelection();
+    hoveredItemIndex = -1;
+}
+
+int ClipboardManager::OriginalItemNumber(int displayFilteredIndex) const {
+    if (displayFilteredIndex < 0 || displayFilteredIndex >= (int)filteredIndices.size())
+        return displayFilteredIndex + 1;
+    int historyIndex = filteredIndices[displayFilteredIndex];
+    for (size_t i = 0; i < filteredIndicesBase.size(); i++) {
+        if (filteredIndicesBase[i] == historyIndex)
+            return (int)i + 1;
+    }
+    return displayFilteredIndex + 1;
+}
+
 void ClipboardManager::FilterItems() {
     ClearMultiSelection(); // Clear multi-selection when filtering
 
-    ComputeFilteredForPane(activeIsPinned, searchText, filteredIndices);
+    ComputeFilteredForPane(activeIsPinned, searchText, filteredIndicesBase);
+    ApplyNumberInputPromotion();
 
-    // Reset scroll offset and selection when filtering
-    scrollOffset = 0;
-    if (filteredIndices.empty()) {
-        selectedIndex = -1;
-    } else {
-        selectedIndex = 0;
+    // Reset scroll offset and selection when filtering (promotion may already set them)
+    if (numberInput.empty()) {
+        scrollOffset = 0;
+        if (filteredIndices.empty()) {
+            selectedIndex = -1;
+        } else {
+            selectedIndex = 0;
+        }
     }
     RefreshInactivePane();
     UpdateListWindow();
@@ -6725,6 +7517,178 @@ void ClipboardManager::PasteSnippet(int index) {
     Sleep(460);
     isPasting = false;
     PlayClickSound();
+}
+
+// ======================= Edit / merge before paste ==========================
+
+static WNDPROC g_editPasteOrigEditProc = nullptr;
+static const int IDC_EDITPASTE_EDIT = 2001;
+static const int IDC_EDITPASTE_PASTE = 2002;
+static const int IDC_EDITPASTE_CANCEL = 2003;
+
+void ClipboardManager::ShowEditPasteDialog(bool saveAsNew) {
+    if (hwndEditPaste && IsWindow(hwndEditPaste)) {
+        SetForegroundWindow(hwndEditPaste);
+        return;
+    }
+    if (snippetsMode) return;
+
+    // Prefill: multi-select joins items with \r\n; single selection uses its plain text
+    // (falling back to the HTML fragment as plain text for HTML-only items).
+    std::wstring prefill;
+    if (!multiSelectedIndices.empty()) {
+        std::vector<int> sorted(multiSelectedIndices.begin(), multiSelectedIndices.end());
+        std::sort(sorted.begin(), sorted.end());
+        for (int fi : sorted) {
+            if (fi < 0 || fi >= (int)filteredIndices.size()) continue;
+            int ai = filteredIndices[fi];
+            if (ai < 0 || ai >= (int)clipboardHistory.size() || !clipboardHistory[ai]) continue;
+            std::wstring part = TrimTrailingForMultiPasteJoin(
+                GetPlainTextForDirectPaste(clipboardHistory[ai].get()));
+            if (part.empty()) continue;
+            if (!prefill.empty()) prefill += L"\r\n";
+            prefill += part;
+        }
+    } else if (selectedIndex >= 0 && selectedIndex < (int)filteredIndices.size()) {
+        int ai = filteredIndices[selectedIndex];
+        if (ai >= 0 && ai < (int)clipboardHistory.size() && clipboardHistory[ai]) {
+            const ClipboardItem* item = clipboardHistory[ai].get();
+            prefill = GetPlainTextForDirectPaste(item);
+            if (prefill.empty()) {
+                const std::vector<BYTE>* htmlData = item->GetFormatData(CfHtml());
+                if (htmlData) prefill = HtmlToPlainText(ExtractHtmlFragment(*htmlData));
+            }
+        }
+    }
+    if (prefill.empty()) return;  // nothing editable: fail silently
+
+    editPasteSaveAsNew = saveAsNew;
+    HideListWindow();  // previousFocusWindow (the paste target) is preserved for paste mode
+
+    static bool classRegistered = false;
+    if (!classRegistered) {
+        WNDCLASS wc = {};
+        wc.lpfnWndProc = EditPasteDialogProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.lpszClassName = L"Clip2EditPasteClass";
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClass(&wc);
+        classRegistered = true;
+    }
+
+    const int W = 560, H = 420;
+    RECT screenRect;
+    GetWindowRect(GetDesktopWindow(), &screenRect);
+    int x = (screenRect.right - W) / 2;
+    int y = (screenRect.bottom - H) / 3;
+    const wchar_t* title = saveAsNew ? L"clip2 - Edit && Save as new" : L"clip2 - Edit && Paste";
+    hwndEditPaste = CreateWindowExW(WS_EX_TOPMOST, L"Clip2EditPasteClass", title,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, hwndMain, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!hwndEditPaste) return;
+
+    RECT rc;
+    GetClientRect(hwndEditPaste, &rc);
+    HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN,
+        10, 10, rc.right - 20, rc.bottom - 86,
+        hwndEditPaste, (HMENU)(INT_PTR)IDC_EDITPASTE_EDIT, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", saveAsNew ? L"Save" : L"Paste", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        rc.right - 180, rc.bottom - 66, 80, 28,
+        hwndEditPaste, (HMENU)(INT_PTR)IDC_EDITPASTE_PASTE, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        rc.right - 90, rc.bottom - 66, 80, 28,
+        hwndEditPaste, (HMENU)(INT_PTR)IDC_EDITPASTE_CANCEL, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"STATIC",
+        saveAsNew ? L"Ctrl+Enter = save as new item  \x2022  Esc = cancel"
+                  : L"Ctrl+Enter = paste  \x2022  Esc = cancel",
+        WS_CHILD | WS_VISIBLE, 12, rc.bottom - 26, rc.right - 24, 18,
+        hwndEditPaste, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    HFONT guiFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    EnumChildWindows(hwndEditPaste, [](HWND child, LPARAM font) -> BOOL {
+        SendMessage(child, WM_SETFONT, (WPARAM)font, TRUE);
+        return TRUE;
+    }, (LPARAM)guiFont);
+
+    if (hEdit) {
+        g_editPasteOrigEditProc = (WNDPROC)SetWindowLongPtr(hEdit, GWLP_WNDPROC, (LONG_PTR)EditPasteEditProc);
+        SetWindowTextW(hEdit, prefill.c_str());
+    }
+
+    ShowWindow(hwndEditPaste, SW_SHOW);
+    SetForegroundWindow(hwndEditPaste);
+    if (hEdit) {
+        SetFocus(hEdit);
+        SendMessage(hEdit, EM_SETSEL, (WPARAM)prefill.size(), (LPARAM)prefill.size());
+    }
+}
+
+LRESULT CALLBACK ClipboardManager::EditPasteDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    ClipboardManager* mgr = instance;
+    if (!mgr) return DefWindowProc(hwnd, uMsg, wParam, lParam);
+
+    switch (uMsg) {
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_EDITPASTE_PASTE) {
+            HWND hEdit = GetDlgItem(hwnd, IDC_EDITPASTE_EDIT);
+            std::wstring text;
+            if (hEdit) {
+                int len = GetWindowTextLengthW(hEdit);
+                if (len > 0) {
+                    text.resize(len + 1);
+                    GetWindowTextW(hEdit, &text[0], len + 1);
+                    text.resize(wcslen(text.c_str()));
+                }
+            }
+            const bool saveAsNew = mgr->editPasteSaveAsNew;
+            DestroyWindow(hwnd);
+            if (text.empty()) return 0;
+            if (saveAsNew) {
+                // Keep edits as a brand-new history entry (original item is untouched).
+                // Also put the text on the system clipboard so it's ready to paste.
+                mgr->CommitCapturedText(text, /*setClipboard=*/true);
+                mgr->ShowListWindow(false);
+            } else {
+                mgr->PasteTransformedText(text);
+            }
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_EDITPASTE_CANCEL) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        if (mgr->hwndEditPaste == hwnd) {
+            mgr->hwndEditPaste = nullptr;
+            mgr->editPasteSaveAsNew = false;
+        }
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+LRESULT CALLBACK ClipboardManager::EditPasteEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+            HWND parent = GetParent(hwnd);
+            if (parent) PostMessage(parent, WM_COMMAND, MAKEWPARAM(IDC_EDITPASTE_PASTE, BN_CLICKED), 0);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            HWND parent = GetParent(hwnd);
+            if (parent) PostMessage(parent, WM_CLOSE, 0, 0);
+            return 0;
+        }
+    }
+    if (g_editPasteOrigEditProc)
+        return CallWindowProc(g_editPasteOrigEditProc, hwnd, uMsg, wParam, lParam);
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
 void ClipboardManager::ShowSnippetsManagerDialog() {
