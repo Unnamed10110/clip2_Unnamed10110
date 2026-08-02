@@ -290,6 +290,33 @@ static void SaveMaxItemsToRegistry(int value) {
     RegCloseKey(hKey);
 }
 
+// Overlay position is stored as signed ints bit-cast into REG_DWORD (multi-monitor may be negative).
+static bool LoadOverlayPosFromRegistry(int& outX, int& outY) {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+    DWORD x = 0, y = 0, sz = sizeof(DWORD), type = REG_DWORD;
+    LONG rcx = RegQueryValueExW(hKey, L"OverlayPosX", nullptr, &type, (LPBYTE)&x, &sz);
+    sz = sizeof(DWORD); type = REG_DWORD;
+    LONG rcy = RegQueryValueExW(hKey, L"OverlayPosY", nullptr, &type, (LPBYTE)&y, &sz);
+    RegCloseKey(hKey);
+    if (rcx != ERROR_SUCCESS || rcy != ERROR_SUCCESS) return false;
+    outX = (int)x;
+    outY = (int)y;
+    return true;
+}
+
+static void SaveOverlayPosToRegistry(int x, int y) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD vx = (DWORD)x, vy = (DWORD)y;
+    RegSetValueExW(hKey, L"OverlayPosX", 0, REG_DWORD, (BYTE*)&vx, sizeof(DWORD));
+    RegSetValueExW(hKey, L"OverlayPosY", 0, REG_DWORD, (BYTE*)&vy, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
 // Case-insensitive fuzzy match with ranking. Returns a positive score on match, 0 on no match.
 // Exact substring matches score highest; subsequence matches score by contiguity and word-start bonuses.
 static int FuzzyScore(const std::wstring& needleLower, const std::wstring& haystack) {
@@ -1551,7 +1578,7 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager()
-    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), hwndSettings(nullptr), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
@@ -1595,6 +1622,7 @@ bool ClipboardManager::Initialize() {
     LoadThemeColorsFromRegistry();
     ApplyThemeId(LoadThemeIdFromRegistry());
     maxItems = LoadMaxItemsFromRegistry(DEFAULT_MAX_ITEMS, MIN_MAX_ITEMS, MAX_MAX_ITEMS);
+    hasSavedOverlayPos = LoadOverlayPosFromRegistry(overlayPosX, overlayPosY);
 
     // Register window class for main window
     WNDCLASS wc = {};
@@ -2236,6 +2264,28 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         
         return hit;
     }
+
+    case WM_MOVING: {
+        // Keep the sibling panel locked beside the dragged one so the pair moves as a unit.
+        LPRECT pr = (LPRECT)lParam;
+        if (!pr) break;
+        if (hwnd == mgr->hwndList && mgr->hwndPinned && IsWindowVisible(mgr->hwndPinned)) {
+            SetWindowPos(mgr->hwndPinned, nullptr,
+                         pr->left - ClipboardManager::PINNED_WIDTH - ClipboardManager::PANEL_GAP, pr->top,
+                         0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (hwnd == mgr->hwndPinned && mgr->hwndList && IsWindowVisible(mgr->hwndList)) {
+            SetWindowPos(mgr->hwndList, nullptr,
+                         pr->left + ClipboardManager::PINNED_WIDTH + ClipboardManager::PANEL_GAP, pr->top,
+                         0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        break;
+    }
+
+    case WM_EXITSIZEMOVE:
+        // User finished dragging — persist the main list's top-left for the next open.
+        mgr->SaveOverlayPosition();
+        break;
+
     case WM_ERASEBKGND:
         if (hwnd == mgr->hwndList) return 1;  // fully painted in WM_PAINT (double-buffered): skip erase flicker
         break;
@@ -3683,23 +3733,28 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
     RefreshInactivePane();  // populate the pinned panel snapshot
     ClearMultiSelection(); // Clear multi-selection when showing list
 
-    // ---- Position the pinned panel + main list as a centered pair -----------
+    // ---- Position the pinned panel + main list (restore last drag position if any) -----------
     RECT screenRect;
     GetWindowRect(GetDesktopWindow(), &screenRect);
-    int y = screenRect.top + 50;
-    bool showPinned = (hwndPinned != nullptr);
-    if (showPinned) {
-        int totalW = PINNED_WIDTH + PANEL_GAP + WINDOW_WIDTH;
-        int startX = (screenRect.right - totalW) / 2;
-        if (startX < 8) startX = 8;
-        int pinnedX = startX;
-        int mainX = startX + PINNED_WIDTH + PANEL_GAP;
-        // Show the pinned panel WITHOUT activating it so keyboard focus stays on the main list.
-        SetWindowPos(hwndPinned, HWND_TOPMOST, pinnedX, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-        SetWindowPos(hwndList, HWND_TOPMOST, mainX, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    int mainX, mainY;
+    if (hasSavedOverlayPos) {
+        mainX = overlayPosX;
+        mainY = overlayPosY;
+        ClampOverlayPosition(mainX, mainY);
     } else {
-        int x = (screenRect.right - WINDOW_WIDTH) / 2;
-        SetWindowPos(hwndList, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+        // Default: centered pair near the top of the primary screen.
+        int totalW = (hwndPinned ? (PINNED_WIDTH + PANEL_GAP) : 0) + WINDOW_WIDTH;
+        mainX = (screenRect.right - totalW) / 2 + (hwndPinned ? (PINNED_WIDTH + PANEL_GAP) : 0);
+        if (mainX < 8) mainX = 8;
+        mainY = screenRect.top + 50;
+    }
+    if (hwndPinned) {
+        int pinnedX = mainX - PINNED_WIDTH - PANEL_GAP;
+        // Show the pinned panel WITHOUT activating it so keyboard focus stays on the main list.
+        SetWindowPos(hwndPinned, HWND_TOPMOST, pinnedX, mainY, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(hwndList, HWND_TOPMOST, mainX, mainY, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    } else {
+        SetWindowPos(hwndList, HWND_TOPMOST, mainX, mainY, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
     }
 
     // Show search boxes without activating (pinned search must never steal focus on open).
@@ -3729,6 +3784,7 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
 void ClipboardManager::HideListWindow() {
     if (listVisible) {
         HidePreviewWindow();
+        SaveOverlayPosition();  // remember where the user left the overlay
         // Clear search text when hiding (both panes)
         searchText.clear();
         inactivePane = PaneState();
@@ -3749,6 +3805,37 @@ void ClipboardManager::HideListWindow() {
         // Stop the focus check timer
         KillTimer(hwndMain, 1);
     }
+}
+
+void ClipboardManager::ClampOverlayPosition(int& mainX, int& mainY) const {
+    // Keep at least 80px of the main list visible somewhere on the virtual screen.
+    const int margin = 80;
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vw <= 0 || vh <= 0) return;
+
+    if (mainX + WINDOW_WIDTH < vx + margin) mainX = vx + margin - WINDOW_WIDTH;
+    if (mainX > vx + vw - margin) mainX = vx + vw - margin;
+    if (mainY + WINDOW_HEIGHT < vy + margin) mainY = vy + margin - WINDOW_HEIGHT;
+    if (mainY > vy + vh - margin) mainY = vy + vh - margin;
+}
+
+void ClipboardManager::SaveOverlayPosition() {
+    if (!hwndList || !IsWindow(hwndList)) return;
+    RECT r{};
+    if (!GetWindowRect(hwndList, &r)) return;
+    overlayPosX = r.left;
+    overlayPosY = r.top;
+    hasSavedOverlayPos = true;
+    // Keep the pinned panel docked to the left of the main list at the same Y.
+    if (hwndPinned && IsWindowVisible(hwndPinned)) {
+        SetWindowPos(hwndPinned, nullptr,
+                     overlayPosX - PINNED_WIDTH - PANEL_GAP, overlayPosY,
+                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    SaveOverlayPosToRegistry(overlayPosX, overlayPosY);
 }
 
 HWND ClipboardManager::ActiveListHwnd() {

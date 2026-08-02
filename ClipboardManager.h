@@ -192,6 +192,8 @@ private:
     void SetListSnippetsMode(bool wantSnippets);
     void HideListWindow();
     void UpdateListWindow(bool includeInactive = true);
+    void SaveOverlayPosition();                  // Persist main-list top-left + keep pinned panel aligned
+    void ClampOverlayPosition(int& mainX, int& mainY) const; // Keep restored position on-screen
     // Left "pinned" panel support. The live member state (filteredIndices, selectedIndex,
     // scrollOffset, searchText, snippetsMode, multi-select...) always belongs to whichever
     // pane is focused; the other pane keeps a lightweight snapshot for rendering.
@@ -262,6 +264,9 @@ private:
     PaneState inactivePane;   // Snapshot of the non-focused pane (for rendering + restore on switch)
     DWORD overlayShownTick;   // Tick when overlay was last shown (grace period before focus-hide)
     bool overlayGotForeground;// True once the overlay actually became foreground after showing
+    bool hasSavedOverlayPos;  // True when overlayPosX/Y come from a prior drag or registry
+    int overlayPosX;          // Last main-list top-left X (virtual-screen coords)
+    int overlayPosY;          // Last main-list top-left Y
     NOTIFYICONDATA nid;
     UINT wmTaskbarCreated;
     bool isRunning;
