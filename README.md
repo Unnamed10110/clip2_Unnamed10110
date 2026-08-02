@@ -129,6 +129,7 @@ The executable will be created as `clip2.exe`.
     - **\*set shortcut**: In snippets overlay, type `*set` and press **Enter** to open Manage Snippets (cannot be used as a snippet name)
     - **Placeholders** (in snippet content): `{{date}}`, `{{time}}`, `{{datetime}}`, `{{year}}`, `{{month}}`, `{{day}}`, `{{hour}}`, `{{minute}}`, `{{second}}`, `{{clipboard}}`
     - **Manage Snippets**: Add, edit, delete snippets; Rich Edit supports RTF formatting (bold, colors, etc.)
+    - **Quick add / edit**: In the snippets overlay (list focused, not the search box), press **A** to add a snippet or **E** to edit the selected one; also available from the right-click menu
 
 ## Technical Details
 

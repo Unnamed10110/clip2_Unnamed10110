@@ -338,15 +338,22 @@ private:
     void PasteSnippet(int index);
     std::wstring ExpandSnippetPlaceholders(const std::wstring& content);
     void ShowSnippetsManagerDialog();
+    // Quick add (editIndex < 0) or edit (actual snippets[] index) popup from the snippets overlay.
+    void ShowSnippetEditorDialog(int editIndex = -1);
     
     // Bypass copy blocks: capture clipboard immediately when it changes so we have content before apps clear it
     bool TryCaptureClipboardImmediately();
     void ProcessClipboardFromSnapshot();
     
     static LRESULT CALLBACK SnippetsManagerProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK SnippetEditorDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK SnippetEditorEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     
     std::vector<Snippet> snippets;
     HWND hwndSnippetsManager;
+    HWND hwndSnippetEditor;       // Quick add/edit snippet dialog
+    int snippetEditorEditIndex;   // -1 = add new; otherwise index into snippets[]
+    bool ignoreNextSnippetShortcutChar; // Consume WM_CHAR for A/E after the shortcut opens the dialog
     
     static const UINT WM_MOUSELEAVE_CUSTOM = WM_USER + 4;
     

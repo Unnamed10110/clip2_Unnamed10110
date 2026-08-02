@@ -1915,7 +1915,7 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
 
 // ClipboardManager implementation
 ClipboardManager::ClipboardManager()
-    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
@@ -2196,6 +2196,10 @@ void ClipboardManager::Stop() {
     }
     
     // Clean shutdown
+    if (hwndSnippetEditor) {
+        DestroyWindow(hwndSnippetEditor);
+        hwndSnippetEditor = nullptr;
+    }
     if (hwndEditPaste) {
         DestroyWindow(hwndEditPaste);
         hwndEditPaste = nullptr;
@@ -2989,7 +2993,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             if (paneIsPinned)
                 hint = L"Tab \x2192 main  \x2022  Enter paste  \x2022  Ctrl+F search  \x2022  Esc close";
             else if (pSnippets)
-                hint = L"Enter paste  \x2022  Ctrl+Left clipboard  \x2022  Ctrl+F search  \x2022  Esc close";
+                hint = L"Enter paste  \x2022  A add  \x2022  E edit  \x2022  Ctrl+Left clipboard  \x2022  Esc close";
             else
                 hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H smart  \x2022  E paste-edit  \x2022  X save-edit  \x2022  Esc";
             DrawTextW(hdc, hint, -1, &hintRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -3105,6 +3109,22 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 SendMessage(mgr->hwndSearch, EM_SETSEL, 0, -1);
             }
             return 0;
+        }
+        // Snippets mode: A = add snippet, E = edit selected (only when search box is not focused,
+        // so typing into search still works).
+        if (mgr->snippetsMode && !ctrlPressed && (wParam == 'A' || wParam == 'E')) {
+            HWND focusedWindow = GetFocus();
+            if (focusedWindow != mgr->hwndSearch) {
+                if (wParam == 'A') {
+                    mgr->ignoreNextSnippetShortcutChar = true;
+                    mgr->ShowSnippetEditorDialog(-1);
+                } else if (mgr->selectedIndex >= 0 &&
+                           mgr->selectedIndex < (int)mgr->filteredSnippetIndices.size()) {
+                    mgr->ignoreNextSnippetShortcutChar = true;
+                    mgr->ShowSnippetEditorDialog(mgr->filteredSnippetIndices[mgr->selectedIndex]);
+                }
+                return 0;
+            }
         }
         // Smart paste one-key modes + edit (clipboard mode, no Ctrl).
         // U = clean URL, M = Markdown link, P = file path, H = HTML->plain,
@@ -3330,6 +3350,13 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 return 0;  // Consume the second 's' from "ss" - don't add to search
             }
             mgr->ignoreNextSChar = false;
+            // A/E were handled as shortcuts in WM_KEYDOWN — don't leak them into search.
+            if (mgr->ignoreNextSnippetShortcutChar &&
+                (wParam == 'a' || wParam == 'A' || wParam == 'e' || wParam == 'E')) {
+                mgr->ignoreNextSnippetShortcutChar = false;
+                return 0;
+            }
+            mgr->ignoreNextSnippetShortcutChar = false;
             HWND focusedWindow = GetFocus();
             if (focusedWindow != mgr->hwndSearch) {
                 SetFocus(mgr->hwndSearch);
@@ -3580,10 +3607,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             if (mgr->snippetsMode) {
                 if (clickedItemIndex >= 0 && clickedItemIndex < listSize) {
                     AppendMenu(hMenu, MF_STRING, 102, L"Paste");
+                    AppendMenu(hMenu, MF_STRING, 107, L"Edit Snippet...\tE");
                     AppendMenu(hMenu, MF_STRING, 105, L"Delete Snippet");
                     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
                 }
-                AppendMenu(hMenu, MF_STRING, 104, L"Add Snippet...");
+                AppendMenu(hMenu, MF_STRING, 104, L"Add Snippet...\tA");
                 AppendMenu(hMenu, MF_STRING, 103, L"Manage Snippets...");
             } else {
             bool isText = false;
@@ -3683,7 +3711,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             } else if (cmd == 103 && mgr->snippetsMode) {
                 mgr->ShowSnippetsManagerDialog();
             } else if (cmd == 104 && mgr->snippetsMode) {
-                mgr->ShowSnippetsManagerDialog();
+                mgr->ShowSnippetEditorDialog(-1);
+            } else if (cmd == 107 && clickedItemIndex >= 0 && clickedItemIndex < listSize && mgr->snippetsMode) {
+                mgr->selectedIndex = clickedItemIndex;
+                mgr->ShowSnippetEditorDialog(mgr->filteredSnippetIndices[clickedItemIndex]);
             } else if (cmd == 105 && clickedItemIndex >= 0 && clickedItemIndex < listSize && mgr->snippetsMode) {
                 int actualIdx = mgr->filteredSnippetIndices[clickedItemIndex];
                 if (actualIdx >= 0 && actualIdx < (int)mgr->snippets.size()) {
@@ -7688,6 +7719,217 @@ LRESULT CALLBACK ClipboardManager::EditPasteEditProc(HWND hwnd, UINT uMsg, WPARA
     }
     if (g_editPasteOrigEditProc)
         return CallWindowProc(g_editPasteOrigEditProc, hwnd, uMsg, wParam, lParam);
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+// ======================= Quick add / edit snippet popup =====================
+
+static WNDPROC g_snippetEditorOrigNameProc = nullptr;
+static WNDPROC g_snippetEditorOrigContentProc = nullptr;
+static const int IDC_SNIPEDIT_NAME = 2101;
+static const int IDC_SNIPEDIT_CONTENT = 2102;
+static const int IDC_SNIPEDIT_SAVE = 2103;
+static const int IDC_SNIPEDIT_CANCEL = 2104;
+
+static void ReadRichEditSnippetContent(HWND hContent, std::wstring& content, std::wstring& contentPlain) {
+    content.clear();
+    contentPlain.clear();
+    if (!hContent) return;
+    std::string rtfOut;
+    StreamCookie cookie = { nullptr, 0, 0, &rtfOut };
+    EDITSTREAM es = { (DWORD_PTR)&cookie, 0, RichEditStreamOutCallback };
+    SendMessage(hContent, EM_STREAMOUT, SF_RTF, (LPARAM)&es);
+    if (!rtfOut.empty() && rtfOut.size() >= 5 && rtfOut[0] == '{' && rtfOut[1] == '\\' &&
+        (rtfOut[2] == 'r' || rtfOut[2] == 'R')) {
+        content.resize(rtfOut.size());
+        for (size_t j = 0; j < rtfOut.size(); j++) content[j] = (wchar_t)(unsigned char)rtfOut[j];
+        wchar_t plainBuf[32768];
+        GetWindowTextW(hContent, plainBuf, 32768);
+        contentPlain = plainBuf;
+    } else {
+        wchar_t contentBuf[32768];
+        GetWindowTextW(hContent, contentBuf, 32768);
+        content = contentBuf;
+    }
+}
+
+void ClipboardManager::ShowSnippetEditorDialog(int editIndex) {
+    if (hwndSnippetEditor && IsWindow(hwndSnippetEditor)) {
+        SetForegroundWindow(hwndSnippetEditor);
+        return;
+    }
+    if (!snippetsMode) return;
+    if (editIndex >= 0 && editIndex >= (int)snippets.size()) return;
+
+    snippetEditorEditIndex = editIndex;
+    HideListWindow();
+
+    static bool msfteditLoaded = false;
+    if (!msfteditLoaded) {
+        LoadLibraryW(L"Msftedit.dll");
+        msfteditLoaded = true;
+    }
+    static bool classRegistered = false;
+    if (!classRegistered) {
+        WNDCLASS wc = {};
+        wc.lpfnWndProc = SnippetEditorDialogProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.lpszClassName = L"Clip2SnippetEditorClass";
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClass(&wc);
+        classRegistered = true;
+    }
+
+    const bool isEdit = (editIndex >= 0);
+    const int W = 520, H = 400;
+    RECT screenRect;
+    GetWindowRect(GetDesktopWindow(), &screenRect);
+    int x = (screenRect.right - W) / 2;
+    int y = (screenRect.bottom - H) / 3;
+    hwndSnippetEditor = CreateWindowExW(WS_EX_TOPMOST, L"Clip2SnippetEditorClass",
+        isEdit ? L"clip2 - Edit Snippet" : L"clip2 - Add Snippet",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, hwndMain, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!hwndSnippetEditor) return;
+
+    RECT rc;
+    GetClientRect(hwndSnippetEditor, &rc);
+    CreateWindowExW(0, L"STATIC", L"Name:", WS_CHILD | WS_VISIBLE,
+        12, 12, rc.right - 24, 18, hwndSnippetEditor, nullptr, GetModuleHandle(nullptr), nullptr);
+    HWND hName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        12, 32, rc.right - 24, 24,
+        hwndSnippetEditor, (HMENU)(INT_PTR)IDC_SNIPEDIT_NAME, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"STATIC", L"Content:", WS_CHILD | WS_VISIBLE,
+        12, 64, rc.right - 24, 18, hwndSnippetEditor, nullptr, GetModuleHandle(nullptr), nullptr);
+    HWND hContent = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_NOOLEDRAGDROP | ES_WANTRETURN,
+        12, 84, rc.right - 24, rc.bottom - 160,
+        hwndSnippetEditor, (HMENU)(INT_PTR)IDC_SNIPEDIT_CONTENT, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        rc.right - 180, rc.bottom - 66, 80, 28,
+        hwndSnippetEditor, (HMENU)(INT_PTR)IDC_SNIPEDIT_SAVE, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        rc.right - 90, rc.bottom - 66, 80, 28,
+        hwndSnippetEditor, (HMENU)(INT_PTR)IDC_SNIPEDIT_CANCEL, GetModuleHandle(nullptr), nullptr);
+    CreateWindowExW(0, L"STATIC", L"Ctrl+Enter = save  \x2022  Esc = cancel",
+        WS_CHILD | WS_VISIBLE, 12, rc.bottom - 26, rc.right - 24, 18,
+        hwndSnippetEditor, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    HFONT guiFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    EnumChildWindows(hwndSnippetEditor, [](HWND child, LPARAM font) -> BOOL {
+        SendMessage(child, WM_SETFONT, (WPARAM)font, TRUE);
+        return TRUE;
+    }, (LPARAM)guiFont);
+
+    if (isEdit) {
+        const Snippet& s = snippets[editIndex];
+        if (hName) SetWindowTextW(hName, s.name.c_str());
+        if (hContent) {
+            if (IsRtfContent(s.content)) {
+                std::string rtfBytes;
+                for (wchar_t wc : s.content) rtfBytes += (char)(wc & 0xFF);
+                StreamCookie cookie = { rtfBytes.c_str(), 0, rtfBytes.size(), nullptr };
+                EDITSTREAM es = { (DWORD_PTR)&cookie, 0, RichEditStreamInCallback };
+                SendMessage(hContent, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+            } else {
+                SetWindowTextW(hContent, s.content.c_str());
+            }
+        }
+    }
+
+    if (hName) {
+        g_snippetEditorOrigNameProc = (WNDPROC)SetWindowLongPtr(hName, GWLP_WNDPROC, (LONG_PTR)SnippetEditorEditProc);
+    }
+    if (hContent) {
+        g_snippetEditorOrigContentProc = (WNDPROC)SetWindowLongPtr(hContent, GWLP_WNDPROC, (LONG_PTR)SnippetEditorEditProc);
+    }
+
+    ShowWindow(hwndSnippetEditor, SW_SHOW);
+    SetForegroundWindow(hwndSnippetEditor);
+    if (hName) {
+        SetFocus(hName);
+        SendMessage(hName, EM_SETSEL, 0, -1);
+    }
+}
+
+LRESULT CALLBACK ClipboardManager::SnippetEditorDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    ClipboardManager* mgr = instance;
+    if (!mgr) return DefWindowProc(hwnd, uMsg, wParam, lParam);
+
+    switch (uMsg) {
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_SNIPEDIT_SAVE) {
+            wchar_t nameBuf[256] = {};
+            GetDlgItemTextW(hwnd, IDC_SNIPEDIT_NAME, nameBuf, 256);
+            if (!nameBuf[0]) {
+                MessageBoxW(hwnd, L"Please enter a snippet name.", L"clip2 Snippets", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            if (_wcsicmp(nameBuf, L"*set") == 0) {
+                MessageBoxW(hwnd, L"Cannot use '*set' as snippet name (reserved).", L"clip2 Snippets", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            std::wstring content, contentPlain;
+            ReadRichEditSnippetContent(GetDlgItem(hwnd, IDC_SNIPEDIT_CONTENT), content, contentPlain);
+
+            const int editIdx = mgr->snippetEditorEditIndex;
+            if (editIdx >= 0 && editIdx < (int)mgr->snippets.size()) {
+                mgr->snippets[editIdx].name = nameBuf;
+                mgr->snippets[editIdx].content = content;
+                mgr->snippets[editIdx].contentPlain = contentPlain;
+            } else {
+                Snippet s;
+                s.name = nameBuf;
+                s.content = content;
+                s.contentPlain = contentPlain;
+                mgr->snippets.push_back(s);
+            }
+            mgr->SaveSnippets();
+            DestroyWindow(hwnd);
+            mgr->ShowListWindow(true);  // reopen in snippets mode
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_SNIPEDIT_CANCEL) {
+            DestroyWindow(hwnd);
+            mgr->ShowListWindow(true);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        if (mgr) mgr->ShowListWindow(true);
+        return 0;
+    case WM_DESTROY:
+        if (mgr->hwndSnippetEditor == hwnd) {
+            mgr->hwndSnippetEditor = nullptr;
+            mgr->snippetEditorEditIndex = -1;
+        }
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+LRESULT CALLBACK ClipboardManager::SnippetEditorEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    const int ctrlId = GetDlgCtrlID(hwnd);
+    WNDPROC orig = (ctrlId == IDC_SNIPEDIT_NAME) ? g_snippetEditorOrigNameProc : g_snippetEditorOrigContentProc;
+    if (uMsg == WM_KEYDOWN) {
+        // Name: Enter saves. Content: Ctrl+Enter saves (Enter inserts a newline). Esc always cancels.
+        const bool saveKey = (wParam == VK_RETURN) &&
+            (ctrlId == IDC_SNIPEDIT_NAME || (GetAsyncKeyState(VK_CONTROL) & 0x8000));
+        if (saveKey) {
+            HWND parent = GetParent(hwnd);
+            if (parent) PostMessage(parent, WM_COMMAND, MAKEWPARAM(IDC_SNIPEDIT_SAVE, BN_CLICKED), 0);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            HWND parent = GetParent(hwnd);
+            if (parent) PostMessage(parent, WM_CLOSE, 0, 0);
+            return 0;
+        }
+    }
+    if (orig) return CallWindowProc(orig, hwnd, uMsg, wParam, lParam);
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
