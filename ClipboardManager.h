@@ -216,6 +216,8 @@ private:
     int GetItemAtPosition(int x, int y);
     void PasteItem(int index);
     void PasteMultipleItems();
+    // Merge the current multi-selection into one new history item at the top (keeps RTF/HTML).
+    void MergeSelectedItems();
     // Smart paste: put a derived plain-text payload on the clipboard and Ctrl+V it.
     void PasteTransformedText(const std::wstring& text);
     // One-key smart paste modes (SMART_PASTE_*). Returns false (silently) when not applicable.
@@ -392,7 +394,8 @@ private:
         SMART_PASTE_FILEPATH = 122,    // P: paste as file path(s)
         SMART_PASTE_HTML_PLAIN = 123,  // H: HTML -> plain text, paste
         SMART_PASTE_EDIT = 124,        // E: edit/merge before paste (menu entry)
-        SMART_PASTE_EDIT_SAVE = 125    // X: edit and save as a new history item
+        SMART_PASTE_EDIT_SAVE = 125,   // X: edit and save as a new history item
+        SMART_MERGE_SELECTION = 126    // M (with multi-select): merge into new top item
     };
 };
 

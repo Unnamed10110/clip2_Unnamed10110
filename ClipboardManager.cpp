@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <shlobj.h>
@@ -1829,7 +1830,7 @@ static std::string RtfBytesFromStoredWide(const std::wstring& packed) {
     return out;
 }
 
-// True when an item carries text/RTF (anything we can combine into a single paste payload).
+// True when an item carries ONLY text/RTF/HTML (no images/files/etc.).
 static bool ItemHasOnlyTextFormats(const ClipboardItem* item) {
     if (!item) return false;
     UINT rtf = CfRtf();
@@ -1850,6 +1851,23 @@ static std::wstring TrimTrailingForMultiPasteJoin(std::wstring s) {
     while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n' || s.back() == L' ' || s.back() == L'\t'))
         s.pop_back();
     return s;
+}
+
+// True when an item has pasteable text content. Ignores extra private formats that browsers
+// and Office apps attach (those used to make ItemHasOnlyTextFormats fail and break merge /
+// multi-paste). Images/files with no text return false.
+static bool ItemHasPasteableText(const ClipboardItem* item) {
+    if (!item) return false;
+    if (!TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(item)).empty())
+        return true;
+    const std::vector<BYTE>* htmlData = item->GetFormatData(CfHtml());
+    if (htmlData && !htmlData->empty()) return true;
+    UINT rtf = CfRtf();
+    if (rtf) {
+        const std::vector<BYTE>* rtfData = item->GetFormatData(rtf);
+        if (rtfData && rtfData->size() >= 5) return true;
+    }
+    return false;
 }
 
 // Build a minimal RTF document wrapping `text` as a single paragraph block. Used to seed
@@ -1893,6 +1911,216 @@ static bool SetClipboardTextPayload(HWND hwnd, const std::wstring& text, bool in
             if (!rtf.empty())
                 PutBytesOnClipboard(cfRtf, rtf.data(), rtf.size() + 1);
         }
+    }
+    CloseClipboard();
+    return ok;
+}
+
+// Result of merging several text/RTF/HTML history items into one clipboard-shaped payload.
+struct MergedRichPayload {
+    std::wstring unicode;
+    std::string rtf;   // "Rich Text Format" bytes (may be empty)
+    std::string html;  // "HTML Format" clipboard descriptor (may be empty)
+};
+
+// Build a CF "HTML Format" descriptor around an HTML fragment (UTF-8).
+static std::string BuildHtmlClipboardFormat(const std::string& fragmentUtf8) {
+    const char* pre = "<html><body>\r\n<!--StartFragment-->";
+    const char* post = "<!--EndFragment-->\r\n</body></html>";
+    // Header placeholders use 10-digit offsets; compute after the header is known.
+    char header[256];
+    // First pass with zeros to measure header length, then fill real offsets.
+    snprintf(header, sizeof(header),
+             "Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n",
+             0, 0, 0, 0);
+    int headerLen = (int)strlen(header);
+    int startHtml = headerLen;
+    int startFrag = headerLen + (int)strlen(pre);
+    int endFrag = startFrag + (int)fragmentUtf8.size();
+    int endHtml = endFrag + (int)strlen(post);
+    snprintf(header, sizeof(header),
+             "Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n",
+             startHtml, endHtml, startFrag, endFrag);
+    std::string out;
+    out.reserve((size_t)endHtml + 1);
+    out += header;
+    out += pre;
+    out += fragmentUtf8;
+    out += post;
+    return out;
+}
+
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// Convert stored CF HTML Format bytes to a UTF-8 fragment suitable for concatenation.
+static std::string HtmlFragmentUtf8FromItem(const ClipboardItem* item) {
+    if (!item) return {};
+    const std::vector<BYTE>* htmlData = item->GetFormatData(CfHtml());
+    if (!htmlData || htmlData->empty()) return {};
+    std::wstring frag = ExtractHtmlFragment(*htmlData);
+    return WideToUtf8(frag);
+}
+
+static void EnsureMsftEditLoaded() {
+    static bool loaded = false;
+    if (!loaded) {
+        LoadLibraryW(L"Msftedit.dll");
+        loaded = true;
+    }
+}
+
+// Merge RTF from multiple history items through a hidden RichEdit so font/color tables
+// and character formatting (bold, italic, colors, etc.) survive concatenation. Inserts a
+// real paragraph between items. Returns empty string on failure.
+static std::string MergeRtfViaRichEdit(const std::vector<const ClipboardItem*>& items) {
+    if (items.empty()) return {};
+    EnsureMsftEditLoaded();
+    HWND hRe = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
+        ES_MULTILINE | ES_AUTOVSCROLL, 0, 0, 200, 200,
+        HWND_MESSAGE, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!hRe) return {};
+
+    UINT cfRtf = CfRtf();
+    bool anyContent = false;
+    for (size_t i = 0; i < items.size(); i++) {
+        const ClipboardItem* it = items[i];
+        if (!it) continue;
+
+        CHARRANGE endCr = { -1, -1 };
+        SendMessageW(hRe, EM_EXSETSEL, 0, (LPARAM)&endCr);
+
+        bool streamed = false;
+        const std::vector<BYTE>* rtfData = (cfRtf != 0) ? it->GetFormatData(cfRtf) : nullptr;
+        if (rtfData && rtfData->size() >= 5) {
+            size_t sz = rtfData->size();
+            while (sz > 0 && rtfData->data()[sz - 1] == 0) sz--;
+            StreamCookie cookie = { (const char*)rtfData->data(), 0, sz, nullptr };
+            EDITSTREAM es = { (DWORD_PTR)&cookie, 0, RichEditStreamInCallback };
+            // SFF_SELECTION inserts at the caret; RichEdit merges font/color tables.
+            LRESULT n = SendMessageW(hRe, EM_STREAMIN, SF_RTF | SFF_SELECTION, (LPARAM)&es);
+            streamed = (n > 0);
+        }
+        if (!streamed) {
+            std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it));
+            if (t.empty()) {
+                const std::vector<BYTE>* htmlData = it->GetFormatData(CfHtml());
+                if (htmlData) t = TrimTrailingForMultiPasteJoin(HtmlToPlainText(ExtractHtmlFragment(*htmlData)));
+            }
+            if (!t.empty()) {
+                SendMessageW(hRe, EM_REPLACESEL, FALSE, (LPARAM)t.c_str());
+                streamed = true;
+            }
+        }
+        if (streamed) anyContent = true;
+
+        // Paragraph between items (RichEdit treats \r as a paragraph mark — not an Enter key).
+        if (streamed && i + 1 < items.size()) {
+            CHARRANGE end2 = { -1, -1 };
+            SendMessageW(hRe, EM_EXSETSEL, 0, (LPARAM)&end2);
+            SendMessageW(hRe, EM_REPLACESEL, FALSE, (LPARAM)L"\r");
+        }
+    }
+
+    std::string rtfOut;
+    if (anyContent) {
+        StreamCookie outCookie = { nullptr, 0, 0, &rtfOut };
+        EDITSTREAM esOut = { (DWORD_PTR)&outCookie, 0, RichEditStreamOutCallback };
+        SendMessageW(hRe, EM_STREAMOUT, SF_RTF, (LPARAM)&esOut);
+    }
+    DestroyWindow(hRe);
+    return rtfOut;
+}
+
+// Merge text-like history items into one Unicode + RTF + HTML payload.
+// Line breaks are embedded as \r\n / paragraph / <br> in the payload — never Enter keystrokes.
+// RTF is merged via RichEdit so original rich formatting is preserved.
+static bool MergeClipboardItemsRich(const std::vector<const ClipboardItem*>& items,
+                                    MergedRichPayload& out, bool plainOnly) {
+    out = {};
+    if (items.empty()) return false;
+
+    // Unicode join: one item per line, \r\n separators.
+    for (const ClipboardItem* it : items) {
+        if (!it) continue;
+        std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it));
+        if (t.empty()) {
+            const std::vector<BYTE>* htmlData = it->GetFormatData(CfHtml());
+            if (htmlData) t = TrimTrailingForMultiPasteJoin(HtmlToPlainText(ExtractHtmlFragment(*htmlData)));
+        }
+        if (t.empty()) continue;
+        if (!out.unicode.empty()) out.unicode += L"\r\n";
+        out.unicode += t;
+    }
+    if (out.unicode.empty()) return false;
+    if (plainOnly) return true;
+
+    // ---- RTF via RichEdit (preserves bold/colors/fonts from each item) ----
+    out.rtf = MergeRtfViaRichEdit(items);
+    if (out.rtf.empty())
+        out.rtf = BuildRtfWrapFromUnicode(out.unicode);
+
+    // ---- HTML: concatenate each item's fragment with <br> (keeps HTML formatting) ----
+    std::string htmlFrag;
+    bool anyHtml = false;
+    for (size_t i = 0; i < items.size(); i++) {
+        std::string frag = HtmlFragmentUtf8FromItem(items[i]);
+        if (frag.empty()) {
+            std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(items[i]));
+            if (t.empty()) continue;
+            std::string u8 = WideToUtf8(t);
+            for (char c : u8) {
+                if (c == '&') frag += "&amp;";
+                else if (c == '<') frag += "&lt;";
+                else if (c == '>') frag += "&gt;";
+                else if (c == '\n') frag += "<br>\r\n";
+                else if (c != '\r') frag += c;
+            }
+        } else {
+            anyHtml = true;
+        }
+        if (frag.empty()) continue;
+        if (!htmlFrag.empty()) htmlFrag += "<br>\r\n";
+        htmlFrag += frag;
+    }
+    if (htmlFrag.empty() && items.size() > 1) {
+        std::string u8 = WideToUtf8(out.unicode);
+        for (char c : u8) {
+            if (c == '&') htmlFrag += "&amp;";
+            else if (c == '<') htmlFrag += "&lt;";
+            else if (c == '>') htmlFrag += "&gt;";
+            else if (c == '\n') htmlFrag += "<br>\r\n";
+            else if (c != '\r') htmlFrag += c;
+        }
+    }
+    if (!htmlFrag.empty() && (anyHtml || items.size() > 1))
+        out.html = BuildHtmlClipboardFormat(htmlFrag);
+
+    return !out.unicode.empty();
+}
+
+// Put a merged rich payload on the clipboard (Unicode + optional RTF + optional HTML).
+static bool SetClipboardMergedRich(HWND hwnd, const MergedRichPayload& payload, bool includeRich) {
+    if (payload.unicode.empty()) return false;
+    if (!OpenClipboardWithRetry(hwnd, 30, 8)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    size_t bytes = (payload.unicode.size() + 1) * sizeof(wchar_t);
+    if (PutBytesOnClipboard(CF_UNICODETEXT, payload.unicode.c_str(), bytes))
+        ok = true;
+    if (includeRich && ok) {
+        UINT cfRtf = CfRtf();
+        if (cfRtf && !payload.rtf.empty())
+            PutBytesOnClipboard(cfRtf, payload.rtf.data(), payload.rtf.size() + 1);
+        UINT cfHtml = CfHtml();
+        if (cfHtml && !payload.html.empty())
+            PutBytesOnClipboard(cfHtml, payload.html.data(), payload.html.size() + 1);
     }
     CloseClipboard();
     return ok;
@@ -3080,7 +3308,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             else if (pSnippets)
                 hint = L"Enter paste  \x2022  A add  \x2022  E edit  \x2022  Ctrl+Left clipboard  \x2022  Esc close";
             else
-                hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H smart  \x2022  E paste-edit  \x2022  X save-edit  \x2022  Esc";
+                hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H  \x2022  M merge  \x2022  E/X edit  \x2022  Esc";
             DrawTextW(hdc, hint, -1, &hintRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(hdc, GetOverlayFont());
         }
@@ -3210,6 +3438,12 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 }
                 return 0;
             }
+        }
+        // M + multi-selection → merge into a new top item.
+        // Runs even if Ctrl is still held from Ctrl+Click multi-select (otherwise M never fires).
+        if (!mgr->snippetsMode && wParam == 'M' && mgr->multiSelectedIndices.size() >= 2) {
+            mgr->MergeSelectedItems();
+            return 0;
         }
         // Smart paste one-key modes + edit (clipboard mode, no Ctrl).
         // U = clean URL, M = Markdown link, P = file path, H = HTML->plain,
@@ -3755,6 +3989,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 AppendMenu(hMenu, MF_STRING | MF_POPUP, (UINT_PTR)hSmartMenu, L"Paste as");
                 AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT, L"Edit && Paste...\tE");
                 AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT_SAVE, L"Edit && Save as new...\tX");
+                if (mgr->multiSelectedIndices.size() >= 2)
+                    AppendMenu(hMenu, MF_STRING, SMART_MERGE_SELECTION, L"Merge selection into new item\tM");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
             
@@ -3827,6 +4063,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             } else if (cmd == SMART_PASTE_EDIT_SAVE && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->selectedIndex = clickedItemIndex;
                 mgr->ShowEditPasteDialog(/*saveAsNew=*/true);
+            } else if (cmd == SMART_MERGE_SELECTION && !mgr->snippetsMode) {
+                mgr->MergeSelectedItems();
             } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_PLAIN_TEXT && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->TransformTextItem(clickedItemIndex, cmd);
             }
@@ -4791,33 +5029,32 @@ bool ClipboardManager::SmartPasteItem(int filteredIndex, int mode) {
 void ClipboardManager::PasteMultipleItems() {
     if (multiSelectedIndices.empty()) return;
 
-    // Sort indices so pasting follows visible top-to-bottom order.
+    // Collect multi-selected history items in visible top-to-bottom order.
     std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
     std::sort(sortedIndices.begin(), sortedIndices.end());
-
     std::vector<const ClipboardItem*> selectedItems;
     selectedItems.reserve(sortedIndices.size());
     for (int filteredIndex : sortedIndices) {
         if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) continue;
         int actualIndex = filteredIndices[filteredIndex];
         if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
-        selectedItems.push_back(clipboardHistory[actualIndex].get());
+        if (clipboardHistory[actualIndex])
+            selectedItems.push_back(clipboardHistory[actualIndex].get());
     }
-
-    if (selectedItems.empty()) { ClearMultiSelection(); return; }
+    if (selectedItems.empty()) {
+        ClearMultiSelection();
+        return;
+    }
 
     // Ctrl+Enter forces plain text mode and skips RTF/HTML.
     bool pasteAsPlainText = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
-    // Fast path: every selected item has plain text we can read — combine into ONE clipboard
-    // payload with \r\n between items (line breaks live in the text, no Enter keystrokes).
-    // Extra non-text formats on an item are ignored; we paste the combined text only.
+    // Fast path: every selected item has pasteable text — join with \r\n into ONE clipboard
+    // payload (line breaks live in the text; no Enter keystrokes) and paste once.
+    // Extra private formats on an item are ignored; we only need text/RTF/HTML content.
     bool fastPath = true;
     for (const ClipboardItem* it : selectedItems) {
-        if (!it || TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it)).empty()) {
-            fastPath = false;
-            break;
-        }
+        if (!ItemHasPasteableText(it)) { fastPath = false; break; }
     }
 
     isPasting = true;
@@ -4837,24 +5074,36 @@ void ClipboardManager::PasteMultipleItems() {
     }
 
     if (fastPath) {
-        // ---- FAST PATH: one clipboard payload, one Ctrl+V ----
-        std::wstring combined;
-        for (const ClipboardItem* it : selectedItems) {
-            if (!it) continue;
-            std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it));
-            if (t.empty()) continue;
-            if (!combined.empty()) combined += L"\r\n";
-            combined += t;
+        // ---- FAST PATH: one rich payload (Unicode + RTF + HTML), one Ctrl+V ----
+        // RTF is merged via RichEdit so each item's bold/colors/fonts survive; line breaks
+        // are \r\n / \par / <br> in the payload (no Enter keystroke).
+        MergedRichPayload merged;
+        if (!MergeClipboardItemsRich(selectedItems, merged, pasteAsPlainText) ||
+            merged.unicode.empty()) {
+            RestoreClipboardSerialFormats(hwndMain, backup);
+            isPasting = false;
+            ClearMultiSelection();
+            return;
         }
-
-        if (combined.empty() || !SetClipboardTextPayload(hwndMain, combined, !pasteAsPlainText)) {
+        // Guarantee line breaks in Unicode without destroying rich RTF/HTML.
+        if (merged.unicode.find(L'\n') == std::wstring::npos && selectedItems.size() > 1) {
+            std::wstring fixed;
+            for (const ClipboardItem* it : selectedItems) {
+                std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it));
+                if (t.empty()) continue;
+                if (!fixed.empty()) fixed += L"\r\n";
+                fixed += t;
+            }
+            if (!fixed.empty()) merged.unicode = fixed;
+        }
+        if (!SetClipboardMergedRich(hwndMain, merged, !pasteAsPlainText)) {
             RestoreClipboardSerialFormats(hwndMain, backup);
             isPasting = false;
             ClearMultiSelection();
             return;
         }
 
-        lastPastedText = combined;
+        lastPastedText = merged.unicode;
         lastSequenceNumber = GetClipboardSequenceNumber();
         Sleep(30);
         SendCtrlV();
@@ -4897,11 +5146,35 @@ void ClipboardManager::PasteMultipleItems() {
         waitForClipboardReady();
 
         bool clipboardSet = false;
-        if (!plainText.empty() && ItemHasOnlyTextFormats(item)) {
-            clipboardSet = SetClipboardTextPayload(hwndMain, plainText, !pasteAsPlainText);
+        if (!pasteAsPlainText && ItemHasPasteableText(item)) {
+            // Preserve this item's original RTF/HTML; append a trailing paragraph when more follow.
+            MergedRichPayload one;
+            std::vector<const ClipboardItem*> oneVec = { item };
+            if (MergeClipboardItemsRich(oneVec, one, /*plainOnly=*/false)) {
+                if (moreItemsFollow) {
+                    if (!one.unicode.empty() && one.unicode.back() != L'\n')
+                        one.unicode += L"\r\n";
+                    if (!one.rtf.empty()) {
+                        size_t close = one.rtf.rfind('}');
+                        if (close != std::string::npos)
+                            one.rtf.insert(close, "\\par\n");
+                    }
+                    if (!one.html.empty()) {
+                        // Trailing <br> so the next paste starts on a new line in HTML targets.
+                        size_t fragEnd = one.html.rfind("<!--EndFragment-->");
+                        if (fragEnd != std::string::npos)
+                            one.html.insert(fragEnd, "<br>\r\n");
+                    }
+                }
+                clipboardSet = SetClipboardMergedRich(hwndMain, one, /*includeRich=*/true);
+            }
+            if (!clipboardSet)
+                clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
         } else if (!pasteAsPlainText && !item->formats.empty()) {
             clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
         }
+        if (!clipboardSet && !plainText.empty())
+            clipboardSet = SetClipboardTextPayload(hwndMain, plainText, !pasteAsPlainText);
         if (!clipboardSet && !plainText.empty())
             clipboardSet = SetClipboardUnicodeOnly(hwndMain, plainText);
         if (!clipboardSet) continue;
@@ -4918,6 +5191,18 @@ void ClipboardManager::PasteMultipleItems() {
         Sleep(20);
         SendCtrlV();
         Sleep(kAfterItemMs);
+
+        // After a non-text item (image/file), paste a clipboard \r\n so the next item
+        // starts on a new line — still no Enter keystroke.
+        if (moreItemsFollow && !ItemHasPasteableText(item)) {
+            waitForClipboardReady();
+            if (SetClipboardUnicodeOnly(hwndMain, L"\r\n")) {
+                lastSequenceNumber = GetClipboardSequenceNumber();
+                Sleep(20);
+                SendCtrlV();
+                Sleep(kAfterItemMs);
+            }
+        }
     }
 
     Sleep(kTailBeforeRestore);
@@ -4930,6 +5215,89 @@ void ClipboardManager::PasteMultipleItems() {
     isPasting = false;
     ClearMultiSelection();
     PlayClickSound();
+}
+
+// Merge the multi-selected items into a single new history entry at the top,
+// preserving Unicode + original RTF/HTML formatting. Original items are left untouched.
+void ClipboardManager::MergeSelectedItems() {
+    if (multiSelectedIndices.size() < 2) return;
+
+    std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
+    std::sort(sortedIndices.begin(), sortedIndices.end());
+    std::vector<const ClipboardItem*> selectedItems;
+    selectedItems.reserve(sortedIndices.size());
+    for (int filteredIndex : sortedIndices) {
+        if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) continue;
+        int actualIndex = filteredIndices[filteredIndex];
+        if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
+        if (!clipboardHistory[actualIndex]) continue;
+        // Skip non-text items (images/files); merge the pasteable text ones.
+        // Do NOT require ItemHasOnlyTextFormats — browsers/Office attach private formats.
+        if (!ItemHasPasteableText(clipboardHistory[actualIndex].get())) continue;
+        selectedItems.push_back(clipboardHistory[actualIndex].get());
+    }
+    if (selectedItems.size() < 2) return;
+
+    MergedRichPayload merged;
+    if (!MergeClipboardItemsRich(selectedItems, merged, /*plainOnly=*/false)) return;
+    // Hard guarantee: one item per line in the stored unicode body (don't touch rich RTF).
+    if (merged.unicode.find(L'\n') == std::wstring::npos) {
+        std::wstring fixed;
+        for (const ClipboardItem* it : selectedItems) {
+            std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it));
+            if (t.empty()) continue;
+            if (!fixed.empty()) fixed += L"\r\n";
+            fixed += t;
+        }
+        if (!fixed.empty()) merged.unicode = fixed;
+        if (merged.rtf.empty())
+            merged.rtf = BuildRtfWrapFromUnicode(merged.unicode);
+    }
+    if (merged.unicode.empty()) return;
+
+    try {
+        size_t uniBytes = (merged.unicode.size() + 1) * sizeof(wchar_t);
+        std::vector<BYTE> uniData(uniBytes);
+        memcpy(uniData.data(), merged.unicode.c_str(), uniBytes);
+        auto item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, uniData);
+        if (!item) return;
+        item->pinned = false;  // merge creates a normal history entry, never a pinned one
+
+        UINT cfRtf = CfRtf();
+        if (cfRtf && !merged.rtf.empty()) {
+            std::vector<BYTE> rtfData(merged.rtf.begin(), merged.rtf.end());
+            rtfData.push_back(0);
+            item->AddFormat(cfRtf, rtfData);
+        }
+        UINT cfHtml = CfHtml();
+        if (cfHtml && !merged.html.empty()) {
+            std::vector<BYTE> htmlData(merged.html.begin(), merged.html.end());
+            htmlData.push_back(0);
+            item->AddFormat(cfHtml, htmlData);
+        }
+
+        // Also publish to the system clipboard so the merge is immediately pasteable.
+        isPasting = true;
+        SetClipboardMergedRich(hwndMain, merged, /*includeRich=*/true);
+        lastPastedText = merged.unicode;
+        lastSequenceNumber = GetClipboardSequenceNumber();
+
+        clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
+        TrimHistory();
+        MarkHistoryDirty();
+        ClearMultiSelection();
+        numberInput.clear();
+        // Show on the main (unpinned) list so the new entry is visible immediately.
+        if (activeIsPinned) SwitchActivePane(false, /*focusListWindow=*/true);
+        else FilterItems();
+        UpdateListWindow();
+        PlayClickSound();
+
+        Sleep(80);
+        isPasting = false;
+    } catch (...) {
+        isPasting = false;
+    }
 }
 
 void ClipboardManager::ToggleMultiSelect(int filteredIndex) {
