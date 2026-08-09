@@ -1752,6 +1752,20 @@ static void SendCtrlKey(WORD vk) {
 static void SendCtrlC() { SendCtrlKey('C'); }
 static void SendCtrlA() { SendCtrlKey('A'); }
 
+// Plain key tap (down + up) in one SendInput batch. Used by the Excel paste flow
+// to advance the active cell with a real Enter keystroke between item pastes.
+static void SendVkTap(WORD vk) {
+    INPUT in[2] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = vk;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = vk;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+}
+
+static void SendEnterKey() { SendVkTap(VK_RETURN); }
+
 // Read plain text from the clipboard (CF_UNICODETEXT, falling back to CF_TEXT).
 // Returns empty string when no text is available.
 static std::wstring ReadClipboardUnicodeText(HWND hwnd) {
@@ -3308,7 +3322,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             else if (pSnippets)
                 hint = L"Enter paste  \x2022  A add  \x2022  E edit  \x2022  Ctrl+Left clipboard  \x2022  Esc close";
             else
-                hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H  \x2022  M merge  \x2022  E/X edit  \x2022  Esc";
+                hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H  \x2022  M merge  \x2022  Z excel  \x2022  E/X edit  \x2022  Esc";
             DrawTextW(hdc, hint, -1, &hintRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(hdc, GetOverlayFont());
         }
@@ -3443,6 +3457,13 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         // Runs even if Ctrl is still held from Ctrl+Click multi-select (otherwise M never fires).
         if (!mgr->snippetsMode && wParam == 'M' && mgr->multiSelectedIndices.size() >= 2) {
             mgr->MergeSelectedItems();
+            return 0;
+        }
+        // Z + multi-selection → Excel special paste: each item rich into its own cell,
+        // Enter between items. Also runs with Ctrl still held from Ctrl+Click multi-select.
+        if (!mgr->snippetsMode && wParam == 'Z' && mgr->multiSelectedIndices.size() >= 2) {
+            mgr->PasteExcelSelection();
+            mgr->HideListWindow();
             return 0;
         }
         // Smart paste one-key modes + edit (clipboard mode, no Ctrl).
@@ -3989,8 +4010,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 AppendMenu(hMenu, MF_STRING | MF_POPUP, (UINT_PTR)hSmartMenu, L"Paste as");
                 AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT, L"Edit && Paste...\tE");
                 AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT_SAVE, L"Edit && Save as new...\tX");
-                if (mgr->multiSelectedIndices.size() >= 2)
+                if (mgr->multiSelectedIndices.size() >= 2) {
                     AppendMenu(hMenu, MF_STRING, SMART_MERGE_SELECTION, L"Merge selection into new item\tM");
+                    AppendMenu(hMenu, MF_STRING, SMART_PASTE_EXCEL, L"Paste into Excel (Enter between)\tZ");
+                }
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
             
@@ -4065,6 +4088,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 mgr->ShowEditPasteDialog(/*saveAsNew=*/true);
             } else if (cmd == SMART_MERGE_SELECTION && !mgr->snippetsMode) {
                 mgr->MergeSelectedItems();
+            } else if (cmd == SMART_PASTE_EXCEL && !mgr->snippetsMode) {
+                mgr->PasteExcelSelection();
+                mgr->HideListWindow();
             } else if (cmd >= TRANSFORM_UPPERCASE && cmd <= TRANSFORM_PLAIN_TEXT && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
                 mgr->TransformTextItem(clickedItemIndex, cmd);
             }
@@ -5210,6 +5236,110 @@ void ClipboardManager::PasteMultipleItems() {
     lastSequenceNumber = GetClipboardSequenceNumber();
     if (!pastedTextAggregate.empty())
         lastPastedText = pastedTextAggregate;
+
+    Sleep(80);
+    isPasting = false;
+    ClearMultiSelection();
+    PlayClickSound();
+}
+
+// Excel special paste (Z): each multi-selected item is restored to the clipboard with its
+// full rich formats and pasted with Ctrl+V, then a real Enter keystroke moves Excel's
+// active cell down before the next item. No merged payload, no embedded \r\n — navigation
+// is only the Enter key between pastes, and there is no Enter after the last item.
+void ClipboardManager::PasteExcelSelection() {
+    if (multiSelectedIndices.size() < 2) return;
+
+    // Collect multi-selected history items in visible top-to-bottom order.
+    std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
+    std::sort(sortedIndices.begin(), sortedIndices.end());
+    std::vector<const ClipboardItem*> selectedItems;
+    selectedItems.reserve(sortedIndices.size());
+    for (int filteredIndex : sortedIndices) {
+        if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) continue;
+        int actualIndex = filteredIndices[filteredIndex];
+        if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
+        if (clipboardHistory[actualIndex])
+            selectedItems.push_back(clipboardHistory[actualIndex].get());
+    }
+    if (selectedItems.size() < 2) {
+        ClearMultiSelection();
+        return;
+    }
+
+    isPasting = true;
+
+    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
+        SetForegroundWindow(previousFocusWindow);
+        SetFocus(previousFocusWindow);
+        Sleep(70);
+    }
+    ReleaseHotkeyModifiersForPaste();
+
+    std::map<UINT, std::vector<BYTE>> backup;
+    if (!BackupClipboardSerialFormats(hwndMain, backup)) {
+        isPasting = false;
+        ClearMultiSelection();
+        return;
+    }
+
+    auto waitForClipboardReady = [&]() {
+        for (int attempt = 0; attempt < 32; attempt++) {
+            if (OpenClipboard(hwndMain)) { CloseClipboard(); return true; }
+            Sleep(8);
+        }
+        return false;
+    };
+
+    std::wstring lastSegment;
+
+    for (size_t i = 0; i < selectedItems.size(); i++) {
+        const ClipboardItem* item = selectedItems[i];
+        if (!item) continue;
+
+        waitForClipboardReady();
+
+        // Prefer the item's original full rich formats; fall back to merged rich text,
+        // then Unicode-only so one bad item does not abort the whole run.
+        bool clipboardSet = false;
+        if (!item->formats.empty())
+            clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
+        if (!clipboardSet && ItemHasPasteableText(item)) {
+            MergedRichPayload one;
+            std::vector<const ClipboardItem*> oneVec = { item };
+            if (MergeClipboardItemsRich(oneVec, one, /*plainOnly=*/false))
+                clipboardSet = SetClipboardMergedRich(hwndMain, one, /*includeRich=*/true);
+        }
+        if (!clipboardSet) {
+            std::wstring plainText = GetPlainTextForDirectPaste(item);
+            if (!plainText.empty())
+                clipboardSet = SetClipboardUnicodeOnly(hwndMain, plainText);
+        }
+        if (!clipboardSet) continue;
+
+        {
+            std::wstring segment = GetPlainTextForDirectPaste(item);
+            if (!segment.empty()) lastSegment = segment;
+        }
+
+        lastSequenceNumber = GetClipboardSequenceNumber();
+        Sleep(20);
+        SendCtrlV();
+        Sleep(220);
+
+        // Enter moves Excel's active cell down; skip after the last item so focus
+        // stays on the last filled cell.
+        if (i + 1 < selectedItems.size()) {
+            SendEnterKey();
+            Sleep(100);
+        }
+    }
+
+    Sleep(200);
+    RestoreClipboardSerialFormats(hwndMain, backup);
+    lastSequenceNumber = GetClipboardSequenceNumber();
+    if (!lastSegment.empty())
+        lastPastedText = lastSegment;
 
     Sleep(80);
     isPasting = false;
