@@ -216,6 +216,9 @@ private:
     int GetItemAtPosition(int x, int y);
     void PasteItem(int index);
     void PasteMultipleItems();
+    // Excel special paste (Z): paste each multi-selected item rich, with an Enter
+    // keystroke between items so Excel's active cell moves down one row per item.
+    void PasteExcelSelection();
     // Merge the current multi-selection into one new history item at the top (keeps RTF/HTML).
     void MergeSelectedItems();
     // Smart paste: put a derived plain-text payload on the clipboard and Ctrl+V it.
@@ -395,7 +398,8 @@ private:
         SMART_PASTE_HTML_PLAIN = 123,  // H: HTML -> plain text, paste
         SMART_PASTE_EDIT = 124,        // E: edit/merge before paste (menu entry)
         SMART_PASTE_EDIT_SAVE = 125,   // X: edit and save as a new history item
-        SMART_MERGE_SELECTION = 126    // M (with multi-select): merge into new top item
+        SMART_MERGE_SELECTION = 126,   // M (with multi-select): merge into new top item
+        SMART_PASTE_EXCEL = 127        // Z (with multi-select): Excel cell fill, Enter between
     };
 };
 

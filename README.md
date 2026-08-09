@@ -21,11 +21,11 @@ That configures into `build/`, builds Release, and copies `clip2.exe` to the rep
 Or with CMake directly:
 
 ```bat
-mkdir build
-cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release
-```
+   mkdir build
+   cd build
+   cmake .. -G "Visual Studio 17 2022" -A x64
+   cmake --build . --config Release
+   ```
 
 Linked libraries include `user32`, `gdi32`, `shell32`, `winmm`, `comctl32`, `shlwapi`, `ole32`, `oleaut32`, `comdlg32`, `crypt32`, and Media Foundation (`mfplat`, `mf`, `mfreadwrite`, `mfuuid`) for the click sound. If the Windows SDK’s UIAutomation library is found, the build defines `HAVE_UIAUTOMATION` and enables **Copy from focused control**.
 
@@ -82,14 +82,16 @@ Hover an image/video for a larger preview. Row thumbnails load lazily when a row
 | **H** | Paste HTML as plain text |
 | **E** | Edit selection (or joined multi-selection), then paste — history unchanged |
 | **X** | Same editor; **Save** / **Ctrl+Enter** adds a **new** history item and updates the clipboard |
+| **Z** | **Excel cell fill (needs 2+ multi-selected items):** paste each item into its own cell with full rich formats, pressing **Enter** between items to move down one row (no Enter after the last) |
 
-Also available from the right-click menu (**Paste as…**, **Edit & Paste…**, **Edit & Save as new…**, **Merge selection into new item**). Modes that don’t apply fail silently.
+Also available from the right-click menu (**Paste as…**, **Edit & Paste…**, **Edit & Save as new…**, **Merge selection into new item**, **Paste into Excel**). Modes that don’t apply fail silently.
 
 ### Multi-paste & merge
 
 - Multi-select text/RTF/HTML items and press **Enter**: one clipboard payload with each item on its own line (`\r\n` / RTF paragraph / HTML `<br>`), formatting preserved via RichEdit merge, single Ctrl+V (no Enter keystrokes).
 - Mixed image/file selections paste sequentially, with line breaks inserted as clipboard text where needed.
 - **M** with 2+ selected items creates a new unpinned history entry at the top of the main list.
+- **Z** with 2+ selected items is the Excel special paste: items are pasted one by one (each with its original rich clipboard formats), with a real **Enter** keystroke between pastes so Excel's active cell moves down a row per item. Independent of Enter multi-paste — nothing is merged and no line breaks are embedded.
 
 ### Pinned items
 
