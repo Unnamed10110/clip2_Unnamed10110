@@ -3322,7 +3322,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             else if (pSnippets)
                 hint = L"Enter paste  \x2022  A add  \x2022  E edit  \x2022  Ctrl+Left clipboard  \x2022  Esc close";
             else
-                hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H  \x2022  M merge  \x2022  Z excel  \x2022  E/X edit  \x2022  Esc";
+                hint = L"Tab \x2192 pinned  \x2022  # + Enter  \x2022  U/M/P/H  \x2022  M merge  \x2022  P plain  \x2022  Z excel  \x2022  Esc";
             DrawTextW(hdc, hint, -1, &hintRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(hdc, GetOverlayFont());
         }
@@ -3456,7 +3456,14 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         // M + multi-selection → merge into a new top item.
         // Runs even if Ctrl is still held from Ctrl+Click multi-select (otherwise M never fires).
         if (!mgr->snippetsMode && wParam == 'M' && mgr->multiSelectedIndices.size() >= 2) {
-            mgr->MergeSelectedItems();
+            mgr->MergeSelectedItems(/*plainOnly=*/false);
+            return 0;
+        }
+        // P + multi-selection → paste as plain text and merge as plain text into the list.
+        // Same Ctrl-held rule as M/Z so Ctrl+Click multi-select still works.
+        if (!mgr->snippetsMode && wParam == 'P' && mgr->multiSelectedIndices.size() >= 2) {
+            mgr->PastePlainAndMergeSelection();
+            mgr->HideListWindow();
             return 0;
         }
         // Z + multi-selection → Excel special paste: each item rich into its own cell,
@@ -4012,6 +4019,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT_SAVE, L"Edit && Save as new...\tX");
                 if (mgr->multiSelectedIndices.size() >= 2) {
                     AppendMenu(hMenu, MF_STRING, SMART_MERGE_SELECTION, L"Merge selection into new item\tM");
+                    AppendMenu(hMenu, MF_STRING, SMART_PASTE_PLAIN_MERGE, L"Paste && merge as plain text\tP");
                     AppendMenu(hMenu, MF_STRING, SMART_PASTE_EXCEL, L"Paste into Excel (Enter between)\tZ");
                 }
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -4087,7 +4095,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 mgr->selectedIndex = clickedItemIndex;
                 mgr->ShowEditPasteDialog(/*saveAsNew=*/true);
             } else if (cmd == SMART_MERGE_SELECTION && !mgr->snippetsMode) {
-                mgr->MergeSelectedItems();
+                mgr->MergeSelectedItems(/*plainOnly=*/false);
+            } else if (cmd == SMART_PASTE_PLAIN_MERGE && !mgr->snippetsMode) {
+                mgr->PastePlainAndMergeSelection();
+                mgr->HideListWindow();
             } else if (cmd == SMART_PASTE_EXCEL && !mgr->snippetsMode) {
                 mgr->PasteExcelSelection();
                 mgr->HideListWindow();
@@ -5136,6 +5147,9 @@ void ClipboardManager::PasteMultipleItems() {
         Sleep(320);
         RestoreClipboardSerialFormats(hwndMain, backup);
         lastSequenceNumber = GetClipboardSequenceNumber();
+        // Multi-paste also becomes a new top history item (rich or plain matching the paste).
+        if (selectedItems.size() >= 2)
+            InsertMergedPayloadIntoHistory(merged, pasteAsPlainText);
         Sleep(70);
         isPasting = false;
         ClearMultiSelection();
@@ -5236,6 +5250,15 @@ void ClipboardManager::PasteMultipleItems() {
     lastSequenceNumber = GetClipboardSequenceNumber();
     if (!pastedTextAggregate.empty())
         lastPastedText = pastedTextAggregate;
+
+    // Mixed image/file multi-paste: still record the joined text body as a new history item
+    // when at least two text segments were involved.
+    if (selectedItems.size() >= 2 && !pastedTextAggregate.empty() &&
+        pastedTextAggregate.find(L'\n') != std::wstring::npos) {
+        MergedRichPayload textOnly;
+        textOnly.unicode = pastedTextAggregate;
+        InsertMergedPayloadIntoHistory(textOnly, /*plainOnly=*/true);
+    }
 
     Sleep(80);
     isPasting = false;
@@ -5347,9 +5370,51 @@ void ClipboardManager::PasteExcelSelection() {
     PlayClickSound();
 }
 
-// Merge the multi-selected items into a single new history entry at the top,
-// preserving Unicode + original RTF/HTML formatting. Original items are left untouched.
-void ClipboardManager::MergeSelectedItems() {
+// Insert a previously built merge payload as a new unpinned history item at the top.
+// Does not touch the system clipboard (callers that need clipboard publish do that separately).
+bool ClipboardManager::InsertMergedPayloadIntoHistory(const MergedRichPayload& merged, bool plainOnly) {
+    if (merged.unicode.empty()) return false;
+    try {
+        size_t uniBytes = (merged.unicode.size() + 1) * sizeof(wchar_t);
+        std::vector<BYTE> uniData(uniBytes);
+        memcpy(uniData.data(), merged.unicode.c_str(), uniBytes);
+        auto item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, uniData);
+        if (!item) return false;
+        item->pinned = false;
+
+        if (!plainOnly) {
+            UINT cfRtf = CfRtf();
+            if (cfRtf && !merged.rtf.empty()) {
+                std::vector<BYTE> rtfData(merged.rtf.begin(), merged.rtf.end());
+                rtfData.push_back(0);
+                item->AddFormat(cfRtf, rtfData);
+            }
+            UINT cfHtml = CfHtml();
+            if (cfHtml && !merged.html.empty()) {
+                std::vector<BYTE> htmlData(merged.html.begin(), merged.html.end());
+                htmlData.push_back(0);
+                item->AddFormat(cfHtml, htmlData);
+            }
+        }
+
+        clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
+        TrimHistory();
+        MarkHistoryDirty();
+        numberInput.clear();
+        if (listVisible) {
+            if (activeIsPinned) SwitchActivePane(false, /*focusListWindow=*/true);
+            else FilterItems();
+            UpdateListWindow();
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Merge the multi-selected items into a single new history entry at the top.
+// plainOnly=false keeps RTF/HTML; plainOnly=true stores Unicode text only.
+void ClipboardManager::MergeSelectedItems(bool plainOnly) {
     if (multiSelectedIndices.size() < 2) return;
 
     std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
@@ -5369,8 +5434,8 @@ void ClipboardManager::MergeSelectedItems() {
     if (selectedItems.size() < 2) return;
 
     MergedRichPayload merged;
-    if (!MergeClipboardItemsRich(selectedItems, merged, /*plainOnly=*/false)) return;
-    // Hard guarantee: one item per line in the stored unicode body (don't touch rich RTF).
+    if (!MergeClipboardItemsRich(selectedItems, merged, plainOnly)) return;
+    // Hard guarantee: one item per line in the stored unicode body.
     if (merged.unicode.find(L'\n') == std::wstring::npos) {
         std::wstring fixed;
         for (const ClipboardItem* it : selectedItems) {
@@ -5380,54 +5445,66 @@ void ClipboardManager::MergeSelectedItems() {
             fixed += t;
         }
         if (!fixed.empty()) merged.unicode = fixed;
-        if (merged.rtf.empty())
+        if (!plainOnly && merged.rtf.empty())
             merged.rtf = BuildRtfWrapFromUnicode(merged.unicode);
     }
     if (merged.unicode.empty()) return;
 
-    try {
-        size_t uniBytes = (merged.unicode.size() + 1) * sizeof(wchar_t);
-        std::vector<BYTE> uniData(uniBytes);
-        memcpy(uniData.data(), merged.unicode.c_str(), uniBytes);
-        auto item = std::make_unique<ClipboardItem>(CF_UNICODETEXT, uniData);
-        if (!item) return;
-        item->pinned = false;  // merge creates a normal history entry, never a pinned one
-
-        UINT cfRtf = CfRtf();
-        if (cfRtf && !merged.rtf.empty()) {
-            std::vector<BYTE> rtfData(merged.rtf.begin(), merged.rtf.end());
-            rtfData.push_back(0);
-            item->AddFormat(cfRtf, rtfData);
-        }
-        UINT cfHtml = CfHtml();
-        if (cfHtml && !merged.html.empty()) {
-            std::vector<BYTE> htmlData(merged.html.begin(), merged.html.end());
-            htmlData.push_back(0);
-            item->AddFormat(cfHtml, htmlData);
-        }
-
-        // Also publish to the system clipboard so the merge is immediately pasteable.
-        isPasting = true;
+    // Publish to the system clipboard so the merge is immediately pasteable.
+    isPasting = true;
+    if (plainOnly)
+        SetClipboardTextPayload(hwndMain, merged.unicode, /*includeRtf=*/false);
+    else
         SetClipboardMergedRich(hwndMain, merged, /*includeRich=*/true);
-        lastPastedText = merged.unicode;
-        lastSequenceNumber = GetClipboardSequenceNumber();
+    lastPastedText = merged.unicode;
+    lastSequenceNumber = GetClipboardSequenceNumber();
 
-        clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
-        TrimHistory();
-        MarkHistoryDirty();
-        ClearMultiSelection();
-        numberInput.clear();
-        // Show on the main (unpinned) list so the new entry is visible immediately.
-        if (activeIsPinned) SwitchActivePane(false, /*focusListWindow=*/true);
-        else FilterItems();
-        UpdateListWindow();
-        PlayClickSound();
+    InsertMergedPayloadIntoHistory(merged, plainOnly);
+    ClearMultiSelection();
+    PlayClickSound();
 
-        Sleep(80);
-        isPasting = false;
-    } catch (...) {
-        isPasting = false;
+    Sleep(80);
+    isPasting = false;
+}
+
+// P + multi-select: paste the selection as plain text (one line per item) and also
+// insert that same plain merged text as a new top history item.
+void ClipboardManager::PastePlainAndMergeSelection() {
+    if (multiSelectedIndices.size() < 2) return;
+
+    std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
+    std::sort(sortedIndices.begin(), sortedIndices.end());
+    std::vector<const ClipboardItem*> selectedItems;
+    selectedItems.reserve(sortedIndices.size());
+    for (int filteredIndex : sortedIndices) {
+        if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) continue;
+        int actualIndex = filteredIndices[filteredIndex];
+        if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
+        if (!clipboardHistory[actualIndex]) continue;
+        if (!ItemHasPasteableText(clipboardHistory[actualIndex].get())) continue;
+        selectedItems.push_back(clipboardHistory[actualIndex].get());
     }
+    if (selectedItems.size() < 2) return;
+
+    MergedRichPayload merged;
+    if (!MergeClipboardItemsRich(selectedItems, merged, /*plainOnly=*/true) || merged.unicode.empty())
+        return;
+    if (merged.unicode.find(L'\n') == std::wstring::npos) {
+        std::wstring fixed;
+        for (const ClipboardItem* it : selectedItems) {
+            std::wstring t = TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(it));
+            if (t.empty()) continue;
+            if (!fixed.empty()) fixed += L"\r\n";
+            fixed += t;
+        }
+        if (!fixed.empty()) merged.unicode = fixed;
+    }
+    if (merged.unicode.empty()) return;
+
+    PasteTransformedText(merged.unicode);
+    InsertMergedPayloadIntoHistory(merged, /*plainOnly=*/true);
+    ClearMultiSelection();
+    PlayClickSound();
 }
 
 void ClipboardManager::ToggleMultiSelect(int filteredIndex) {

@@ -161,6 +161,8 @@ private:
     HBITMAP CreateBitmapFromData();
 };
 
+struct MergedRichPayload;
+
 class ClipboardManager {
 public:
     ClipboardManager();
@@ -219,8 +221,15 @@ private:
     // Excel special paste (Z): paste each multi-selected item rich, with an Enter
     // keystroke between items so Excel's active cell moves down one row per item.
     void PasteExcelSelection();
-    // Merge the current multi-selection into one new history item at the top (keeps RTF/HTML).
-    void MergeSelectedItems();
+    // Merge the current multi-selection into one new history item at the top.
+    // plainOnly=false keeps RTF/HTML; plainOnly=true stores Unicode text only.
+    void MergeSelectedItems(bool plainOnly = false);
+    // P + multi-select: paste selection as plain text (one line per item) and also
+    // insert that plain merged text as a new top history item.
+    void PastePlainAndMergeSelection();
+    // Insert a previously built merge payload as a new unpinned history item at the top.
+    // Does not touch the system clipboard. Returns false if unicode is empty / insert fails.
+    bool InsertMergedPayloadIntoHistory(const MergedRichPayload& merged, bool plainOnly);
     // Smart paste: put a derived plain-text payload on the clipboard and Ctrl+V it.
     void PasteTransformedText(const std::wstring& text);
     // One-key smart paste modes (SMART_PASTE_*). Returns false (silently) when not applicable.
@@ -399,7 +408,8 @@ private:
         SMART_PASTE_EDIT = 124,        // E: edit/merge before paste (menu entry)
         SMART_PASTE_EDIT_SAVE = 125,   // X: edit and save as a new history item
         SMART_MERGE_SELECTION = 126,   // M (with multi-select): merge into new top item
-        SMART_PASTE_EXCEL = 127        // Z (with multi-select): Excel cell fill, Enter between
+        SMART_PASTE_EXCEL = 127,       // Z (with multi-select): Excel cell fill, Enter between
+        SMART_PASTE_PLAIN_MERGE = 128  // P (with multi-select): paste + merge as plain text
     };
 };
 
