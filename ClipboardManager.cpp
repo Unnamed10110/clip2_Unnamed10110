@@ -385,6 +385,19 @@ static int FuzzyScore(const std::wstring& needleLower, const std::wstring& hayst
 // negatives (missed matches).
 static const unsigned int kTrigramBloomBytes = 1024;
 
+// Companion gate for needles too short to have a trigram (1-2 chars). Without it those
+// needles bypassed the gate entirely and scored every item's full body -- i.e. the very
+// first character typed was the most expensive keystroke in the search. 256 bits over the
+// low plane, with every code point >= 256 folded into one catch-all bit, so like the
+// trigram filter it yields false positives but never false negatives.
+static const unsigned int kCharBloomBytes = 32;
+static const unsigned int kCharBloomOther = 255;  // catch-all slot for code points >= 256
+
+static inline unsigned int CharBloomBit(wchar_t c) {
+    unsigned int v = (unsigned int)c;
+    return v < 256u ? v : kCharBloomOther;
+}
+
 static inline unsigned int TrigramHashBit(wchar_t a, wchar_t b, wchar_t c) {
     unsigned int h = 2166136261u;
     h = (h ^ (unsigned int)a) * 16777619u;
@@ -404,14 +417,24 @@ void ClipboardItem::RebuildSearchIndex() {
         searchBodyLower.pop_back();
 
     trigramBloom.assign(kTrigramBloomBytes, 0);
+    charBloom.assign(kCharBloomBytes, 0);
     auto addTrigrams = [this](const std::wstring& s) {
         for (size_t i = 0; i + 2 < s.size(); i++) {
             unsigned int bit = TrigramHashBit(s[i], s[i + 1], s[i + 2]);
             trigramBloom[bit >> 3] |= (unsigned char)(1u << (bit & 7));
         }
     };
+    auto addChars = [this](const std::wstring& s) {
+        for (wchar_t c : s) {
+            unsigned int bit = CharBloomBit(c);
+            charBloom[bit >> 3] |= (unsigned char)(1u << (bit & 7));
+        }
+    };
     addTrigrams(searchBodyLower);
     addTrigrams(searchPreviewLower);
+    addChars(searchBodyLower);
+
+    searchIndexDirty = false;
 }
 
 // Shared font handle used by the overlay paint loop and the search box. Re-created on
@@ -456,6 +479,108 @@ static void EnsureOverlayFontVariants() {
 }
 static HFONT GetOverlayFontBold()  { EnsureOverlayFontVariants(); return g_overlayFontBold; }
 static HFONT GetOverlayFontSmall() { EnsureOverlayFontVariants(); return g_overlayFontSmall; }
+
+static COLORREF BlendColor(COLORREF a, COLORREF b, int t);  // defined below
+
+// ---- Cached paint resources ------------------------------------------------------
+// The overlay repaints in full on every hover move, arrow key and search keystroke.
+// Everything below used to be created and destroyed inside each WM_PAINT: a ~1.4MB
+// off-screen bitmap, eight theme-coloured pens/brushes, and up to four more per visible
+// row. None of it depends on anything that changes between repaints.
+
+// One reusable back buffer per overlay window. hwndList and hwndPinned share
+// ListWindowProc but have different widths, so this cannot be a single static.
+struct OverlayBackBuffer {
+    HDC     dc = nullptr;
+    HBITMAP bmp = nullptr;
+    HGDIOBJ oldBmp = nullptr;
+    int     w = 0;
+    int     h = 0;
+};
+static std::map<HWND, OverlayBackBuffer> g_backBuffers;
+
+static void FreeBackBuffer(OverlayBackBuffer& bb) {
+    if (bb.dc) {
+        if (bb.oldBmp) SelectObject(bb.dc, bb.oldBmp);
+        if (bb.bmp) DeleteObject(bb.bmp);
+        DeleteDC(bb.dc);
+    }
+    bb = OverlayBackBuffer{};
+}
+
+// Returns a DC sized w x h with a bitmap already selected, or nullptr on failure
+// (callers fall back to drawing straight to the window).
+static HDC AcquireBackBufferDC(HWND hwnd, HDC ref, int w, int h) {
+    if (w <= 0 || h <= 0) return nullptr;
+    OverlayBackBuffer& bb = g_backBuffers[hwnd];
+    if (bb.dc && bb.w == w && bb.h == h) return bb.dc;   // hit: reuse as-is
+    FreeBackBuffer(bb);
+    bb.dc = CreateCompatibleDC(ref);
+    if (!bb.dc) { FreeBackBuffer(bb); return nullptr; }
+    bb.bmp = CreateCompatibleBitmap(ref, w, h);
+    if (!bb.bmp) { FreeBackBuffer(bb); return nullptr; }
+    bb.oldBmp = SelectObject(bb.dc, bb.bmp);
+    bb.w = w;
+    bb.h = h;
+    return bb.dc;
+}
+
+static void ReleaseBackBufferFor(HWND hwnd) {
+    auto it = g_backBuffers.find(hwnd);
+    if (it == g_backBuffers.end()) return;
+    FreeBackBuffer(it->second);
+    g_backBuffers.erase(it);
+}
+
+// Pens and brushes derived purely from the active theme. Invalidated from
+// ClipboardManager::RefreshThemeVisuals(), which every colour-changing setter
+// (SetTheme / SetThemeFontColor / SetThemeColorOverride / ResetThemeColorOverrides)
+// already routes through.
+struct ThemeGdi {
+    bool     valid = false;
+    COLORREF accentSoft = 0;   // subtle row hover / header / footer wash
+    COLORREF dividerCol = 0;   // faint separators
+    HBRUSH   bg = nullptr;
+    HBRUSH   accent = nullptr;
+    HBRUSH   selBg = nullptr;
+    HBRUSH   divider = nullptr;
+    HBRUSH   border = nullptr;
+    HBRUSH   txt = nullptr;     // pinned accent bar, normal row
+    HBRUSH   selFg = nullptr;   // pinned accent bar, selected row
+    HPEN     borderPen = nullptr;
+    HPEN     dividerPen = nullptr;
+    HPEN     txtPen = nullptr;
+    HPEN     selFgPen = nullptr;
+};
+static ThemeGdi g_themeGdi;
+
+void InvalidateThemeGdiCache() {
+    ThemeGdi& t = g_themeGdi;
+    HGDIOBJ objs[] = { t.bg, t.accent, t.selBg, t.divider, t.border, t.txt, t.selFg,
+                       t.borderPen, t.dividerPen, t.txtPen, t.selFgPen };
+    for (HGDIOBJ o : objs) if (o) DeleteObject(o);
+    g_themeGdi = ThemeGdi{};
+}
+
+static const ThemeGdi& GetThemeGdi() {
+    ThemeGdi& t = g_themeGdi;
+    if (t.valid) return t;
+    t.accentSoft = BlendColor(Theme5250::BG, Theme5250::SEL_BG, 38);
+    t.dividerCol = BlendColor(Theme5250::BG, Theme5250::DIM, 150);
+    t.bg         = CreateSolidBrush(Theme5250::BG);
+    t.accent     = CreateSolidBrush(t.accentSoft);
+    t.selBg      = CreateSolidBrush(Theme5250::SEL_BG);
+    t.divider    = CreateSolidBrush(t.dividerCol);
+    t.border     = CreateSolidBrush(Theme5250::BORDER);
+    t.txt        = CreateSolidBrush(Theme5250::TXT);
+    t.selFg      = CreateSolidBrush(Theme5250::SEL_FG);
+    t.borderPen  = CreatePen(PS_SOLID, 1, Theme5250::BORDER);
+    t.dividerPen = CreatePen(PS_SOLID, 1, t.dividerCol);
+    t.txtPen     = CreatePen(PS_SOLID, 1, Theme5250::TXT);
+    t.selFgPen   = CreatePen(PS_SOLID, 1, Theme5250::SEL_FG);
+    t.valid      = true;
+    return t;
+}
 
 // Linear blend between two COLORREFs (t in 0..255). Used for subtle hover/scrollbar tints.
 static COLORREF BlendColor(COLORREF a, COLORREF b, int t) {
@@ -793,14 +918,33 @@ std::wstring ClipboardItem::GetPreview(const std::vector<BYTE>& data, UINT fmt) 
 }
 
 // Helper function to convert HBITMAP to DIB data
+// Upper bounds for a clipboard bitmap we are willing to convert. The dimension limit
+// matches CreateBitmapFromData; the byte limit is only a safety backstop -- the capture
+// path and the ClipboardItem constructor apply stricter product limits downstream.
+static const LONG      kMaxBitmapDimension = 50000;
+static const long long kMaxDibImageBytes   = 256LL * 1024 * 1024;
+
 static std::vector<BYTE> ConvertBitmapToDIB(HBITMAP hBitmap) {
     std::vector<BYTE> dibData;
     if (!hBitmap) return dibData;
-    
+
     HDC hdcScreen = GetDC(nullptr);
-    
+
     BITMAP bm;
     if (GetObject(hBitmap, sizeof(BITMAP), &bm)) {
+        // Bound the dimensions BEFORE any size arithmetic. The row/image math below used
+        // to run in 32-bit int with no guard at all, so a large enough bitmap overflowed
+        // it -- and a product that wrapped to a small positive value produced an
+        // undersized buffer that GetDIBits then wrote past. Clipboard contents come from
+        // other applications, so this input is not ours to trust.
+        LONG absHeight = bm.bmHeight < 0 ? -bm.bmHeight : bm.bmHeight;
+        if (bm.bmWidth <= 0 || absHeight <= 0 ||
+            bm.bmWidth > kMaxBitmapDimension || absHeight > kMaxBitmapDimension ||
+            bm.bmBitsPixel <= 0 || bm.bmBitsPixel > 32) {
+            ReleaseDC(nullptr, hdcScreen);
+            return dibData;
+        }
+
         BITMAPINFOHEADER bih = {};
         bih.biSize = sizeof(BITMAPINFOHEADER);
         bih.biWidth = bm.bmWidth;
@@ -808,33 +952,45 @@ static std::vector<BYTE> ConvertBitmapToDIB(HBITMAP hBitmap) {
         bih.biPlanes = 1;
         bih.biBitCount = bm.bmBitsPixel;
         bih.biCompression = BI_RGB;
-        
-        // Calculate size needed
-        int rowSize = ((bm.bmWidth * bm.bmBitsPixel + 31) / 32) * 4;
-        int imageSize = rowSize * abs(bm.bmHeight);
-        bih.biSizeImage = imageSize;
-        
+
+        // Calculate size needed (64-bit throughout: 50000 x 50000 x 32bpp overflows int).
+        long long rowSize = (((long long)bm.bmWidth * bm.bmBitsPixel + 31) / 32) * 4;
+        long long imageSize = rowSize * absHeight;
+
         // Allocate buffer for header + color table + bits
-        int colorTableSize = 0;
+        long long colorTableSize = 0;
         if (bih.biBitCount <= 8) {
-            colorTableSize = (1 << bih.biBitCount) * sizeof(RGBQUAD);
+            colorTableSize = (1LL << bih.biBitCount) * (long long)sizeof(RGBQUAD);
         }
-        
-        dibData.resize(sizeof(BITMAPINFOHEADER) + colorTableSize + imageSize);
+
+        long long totalSize = (long long)sizeof(BITMAPINFOHEADER) + colorTableSize + imageSize;
+        if (imageSize <= 0 || totalSize <= 0 || imageSize > kMaxDibImageBytes ||
+            totalSize > kMaxDibImageBytes) {
+            ReleaseDC(nullptr, hdcScreen);
+            return dibData;
+        }
+        bih.biSizeImage = (DWORD)imageSize;
+
+        try {
+            dibData.resize((size_t)totalSize);
+        } catch (...) {
+            ReleaseDC(nullptr, hdcScreen);
+            return dibData;   // allocation failed: hand the caller an empty vector
+        }
         BITMAPINFOHEADER* pBih = (BITMAPINFOHEADER*)dibData.data();
         *pBih = bih;
-        
+
         // Get bits
         BITMAPINFO* pBmi = (BITMAPINFO*)dibData.data();
-        void* pBits = dibData.data() + sizeof(BITMAPINFOHEADER) + colorTableSize;
-        
-        if (GetDIBits(hdcScreen, hBitmap, 0, abs(bm.bmHeight), pBits, pBmi, DIB_RGB_COLORS)) {
+        void* pBits = dibData.data() + sizeof(BITMAPINFOHEADER) + (size_t)colorTableSize;
+
+        if (GetDIBits(hdcScreen, hBitmap, 0, absHeight, pBits, pBmi, DIB_RGB_COLORS)) {
             // Success
         } else {
             dibData.clear();
         }
     }
-    
+
     ReleaseDC(nullptr, hdcScreen);
     return dibData;
 }
@@ -1046,7 +1202,11 @@ void ClipboardItem::GenerateThumbnail() {
 
 // Build the 48x48 row thumbnail the first time a visible row needs it. The result
 // (including "couldn't build one") is cached so we never decode the same item twice.
+// Monotonic clock for cached-bitmap recency (see ClipboardManager::TrimBitmapCaches).
+static unsigned long long g_bitmapUseTick = 0;
+
 void ClipboardItem::EnsureThumbnail() {
+    thumbUseTick = ++g_bitmapUseTick;   // touched, whether or not we build one now
     if (thumbnail || thumbnailAttempted) return;
     thumbnailAttempted = true;
     try {
@@ -1111,6 +1271,7 @@ HBITMAP ClipboardItem::GetPreviewBitmap() {
         GeneratePreviewBitmap();
     }
     if (previewBitmap) {
+        previewUseTick = ++g_bitmapUseTick;   // keeps the visible preview from being evicted
         return previewBitmap;
     }
     EnsureThumbnail();  // fall back to the (also lazy) row thumbnail
@@ -1241,6 +1402,11 @@ static bool AreDuplicateImages(const ClipboardItem* a, const ClipboardItem* b) {
 
 static bool AreDuplicateClipboardItems(const ClipboardItem* a, const ClipboardItem* b) {
     if (!a || !b) return false;
+
+    // Byte comparison below: any format still living on disk has to be read in first.
+    // Normally a no-op -- `a` was just captured and `b` is usually the previous capture.
+    a->HydrateAllFormats();
+    b->HydrateAllFormats();
 
     // Exact format-set match (legacy path).
     if (!a->formats.empty() && a->formats.size() == b->formats.size()) {
@@ -1674,7 +1840,9 @@ static bool RestoreClipboardSerialFormats(HWND hwnd, const std::map<UINT, std::v
 
 // Restore all formats from a history item (same strategy as PasteItem rich paste).
 static bool SetClipboardFromHistoryItem(HWND hwnd, const ClipboardItem* item) {
-    if (!item || item->formats.empty()) return false;
+    if (!item || !item->HasAnyFormat()) return false;
+    item->HydrateAllFormats();   // the clipboard needs the actual bytes
+    if (item->formats.empty()) return false;
     if (!OpenClipboard(hwnd)) return false;
     EmptyClipboard();
     bool success = false;
@@ -1849,13 +2017,17 @@ static bool ItemHasOnlyTextFormats(const ClipboardItem* item) {
     if (!item) return false;
     UINT rtf = CfRtf();
     UINT html = CfHtml();
-    for (const auto& kv : item->formats) {
-        UINT f = kv.first;
-        if (f == CF_UNICODETEXT || f == CF_TEXT || f == CF_OEMTEXT || f == CF_LOCALE) continue;
-        if (rtf && f == rtf) continue;
-        if (html && f == html) continue;
+    // Format ids are enough here, so deferred blobs are inspected without reading them.
+    auto isTextish = [rtf, html](UINT f) {
+        if (f == CF_UNICODETEXT || f == CF_TEXT || f == CF_OEMTEXT || f == CF_LOCALE) return true;
+        if (rtf && f == rtf) return true;
+        if (html && f == html) return true;
         return false;
-    }
+    };
+    for (const auto& kv : item->formats)
+        if (!isTextish(kv.first)) return false;
+    for (const auto& kv : item->pendingBlobs)
+        if (!isTextish(kv.first)) return false;
     return true;
 }
 
@@ -2241,6 +2413,55 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
 }
 
 // ClipboardManager implementation
+// ---- Single instance ------------------------------------------------------------
+// Two live instances corrupt history rather than merely duplicating work: both own a
+// clipboard listener, both write %APPDATA%\clip2\history.dat, and each one's blob GC
+// deletes the sidecar files the OTHER instance's history still references -- so images
+// silently vanish. A named mutex keeps exactly one instance per user session; a second
+// launch just raises the running overlay and exits.
+static const wchar_t* const kMainWindowClassName = L"ClipboardManagerClass";
+static const wchar_t* const kSingleInstanceMutexName = L"Local\\clip2_single_instance";
+static HANDLE g_singleInstanceMutex = nullptr;
+
+// False when another instance already holds the lock.
+static bool AcquireSingleInstanceLock() {
+    g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, kSingleInstanceMutexName);
+    if (!g_singleInstanceMutex)
+        return true;  // cannot arbitrate (e.g. name denied): prefer running over refusing
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Must be called before the tray "Restart" spawns our replacement, or our own lock
+// would turn the restart into a plain quit.
+static void ReleaseSingleInstanceLock() {
+    if (!g_singleInstanceMutex) return;
+    ReleaseMutex(g_singleInstanceMutex);
+    CloseHandle(g_singleInstanceMutex);
+    g_singleInstanceMutex = nullptr;
+}
+
+// Ask the instance that is already running to show its overlay (1 = tray "Show Clipboard").
+static void ShowOverlayOfRunningInstance() {
+    HWND existing = FindWindowW(kMainWindowClassName, nullptr);
+    if (existing) PostMessageW(existing, WM_COMMAND, 1, 0);
+}
+
+// Tray "Restart": flush and tear down BEFORE the replacement starts, so the two
+// processes never overlap on history.dat or the blob directory.
+static void RestartSelf(ClipboardManager* mgr) {
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return;
+    if (mgr) mgr->Stop();              // flushes the pending debounced history save
+    ReleaseSingleInstanceLock();
+    ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+    PostQuitMessage(0);
+}
+
 ClipboardManager::ClipboardManager()
     : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
@@ -2292,7 +2513,7 @@ bool ClipboardManager::Initialize() {
     WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandle(nullptr);
-    wc.lpszClassName = L"ClipboardManagerClass";
+    wc.lpszClassName = kMainWindowClassName;
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
@@ -2330,7 +2551,7 @@ bool ClipboardManager::Initialize() {
     // Create main window (hidden but must exist for hotkeys)
     hwndMain = CreateWindowEx(
         0,
-        L"ClipboardManagerClass",
+        kMainWindowClassName,
         L"clip2",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 100, 100,
@@ -2473,35 +2694,20 @@ bool ClipboardManager::Initialize() {
 void ClipboardManager::Run() {
     isRunning = true;
     MSG msg;
-    
+
+    // Plain blocking pump. GetMessage already sleeps the thread until a message
+    // arrives, so neither a PeekMessage drain nor a Sleep() adds anything -- and a
+    // Sleep here would put a latency floor under every keystroke, mouse move and
+    // repaint, which is exactly how this loop used to feel sticky.
     while (isRunning) {
-        // Process all pending messages first (important for hotkeys)
-        // Use GetMessage for better hotkey message delivery
         BOOL bRet = GetMessage(&msg, nullptr, 0, 0);
-        if (bRet == -1) {
-            // Error occurred
-            break;
-        } else if (bRet == 0) {
-            // WM_QUIT received
+        if (bRet == -1) break;          // error
+        if (bRet == 0) {                // WM_QUIT
             isRunning = false;
             break;
         }
-        
         TranslateMessage(&msg);
         DispatchMessage(&msg);
-        
-        // Process any remaining messages in queue
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                isRunning = false;
-                return;
-            }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        
-        // Sleep briefly to avoid busy-waiting
-        Sleep(10);
     }
 }
 
@@ -2613,11 +2819,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 mgr->CopyFromFocusedControlViaUIA();  // Fails silently when nothing can be captured.
 #endif
             } else if (cmd == 7) {
-                wchar_t exePath[MAX_PATH];
-                GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-                ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
-                mgr->Stop();
-                PostQuitMessage(0);
+                RestartSelf(mgr);
             } else if (cmd == 2) {
                 mgr->Stop();
                 PostQuitMessage(0);
@@ -2655,11 +2857,7 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             mgr->CopyFromFocusedControlViaUIA();  // Fails silently when nothing can be captured.
 #endif
         } else if (LOWORD(wParam) == 7) {
-            wchar_t exePath[MAX_PATH];
-            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-            ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
-            mgr->Stop();
-            PostQuitMessage(0);
+            RestartSelf(mgr);
         } else if (LOWORD(wParam) == 2) {
             mgr->Stop();
             PostQuitMessage(0);
@@ -2994,13 +3192,15 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         HWND  pSearchBox = paneIsPinned ? mgr->hwndPinnedSearch : mgr->hwndMainSearch;
 
         // ---- Double buffering: render everything onto an off-screen bitmap first. ----
-        HDC hdc = CreateCompatibleDC(hdcWindow);
-        HBITMAP memBmp = CreateCompatibleBitmap(hdcWindow, rect.right, rect.bottom);
-        HGDIOBJ oldMemBmp = SelectObject(hdc, memBmp);
+        // The surface is cached per window and rebuilt only when the window resizes.
+        HDC hdc = AcquireBackBufferDC(hwnd, hdcWindow, rect.right, rect.bottom);
+        if (!hdc) hdc = hdcWindow;   // out of GDI resources: draw direct rather than not at all
+        const bool buffered = (hdc != hdcWindow);
 
-        // Theme-derived accent tints.
-        COLORREF accentSoft = BlendColor(Theme5250::BG, Theme5250::SEL_BG, 38);   // subtle row hover/header wash
-        COLORREF dividerCol = BlendColor(Theme5250::BG, Theme5250::DIM, 150);     // faint separators
+        // Theme-derived pens/brushes, built once per theme change (not once per repaint).
+        const ThemeGdi& tg = GetThemeGdi();
+        const COLORREF accentSoft = tg.accentSoft;   // subtle row hover/header wash
+        const COLORREF dividerCol = tg.dividerCol;   // faint separators
 
         // Layout constants. NOTE: content top (60), row height (50) and the search box
         // position (y=30) are part of the interaction contract used by hit-testing and
@@ -3015,16 +3215,14 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         SetBkMode(hdc, TRANSPARENT);
 
         // Background (themed).
-        { HBRUSH bgb = CreateSolidBrush(Theme5250::BG); FillRect(hdc, &rect, bgb); DeleteObject(bgb); }
+        FillRect(hdc, &rect, tg.bg);
 
         HGDIOBJ hOldFont = SelectObject(hdc, GetOverlayFont());
 
         // ---- Header bar ----------------------------------------------------------
         {
             RECT headerRect = { 0, 0, rect.right, HEADER_H };
-            HBRUSH hb = CreateSolidBrush(accentSoft);
-            FillRect(hdc, &headerRect, hb);
-            DeleteObject(hb);
+            FillRect(hdc, &headerRect, tg.accent);
 
             // App name (bold) on the left.
             SelectObject(hdc, GetOverlayFontBold());
@@ -3055,13 +3253,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int pillRight = countRect.left - 10;
             int pillLeft = pillRight - (szMode.cx + pillPadX * 2);
             int pillTop = (HEADER_H - 16) / 2, pillBot = pillTop + 16;
-            HPEN pen = CreatePen(PS_SOLID, 1, Theme5250::BORDER);
-            HGDIOBJ op = SelectObject(hdc, pen);
+            HGDIOBJ op = SelectObject(hdc, tg.borderPen);
             HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
             RoundRect(hdc, pillLeft, pillTop, pillRight, pillBot, 8, 8);
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
-            DeleteObject(pen);
             RECT pillRect = { pillLeft, pillTop, pillRight, pillBot };
             SetTextColor(hdc, Theme5250::TXT);
             DrawTextW(hdc, modeText.c_str(), -1, &pillRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -3070,26 +3266,22 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
 
         // Outer window border (thin, accent) for a crisp framed look.
         {
-            HPEN hBorderPen = CreatePen(PS_SOLID, 1, Theme5250::BORDER);
-            HGDIOBJ op = SelectObject(hdc, hBorderPen);
+            HGDIOBJ op = SelectObject(hdc, tg.borderPen);
             HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
             Rectangle(hdc, 0, 0, rect.right, rect.bottom);
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
-            DeleteObject(hBorderPen);
         }
 
         // ---- Search field --------------------------------------------------------
         if (pSearchBox && IsWindowVisible(pSearchBox)) {
             bool searchFocused = (GetFocus() == pSearchBox);
             RECT searchRect = { 6, SEARCH_TOP, rect.right - 6, SEARCH_BOT };
-            HPEN hPen = CreatePen(PS_SOLID, 1, searchFocused ? Theme5250::TXT : dividerCol);
-            HGDIOBJ op = SelectObject(hdc, hPen);
+            HGDIOBJ op = SelectObject(hdc, searchFocused ? tg.txtPen : tg.dividerPen);
             HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
             RoundRect(hdc, searchRect.left, searchRect.top, searchRect.right, searchRect.bottom, 6, 6);
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
-            DeleteObject(hPen);
         }
 
         // ---- Scroll / paging math ------------------------------------------------
@@ -3102,6 +3294,21 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         if (pScroll < 0) pScroll = 0;
         // Persist the clamped scroll back to the owning pane.
         if (paneIsActive) mgr->scrollOffset = pScroll; else mgr->inactivePane.scrollOffset = pScroll;
+
+        // Every row highlight is the same round-rect shape at a different y, so build the
+        // region once and OffsetRgn it into place instead of creating one per row.
+        HRGN rowHiliteRgn = nullptr;
+        int  rowHiliteY = 0;
+        auto fillRowHilite = [&](const RECT& r, HBRUSH b) {
+            if (!rowHiliteRgn) {
+                rowHiliteRgn = CreateRoundRectRgn(r.left, r.top, r.right, r.bottom, 8, 8);
+                rowHiliteY = r.top;
+            } else if (rowHiliteY != r.top) {
+                OffsetRgn(rowHiliteRgn, 0, r.top - rowHiliteY);
+                rowHiliteY = r.top;
+            }
+            if (rowHiliteRgn) FillRgn(hdc, rowHiliteRgn, b);
+        };
 
         int yPos = CONTENT_TOP;
         int startIndex = pScroll;
@@ -3129,17 +3336,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 RECT rowRect = { 6, yPos + 2, rowRight, yPos + itemHeight - 2 };
 
                 if (isSelected) {
-                    HBRUSH b = CreateSolidBrush(Theme5250::SEL_BG);
-                    HRGN rgn = CreateRoundRectRgn(rowRect.left, rowRect.top, rowRect.right, rowRect.bottom, 8, 8);
-                    FillRgn(hdc, rgn, b);
-                    DeleteObject(rgn);
-                    DeleteObject(b);
+                    fillRowHilite(rowRect, tg.selBg);
                 } else if (isHover) {
-                    HBRUSH b = CreateSolidBrush(accentSoft);
-                    HRGN rgn = CreateRoundRectRgn(rowRect.left, rowRect.top, rowRect.right, rowRect.bottom, 8, 8);
-                    FillRgn(hdc, rgn, b);
-                    DeleteObject(rgn);
-                    DeleteObject(b);
+                    fillRowHilite(rowRect, tg.accent);
                 }
 
                 COLORREF fg = isSelected ? Theme5250::SEL_FG : Theme5250::TXT;
@@ -3182,17 +3381,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
 
                 if (hot) {
                     // Dim the selection on the non-focused pane so it reads as inactive.
-                    HBRUSH b = CreateSolidBrush(paneIsActive ? Theme5250::SEL_BG : accentSoft);
-                    HRGN rgn = CreateRoundRectRgn(rowRect.left, rowRect.top, rowRect.right, rowRect.bottom, 8, 8);
-                    FillRgn(hdc, rgn, b);
-                    DeleteObject(rgn);
-                    DeleteObject(b);
+                    fillRowHilite(rowRect, paneIsActive ? tg.selBg : tg.accent);
                 } else if (isHover) {
-                    HBRUSH b = CreateSolidBrush(accentSoft);
-                    HRGN rgn = CreateRoundRectRgn(rowRect.left, rowRect.top, rowRect.right, rowRect.bottom, 8, 8);
-                    FillRgn(hdc, rgn, b);
-                    DeleteObject(rgn);
-                    DeleteObject(b);
+                    fillRowHilite(rowRect, tg.accent);
                 }
 
                 COLORREF fg = (hot && paneIsActive) ? Theme5250::SEL_FG : Theme5250::TXT;
@@ -3201,9 +3392,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 // Pinned accent bar at the very left of the row.
                 if (item->pinned) {
                     RECT pinBar = { rowRect.left, rowRect.top + 4, rowRect.left + 3, rowRect.bottom - 4 };
-                    HBRUSH pinBrush = CreateSolidBrush(fg);
-                    FillRect(hdc, &pinBar, pinBrush);
-                    DeleteObject(pinBrush);
+                    FillRect(hdc, &pinBar, (fg == Theme5250::SEL_FG) ? tg.selFg : tg.txt);
                 }
 
                 int contentLeft = rowRect.left + 10;
@@ -3217,7 +3406,6 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     int thumbY = yPos + (itemHeight - thumbSize) / 2;
                     HDC hdcMem = CreateCompatibleDC(hdc);
                     HGDIOBJ ob = SelectObject(hdcMem, item->thumbnail);
-                    SetStretchBltMode(hdc, HALFTONE);
                     BitBlt(hdc, contentLeft, thumbY, thumbSize, thumbSize, hdcMem, 0, 0, SRCCOPY);
                     SelectObject(hdcMem, ob);
                     DeleteDC(hdcMem);
@@ -3232,13 +3420,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     else badge = L"?";
                     int bW = 34, bH = 22;
                     int bx = contentLeft, by = yPos + (itemHeight - bH) / 2;
-                    HPEN pen = CreatePen(PS_SOLID, 1, hot ? Theme5250::SEL_FG : Theme5250::BORDER);
-                    HGDIOBJ op = SelectObject(hdc, pen);
+                    HGDIOBJ op = SelectObject(hdc, hot ? tg.selFgPen : tg.borderPen);
                     HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
                     RoundRect(hdc, bx, by, bx + bW, by + bH, 6, 6);
                     SelectObject(hdc, ob);
                     SelectObject(hdc, op);
-                    DeleteObject(pen);
                     RECT badgeRect = { bx, by, bx + bW, by + bH };
                     SetTextColor(hdc, meta);
                     SelectObject(hdc, GetOverlayFontSmall());
@@ -3286,32 +3472,24 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int trackH = trackBot - trackTop;
             int trackX = rect.right - 6;
             if (trackH > 10) {
-                HBRUSH tb = CreateSolidBrush(dividerCol);
                 RECT track = { trackX, trackTop, trackX + 3, trackBot };
-                FillRect(hdc, &track, tb);
-                DeleteObject(tb);
+                FillRect(hdc, &track, tg.divider);
                 int thumbH = std::max(20, trackH * itemsPerPage / totalItems);
                 int thumbY = trackTop + (maxScroll > 0 ? (trackH - thumbH) * pScroll / maxScroll : 0);
-                HBRUSH thb = CreateSolidBrush(Theme5250::BORDER);
                 RECT thumb = { trackX, thumbY, trackX + 3, thumbY + thumbH };
-                FillRect(hdc, &thumb, thb);
-                DeleteObject(thb);
+                FillRect(hdc, &thumb, tg.border);
             }
         }
 
         // ---- Footer status / hint bar --------------------------------------------
         {
             RECT footRect = { 0, rect.bottom - FOOTER_H, rect.right, rect.bottom };
-            HBRUSH fb = CreateSolidBrush(accentSoft);
-            FillRect(hdc, &footRect, fb);
-            DeleteObject(fb);
+            FillRect(hdc, &footRect, tg.accent);
             // Divider line above footer.
-            HPEN dp = CreatePen(PS_SOLID, 1, dividerCol);
-            HGDIOBJ op = SelectObject(hdc, dp);
+            HGDIOBJ op = SelectObject(hdc, tg.dividerPen);
             MoveToEx(hdc, 1, footRect.top, nullptr);
             LineTo(hdc, rect.right - 1, footRect.top);
             SelectObject(hdc, op);
-            DeleteObject(dp);
 
             SelectObject(hdc, GetOverlayFontSmall());
             SetTextColor(hdc, BlendColor(Theme5250::BG, Theme5250::TXT, 170));
@@ -3328,15 +3506,22 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         }
 
         // Blit the finished frame to the window in one shot (flicker-free).
-        BitBlt(hdcWindow, 0, 0, rect.right, rect.bottom, hdc, 0, 0, SRCCOPY);
+        // Skipped when the back buffer could not be created: we drew straight to hdcWindow.
+        if (buffered)
+            BitBlt(hdcWindow, 0, 0, rect.right, rect.bottom, hdc, 0, 0, SRCCOPY);
 
         SelectObject(hdc, hOldFont);
-        SelectObject(hdc, oldMemBmp);
-        DeleteObject(memBmp);
-        DeleteDC(hdc);
+        if (rowHiliteRgn) DeleteObject(rowHiliteRgn);
+        // The back-buffer DC/bitmap are cached for the next repaint -- see AcquireBackBufferDC.
         EndPaint(hwnd, &ps);
         return 0;
     }
+
+    case WM_DESTROY:
+        // Drop this window's cached back buffer (the theme pens/brushes are process-wide
+        // and stay until the next theme change).
+        ReleaseBackBufferFor(hwnd);
+        break;
     
     case WM_KEYDOWN: {
         // Tab toggles focus between the main list and the left pinned panel.
@@ -4394,6 +4579,18 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         if (pKeyboard->flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
             return CallNextHookEx(mgr->hKeyboardHook, nCode, wParam, lParam);
 
+        // This is a WH_KEYBOARD_LL hook: every keystroke on the machine serializes
+        // behind it, and Windows silently unhooks us if we exceed LowLevelHooksTimeout.
+        // So decide from vkCode alone whether this key can possibly interest us BEFORE
+        // querying modifier state -- only three keys ever can, and the five
+        // GetAsyncKeyState calls below used to run for every key the user pressed.
+        const DWORD vk = pKeyboard->vkCode;
+        const bool couldBeOverlay  = (vk == mgr->hotkeyConfig.vkCode);
+        const bool couldBeSnippets = (mgr->snippetsHotkey.vkCode != 0 && vk == mgr->snippetsHotkey.vkCode);
+        const bool couldBeEscape   = (vk == VK_ESCAPE && mgr->listVisible);
+        if (!couldBeOverlay && !couldBeSnippets && !couldBeEscape)
+            return CallNextHookEx(mgr->hKeyboardHook, nCode, wParam, lParam);
+
         // Check for configured hotkey modifiers
         bool hasCtrl = (mgr->hotkeyConfig.modifiers & MOD_CONTROL) != 0;
         bool hasAlt = (mgr->hotkeyConfig.modifiers & MOD_ALT) != 0;
@@ -4405,25 +4602,23 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
         
-        {
-            // Snippets overlay shortcut is optional — if the user has not bound one
-            // (vkCode == 0) we skip dispatch entirely so the keypress falls through.
-            if (mgr->snippetsHotkey.vkCode != 0) {
-                bool snipCtrl  = (mgr->snippetsHotkey.modifiers & MOD_CONTROL) != 0;
-                bool snipAlt   = (mgr->snippetsHotkey.modifiers & MOD_ALT) != 0;
-                bool snipShift = (mgr->snippetsHotkey.modifiers & MOD_SHIFT) != 0;
-                bool snipWin   = (mgr->snippetsHotkey.modifiers & MOD_WIN) != 0;
-                bool snipMatch = (snipCtrl == isCtrlPressed) && (snipAlt == isAltPressed) &&
-                                 (snipShift == isShiftPressed) && (snipWin == isWinPressed);
-                if (wParam == WM_KEYDOWN && snipMatch && pKeyboard->vkCode == mgr->snippetsHotkey.vkCode) {
-                    PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
-                    return 1;
-                }
+        if (couldBeSnippets) {
+            // Snippets overlay shortcut is optional -- when unbound (vkCode == 0) we
+            // never get here, so the keypress falls through untouched.
+            bool snipCtrl  = (mgr->snippetsHotkey.modifiers & MOD_CONTROL) != 0;
+            bool snipAlt   = (mgr->snippetsHotkey.modifiers & MOD_ALT) != 0;
+            bool snipShift = (mgr->snippetsHotkey.modifiers & MOD_SHIFT) != 0;
+            bool snipWin   = (mgr->snippetsHotkey.modifiers & MOD_WIN) != 0;
+            bool snipMatch = (snipCtrl == isCtrlPressed) && (snipAlt == isAltPressed) &&
+                             (snipShift == isShiftPressed) && (snipWin == isWinPressed);
+            if (wParam == WM_KEYDOWN && snipMatch) {
+                PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
+                return 1;
             }
         }
         
         // Plain Esc closes overlay when list, search, preview, or a list child has focus
-        if (wParam == WM_KEYDOWN && pKeyboard->vkCode == VK_ESCAPE && mgr->listVisible) {
+        if (wParam == WM_KEYDOWN && couldBeEscape) {
             bool plainEsc = !isCtrlPressed && !isAltPressed && !isShiftPressed && !isWinPressed;
             if (plainEsc) {
                 HWND fg = GetForegroundWindow();
@@ -4448,7 +4643,7 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         }
         
         // Check if the configured key is pressed
-        if (wParam == WM_KEYDOWN && modifiersMatch && pKeyboard->vkCode == mgr->hotkeyConfig.vkCode) {
+        if (wParam == WM_KEYDOWN && modifiersMatch && couldBeOverlay) {
             // Post message to main window to toggle list
             PostMessage(mgr->hwndMain, WM_CLIPBOARD_HOTKEY, 0, 0);
             return 1; // Consume the key so it doesn't propagate
@@ -4575,6 +4770,13 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
 }
 
 void ClipboardManager::HideListWindow() {
+    // Overlay is closing, so nothing is painting and no caller is holding a pointer into
+    // an item's format map: a safe point to hand back image bytes we can re-read from
+    // their sidecars. Deliberately NOT done from TrimBitmapCaches, which runs mid-repaint
+    // where a GetFormatData() pointer could still be live.
+    for (auto& it : clipboardHistory)
+        if (it) it->DehydrateBlobFormats();
+
     if (listVisible) {
         HidePreviewWindow();
         SaveOverlayPosition();  // remember where the user left the overlay
@@ -4792,6 +4994,43 @@ void ClipboardManager::ShowPreviewWindow(int itemIndex, int mouseX, int mouseY) 
     
     InvalidateRect(hwndPreview, nullptr, TRUE);
     UpdateWindow(hwndPreview);
+
+    TrimBitmapCaches();
+}
+
+// Caps on cached bitmaps. Previews are the memory problem (~1MB each), so they get a
+// small cap; thumbnails are ~9KB but pin a GDI object each, so their cap is generous and
+// far above the number of rows that can be on screen -- evicting a visible row's
+// thumbnail would just make the next repaint rebuild it.
+static const size_t kMaxCachedPreviews = 6;
+static const size_t kMaxCachedThumbnails = 256;
+
+void ClipboardManager::TrimBitmapCaches() {
+    // Collect recency ticks for whichever caches are over budget, find the cut-off with a
+    // partial sort, and release everything older. Indices are used rather than pointers so
+    // nothing can dangle if items are deleted between calls.
+    auto trim = [this](bool previews, size_t cap) {
+        std::vector<unsigned long long> ticks;
+        for (const auto& it : clipboardHistory) {
+            if (!it) continue;
+            if (previews ? (it->previewBitmap != nullptr) : (it->thumbnail != nullptr))
+                ticks.push_back(previews ? it->previewUseTick : it->thumbUseTick);
+        }
+        if (ticks.size() <= cap) return;
+        // Keep the `cap` largest ticks: the cut-off is the element at position size-cap.
+        std::nth_element(ticks.begin(), ticks.begin() + (ticks.size() - cap), ticks.end());
+        unsigned long long cutoff = ticks[ticks.size() - cap];
+        for (auto& it : clipboardHistory) {
+            if (!it) continue;
+            if (previews) {
+                if (it->previewBitmap && it->previewUseTick < cutoff) it->ReleasePreviewBitmap();
+            } else {
+                if (it->thumbnail && it->thumbUseTick < cutoff) it->ReleaseThumbnail();
+            }
+        }
+    };
+    trim(/*previews=*/true, kMaxCachedPreviews);
+    trim(/*previews=*/false, kMaxCachedThumbnails);
 }
 
 void ClipboardManager::HidePreviewWindow() {
@@ -4877,6 +5116,9 @@ void ClipboardManager::UpdateListWindow(bool includeInactive) {
             UpdateWindow(inactive);
         }
     }
+    // Rows just painted stamped their thumbnails as most-recent, so this only sheds
+    // bitmaps for items well outside the viewport.
+    TrimBitmapCaches();
 }
 
 void ClipboardManager::PasteItem(int index) {
@@ -4906,7 +5148,8 @@ void ClipboardManager::PasteItem(int index) {
             size_t bytes = (t.size() + 1) * sizeof(wchar_t);
             success = PutBytesOnClipboard(CF_UNICODETEXT, t.c_str(), bytes);
         }
-    } else if (!item->formats.empty()) {
+    } else if (item->HasAnyFormat()) {
+        item->HydrateAllFormats();
         for (const auto& fp : item->formats) {
             if (fp.second.empty()) continue;
             if (PutBytesOnClipboard(fp.first, fp.second.data(), fp.second.size()))
@@ -5210,7 +5453,7 @@ void ClipboardManager::PasteMultipleItems() {
             }
             if (!clipboardSet)
                 clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
-        } else if (!pasteAsPlainText && !item->formats.empty()) {
+        } else if (!pasteAsPlainText && item->HasAnyFormat()) {
             clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
         }
         if (!clipboardSet && !plainText.empty())
@@ -5325,7 +5568,7 @@ void ClipboardManager::PasteExcelSelection() {
         // Prefer the item's original full rich formats; fall back to merged rich text,
         // then Unicode-only so one bad item does not abort the whole run.
         bool clipboardSet = false;
-        if (!item->formats.empty())
+        if (item->HasAnyFormat())
             clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
         if (!clipboardSet && ItemHasPasteableText(item)) {
             MergedRichPayload one;
@@ -5387,13 +5630,13 @@ bool ClipboardManager::InsertMergedPayloadIntoHistory(const MergedRichPayload& m
             if (cfRtf && !merged.rtf.empty()) {
                 std::vector<BYTE> rtfData(merged.rtf.begin(), merged.rtf.end());
                 rtfData.push_back(0);
-                item->AddFormat(cfRtf, rtfData);
+                item->AddFormat(cfRtf, std::move(rtfData));
             }
             UINT cfHtml = CfHtml();
             if (cfHtml && !merged.html.empty()) {
                 std::vector<BYTE> htmlData(merged.html.begin(), merged.html.end());
                 htmlData.push_back(0);
-                item->AddFormat(cfHtml, htmlData);
+                item->AddFormat(cfHtml, std::move(htmlData));
             }
         }
 
@@ -5651,10 +5894,13 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
         hasImmediateClipboardSnapshot = false;
         return;
     }
-    for (const auto& kv : immediateClipboardSnapshot) {
+    // Safe to move out of the snapshot: it is cleared before this function returns, and
+    // primaryData references a different element than any we move from.
+    for (auto& kv : immediateClipboardSnapshot) {
         if (kv.first == primaryFormat || kv.second.empty()) continue;
-        item->AddFormat(kv.first, kv.second);
+        item->AddFormat(kv.first, std::move(kv.second), /*deferIndex=*/true);
     }
+    item->FinalizeSearchIndex();
     bool isPastPaste = false;
     if (!lastPastedText.empty() && item->format == CF_UNICODETEXT) {
         try {
@@ -5689,7 +5935,7 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
             clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
             TrimHistory();
             MarkHistoryDirty();
-            if (listVisible) { FilterItems(); UpdateListWindow(); }
+            if (listVisible) FilterItems();  // FilterItems() already repaints
         } catch (...) {}
     }
     immediateClipboardSnapshot.clear();
@@ -5910,7 +6156,7 @@ void ClipboardManager::CommitCapturedText(const std::wstring& text, bool setClip
         clipboardHistory.insert(clipboardHistory.begin(), std::move(item));
         TrimHistory();
         MarkHistoryDirty();
-        if (listVisible) { FilterItems(); UpdateListWindow(); }
+        if (listVisible) FilterItems();  // FilterItems() already repaints
     } catch (...) {
         // Even if history insertion fails, still try to set the clipboard below.
     }
@@ -6064,7 +6310,7 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
         return false;
     const ClipboardItem* item = clipboardHistory[actualIndex].get();
     std::wstring text = GetPlainTextForDirectPaste(item);
-    if (text.empty() && item->formats.empty())
+    if (text.empty() && !item->HasAnyFormat())
         return false;
     HWND hTarget = GetForegroundWindow();
     if (hTarget == hwndList || hTarget == hwndMain || (hwndList && IsChild(hwndList, hTarget))) {
@@ -6113,7 +6359,7 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
     }
 
     bool clipboardSet = false;
-    if (!item->formats.empty())
+    if (item->HasAnyFormat())
         clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
     if (!clipboardSet && !text.empty())
         clipboardSet = SetClipboardUnicodeOnly(hwndMain, text);
@@ -6376,7 +6622,8 @@ void ClipboardManager::ProcessClipboard() {
                                                 std::vector<BYTE> formatData(formatSize);
                                                 memcpy(formatData.data(), pFormatMem, formatSize);
                                                 GlobalUnlock((HGLOBAL)hFormatData);
-                                                item->AddFormat(format, formatData);
+                                                // Defer: several text formats often arrive together.
+                                                item->AddFormat(format, std::move(formatData), /*deferIndex=*/true);
                                                 totalFormatSize += formatSize;
                                                 formatCount++;
                                             } catch (...) {
@@ -6404,6 +6651,8 @@ void ClipboardManager::ProcessClipboard() {
                         }
                     }
                     
+                    if (item) item->FinalizeSearchIndex();  // one reindex for the whole format set
+
                     // Check if this matches the text we just pasted (multi-paste combined text)
                     bool isPastPaste = false;
                     if (!lastPastedText.empty() && item && item->format == CF_UNICODETEXT) {
@@ -6461,8 +6710,7 @@ void ClipboardManager::ProcessClipboard() {
                             
                             // Update filter if list is visible
                             if (listVisible) {
-                                FilterItems();
-                                UpdateListWindow();
+                                FilterItems();  // already repaints both panes
                             }
                         } catch (...) {
                             // Error adding item to history, skip it
@@ -7157,9 +7405,9 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
     
     // Update the item with transformed text
     // Remove all text formats and add only Unicode text
-    clipboardHistory[actualIndex]->formats.erase(CF_TEXT);
-    clipboardHistory[actualIndex]->formats.erase(CF_OEMTEXT);
-    clipboardHistory[actualIndex]->formats.erase(CF_UNICODETEXT);
+    clipboardHistory[actualIndex]->RemoveFormat(CF_TEXT);
+    clipboardHistory[actualIndex]->RemoveFormat(CF_OEMTEXT);
+    clipboardHistory[actualIndex]->RemoveFormat(CF_UNICODETEXT);
     
     // Add transformed text as Unicode
     size_t dataSize = (transformedText.length() + 1) * sizeof(wchar_t);
@@ -7345,23 +7593,87 @@ namespace {
 
     // Build a history item from a full set of formats. Chooses a sensible primary format
     // so the existing constructor regenerates preview/thumbnail, then attaches the rest.
-    std::unique_ptr<ClipboardItem> MakeItemFromFormats(std::map<UINT, std::vector<BYTE>>& fmts, bool pinned) {
-        if (fmts.empty()) return nullptr;
+    // `fmts` holds formats whose bytes are in hand; `deferred` holds blob digests whose
+    // bytes are still on disk (see ClipboardItem's blob section). Either may be empty.
+    std::unique_ptr<ClipboardItem> MakeItemFromFormats(std::map<UINT, std::vector<BYTE>>& fmts,
+                                                      std::map<UINT, ClipboardItem::BlobDigest>& deferred,
+                                                      bool pinned) {
+        if (fmts.empty() && deferred.empty()) return nullptr;
         UINT primary = 0;
         const UINT order[] = { CF_DIBV5, CF_DIB, CF_BITMAP, CF_HDROP, CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT };
-        for (UINT cand : order) { if (fmts.count(cand)) { primary = cand; break; } }
-        if (primary == 0) primary = fmts.begin()->first;
+        for (UINT cand : order) {
+            if (fmts.count(cand) || deferred.count(cand)) { primary = cand; break; }
+        }
+        if (primary == 0)
+            primary = !fmts.empty() ? fmts.begin()->first : deferred.begin()->first;
+
         std::unique_ptr<ClipboardItem> item;
         try {
-            item = std::make_unique<ClipboardItem>(primary, fmts[primary]);
+            // An image item's primary format is normally the deferred blob, so build from
+            // the format id alone in that case and let the bytes arrive on first use.
+            if (fmts.count(primary))
+                item = std::make_unique<ClipboardItem>(primary, fmts[primary]);
+            else
+                item = std::make_unique<ClipboardItem>(primary, ClipboardItem::DeferredPrimary{});
         } catch (...) { return nullptr; }
-        if (!item || item->formats.empty()) return nullptr;  // constructor rejected the data
+        if (!item) return nullptr;
         for (auto& kv : fmts) {
             if (kv.first != primary && !kv.second.empty())
-                item->AddFormat(kv.first, kv.second);
+                item->AddFormat(kv.first, std::move(kv.second), /*deferIndex=*/true);
         }
+        for (const auto& kv : deferred)
+            item->AddPendingBlob(kv.first, kv.second.data());
+        // Nothing usable survived (e.g. the byte constructor rejected an oversized payload).
+        if (!item->HasAnyFormat()) return nullptr;
+        item->FinalizeSearchIndex();  // once per item, not once per text format
         item->pinned = pinned;
         return item;
+    }
+}
+
+// ---- Blob-backed format hydration -----------------------------------------------
+// Defined here rather than beside the other ClipboardItem methods because it needs the
+// blob-directory helpers from the anonymous namespace above.
+
+bool ClipboardItem::HydrateFormat(UINT fmt) const {
+    auto pit = pendingBlobs.find(fmt);
+    if (pit == pendingBlobs.end()) return formats.count(fmt) != 0;
+
+    std::wstring dir = GetClip2DataDir();
+    if (dir.empty()) return false;
+    std::vector<BYTE> bytes;
+    std::wstring blobPath = dir + L"\\blobs\\" + DigestToHex(pit->second.data());
+    if (!ReadWholeFile(blobPath, bytes, (LONGLONG)kPersistFormatCap)) {
+        // Sidecar is gone. Drop the reference so every later access does not retry the
+        // read; the format is simply absent, exactly as before lazy loading existed.
+        pendingBlobs.erase(pit);
+        return false;
+    }
+    blobOrigin[fmt] = pit->second;   // remember these bytes are re-readable from disk
+    formats[fmt] = std::move(bytes);
+    pendingBlobs.erase(pit);
+    return true;
+}
+
+void ClipboardItem::HydrateAllFormats() const {
+    if (pendingBlobs.empty()) return;
+    std::vector<UINT> wanted;
+    wanted.reserve(pendingBlobs.size());
+    for (const auto& kv : pendingBlobs) wanted.push_back(kv.first);
+    for (UINT fmt : wanted) HydrateFormat(fmt);   // erases from pendingBlobs as it goes
+}
+
+void ClipboardItem::DehydrateBlobFormats() {
+    if (blobOrigin.empty()) return;
+    for (auto it = blobOrigin.begin(); it != blobOrigin.end(); ) {
+        UINT fmt = it->first;
+        // Text bytes stay: RebuildSearchIndex reads them, and they are small by comparison.
+        bool isText = (fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT);
+        auto fit = formats.find(fmt);
+        if (isText || fit == formats.end()) { ++it; continue; }
+        formats.erase(fit);
+        pendingBlobs[fmt] = it->second;
+        it = blobOrigin.erase(it);
     }
 }
 
@@ -7431,7 +7743,8 @@ void ClipboardManager::LoadClipboardHistory() {
                 else if (fmt == CF_TEXT) { data.push_back(0); }
                 std::map<UINT, std::vector<BYTE>> fmts;
                 fmts[fmt] = std::move(data);
-                auto item = MakeItemFromFormats(fmts, false);
+                std::map<UINT, ClipboardItem::BlobDigest> noBlobs;
+                auto item = MakeItemFromFormats(fmts, noBlobs, false);
                 if (item) clipboardHistory.push_back(std::move(item));
             } else {  // version >= 2
                 if (off + 1 > len) break;
@@ -7440,6 +7753,7 @@ void ClipboardManager::LoadClipboardHistory() {
                 if (!readDword(formatCount)) break;
                 if (formatCount > 64) break;  // corruption guard
                 std::map<UINT, std::vector<BYTE>> fmts;
+                std::map<UINT, ClipboardItem::BlobDigest> deferred;
                 bool ok = true;
                 for (DWORD f = 0; f < formatCount; f++) {
                     DWORD fmt = 0, size = 0;
@@ -7450,6 +7764,17 @@ void ClipboardManager::LoadClipboardHistory() {
                         BYTE digest[20];
                         memcpy(digest, p + off, 20);
                         off += 20;
+                        // Text blobs are read now (RebuildSearchIndex needs the bytes to
+                        // index them). Everything else -- images, file lists -- is recorded
+                        // as a reference and read on first actual use, so launching does not
+                        // pull the whole image history into memory.
+                        bool isText = (fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT);
+                        if (!isText) {
+                            ClipboardItem::BlobDigest d;
+                            memcpy(d.data(), digest, 20);
+                            deferred[fmt] = d;
+                            continue;
+                        }
                         std::wstring dir = GetClip2DataDir();
                         if (!dir.empty()) {
                             std::vector<BYTE> blobBytes;
@@ -7466,7 +7791,7 @@ void ClipboardManager::LoadClipboardHistory() {
                     off += size;
                 }
                 if (!ok) break;
-                auto item = MakeItemFromFormats(fmts, pinned != 0);
+                auto item = MakeItemFromFormats(fmts, deferred, pinned != 0);
                 if (item) clipboardHistory.push_back(std::move(item));
             }
         }
@@ -7491,14 +7816,17 @@ void ClipboardManager::SaveClipboardHistory() {
 
         // Decide which items to save: all pinned first (exempt from the count cap),
         // then the most recent unpinned items up to maxItems.
+        // The cap applies to UNPINNED items only -- counting pinned items against it
+        // meant a user with `cap` pinned favorites silently persisted no history at all.
         size_t cap = (size_t)std::max(MIN_MAX_ITEMS, std::min(maxItems, MAX_MAX_ITEMS));
         std::vector<size_t> order;
         for (size_t i = 0; i < clipboardHistory.size(); i++)
             if (clipboardHistory[i] && clipboardHistory[i]->pinned) order.push_back(i);
-        for (size_t i = 0; i < clipboardHistory.size() && order.size() < cap + 0; i++) {
+        size_t unpinnedSaved = 0;
+        for (size_t i = 0; i < clipboardHistory.size() && unpinnedSaved < cap; i++) {
             if (clipboardHistory[i] && !clipboardHistory[i]->pinned) {
-                if (order.size() >= cap) break;
                 order.push_back(i);
+                unpinnedSaved++;
             }
         }
 
@@ -7516,6 +7844,13 @@ void ClipboardManager::SaveClipboardHistory() {
         for (size_t idx : order) {
             const auto& item = clipboardHistory[idx];
             if (!item) continue;
+            // Formats whose bytes are still on disk are re-emitted straight from the
+            // digest we already hold: no read, no re-hash, and the sidecar is already
+            // there. Their hashes MUST land in referencedBlobs or the GC below would
+            // delete the very files this index points at.
+            std::vector<std::pair<UINT, ClipboardItem::BlobDigest>> blobRefs;
+            for (const auto& kv : item->pendingBlobs) blobRefs.emplace_back(kv.first, kv.second);
+
             // Collect formats that fit within the per-format and per-item caps.
             std::vector<std::pair<UINT, const std::vector<BYTE>*>> keep;
             size_t itemTotal = 0;
@@ -7525,12 +7860,31 @@ void ClipboardManager::SaveClipboardHistory() {
                 keep.emplace_back(kv.first, &kv.second);
                 itemTotal += kv.second.size();
             }
-            if (keep.empty()) continue;
+            if (keep.empty() && blobRefs.empty()) continue;
             payload.push_back(item->pinned ? 1 : 0);
-            AppendDword(payload, (DWORD)keep.size());
+            AppendDword(payload, (DWORD)(keep.size() + blobRefs.size()));
+            for (const auto& kv : blobRefs) {
+                AppendDword(payload, (DWORD)kv.first);
+                AppendDword(payload, kBlobSizeMarker);
+                AppendBytes(payload, kv.second.data(), 20);
+                referencedBlobs.insert(DigestToHex(kv.second.data()));
+            }
             for (const auto& kv : keep) {
                 AppendDword(payload, (DWORD)kv.first);
                 BYTE digest[20];
+                // Bytes we read back from a sidecar already have a known digest.
+                auto originIt = item->blobOrigin.find(kv.first);
+                if (originIt != item->blobOrigin.end()) {
+                    memcpy(digest, originIt->second.data(), 20);
+                    std::wstring hex = DigestToHex(digest);
+                    std::wstring blobPath = blobDir + L"\\" + hex;
+                    if (GetFileAttributesW(blobPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+                        WriteFileAtomic(blobPath, kv.second->data(), kv.second->size());
+                    referencedBlobs.insert(hex);
+                    AppendDword(payload, kBlobSizeMarker);
+                    AppendBytes(payload, digest, 20);
+                    continue;
+                }
                 if (kv.second->size() >= kBlobThreshold && Sha1Digest(kv.second->data(), kv.second->size(), digest)) {
                     // Blob reference: size sentinel + SHA1. Write the blob only when new.
                     std::wstring hex = DigestToHex(digest);
@@ -7600,15 +7954,31 @@ void ClipboardManager::ComputeFilteredForPane(bool pinnedOnly, const std::wstrin
 
         // Candidate gate: with a needle of >= 3 chars, an item's body can only contain the
         // needle as a substring when every needle trigram is in the item's bloom filter.
-        // Preview fields are always scored (cheap), so short/fuzzy matches still surface.
+        // Shorter needles have no trigram, so they are gated on the per-character bitmap
+        // instead -- otherwise typing the first character of a search scored every item's
+        // full body (up to 500KB each). Preview fields are always scored (cheap), so
+        // short/fuzzy matches still surface.
         std::vector<unsigned int> needleBits;
         for (size_t i = 0; i + 2 < searchLower.size(); i++)
             needleBits.push_back(TrigramHashBit(searchLower[i], searchLower[i + 1], searchLower[i + 2]));
-        auto bodyCandidate = [&needleBits](const ClipboardItem* item) {
-            if (needleBits.empty()) return true;  // needle < 3 chars: no gate
-            if (item->trigramBloom.size() != kTrigramBloomBytes) return true;  // no index built
-            for (unsigned int bit : needleBits) {
-                if (!(item->trigramBloom[bit >> 3] & (1u << (bit & 7))))
+        std::vector<unsigned int> needleCharBits;
+        if (needleBits.empty()) {
+            for (wchar_t c : searchLower)
+                needleCharBits.push_back(CharBloomBit(c));
+        }
+        auto bodyCandidate = [&needleBits, &needleCharBits](const ClipboardItem* item) {
+            if (!needleBits.empty()) {
+                if (item->trigramBloom.size() != kTrigramBloomBytes) return true;  // no index built
+                for (unsigned int bit : needleBits) {
+                    if (!(item->trigramBloom[bit >> 3] & (1u << (bit & 7))))
+                        return false;
+                }
+                return true;
+            }
+            // Needle is 1-2 chars: every character must be present in the body.
+            if (item->charBloom.size() != kCharBloomBytes) return true;  // no index built
+            for (unsigned int bit : needleCharBits) {
+                if (!(item->charBloom[bit >> 3] & (1u << (bit & 7))))
                     return false;
             }
             return true;
@@ -7855,6 +8225,10 @@ void ClipboardManager::SaveHotkeyConfig() {
 // Update the class background brushes so newly-erased regions use the active BG, then
 // force a full repaint of everything that consumes Theme5250::* in WM_PAINT.
 void ClipboardManager::RefreshThemeVisuals() {
+    // Every colour-changing setter routes through here, so this is the one place the
+    // cached paint pens/brushes need to be dropped.
+    InvalidateThemeGdiCache();
+
     auto refreshClassBrush = [](HWND hwnd, COLORREF c) {
         if (!hwnd) return;
         HBRUSH oldBrush = (HBRUSH)GetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND);
@@ -9180,6 +9554,15 @@ static LONG WINAPI Clip2ExceptionHandler(LPEXCEPTION_POINTERS p) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     SetUnhandledExceptionFilter(Clip2ExceptionHandler);
+
+    // Refuse to run a second copy -- see AcquireSingleInstanceLock for why this matters
+    // beyond tidiness. Raise the running overlay instead so a double-launch still feels
+    // like it did something.
+    if (!AcquireSingleInstanceLock()) {
+        ShowOverlayOfRunningInstance();
+        return 0;
+    }
+
     try {
         ClipboardManager manager;
         
@@ -9198,6 +9581,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBox(nullptr, L"clip2 crashed with an unknown error during startup.", L"clip2 Error", MB_OK | MB_ICONERROR);
         return 1;
     }
+    ReleaseSingleInstanceLock();
     return 0;
 }
 

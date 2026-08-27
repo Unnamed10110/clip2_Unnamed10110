@@ -18,10 +18,11 @@
 #include <chrono>
 #include <map>
 #include <set>
+#include <array>
 
 struct ClipboardItem {
     UINT format;  // Primary format (for display/compatibility)
-    std::map<UINT, std::vector<BYTE>> formats;  // All formats stored
+    mutable std::map<UINT, std::vector<BYTE>> formats;  // All formats (mutable: lazy blob hydration)
     std::wstring preview;
     std::wstring formatName;
     std::wstring fileType;
@@ -35,7 +36,7 @@ struct ClipboardItem {
     bool pinned;  // Pinned/favorite items stay on top, survive Clear, and always persist
     
     ClipboardItem(UINT fmt, const std::vector<BYTE>& d) 
-        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), thumbnailAttempted(false), previewAttempted(false), isImage(false), isVideo(false), pinned(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]") {
+        : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), thumbnailAttempted(false), previewAttempted(false), isImage(false), isVideo(false), pinned(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]"), searchIndexDirty(false) {
         // CRITICAL: Store data first, before any processing
         if (d.empty() || d.size() > 200 * 1024 * 1024) {
             return;
@@ -44,38 +45,8 @@ struct ClipboardItem {
         // Store format data immediately - this must succeed
         formats[fmt] = d;
         
-        // Get format name - simple, safe operation
-        if (fmt == CF_TEXT) formatName = L"Text";
-        else if (fmt == CF_UNICODETEXT) formatName = L"Unicode Text";
-        else if (fmt == CF_OEMTEXT) formatName = L"OEM Text";
-        else if (fmt == CF_BITMAP) formatName = L"Bitmap";
-        else if (fmt == CF_DIB) formatName = L"DIB";
-        else if (fmt == CF_DIBV5) formatName = L"DIB v5";
-        else if (fmt == CF_HDROP) formatName = L"File Drop";
-        else {
-            // Try to get format name, but don't crash if it fails
-            try {
-                wchar_t name[256] = {0};
-                if (GetClipboardFormatNameW(fmt, name, 256)) {
-                    formatName = name;
-                }
-            } catch (...) {
-                formatName = L"Unknown Format";
-            }
-        }
-        
-        // Get file type - simple checks only
-        if (fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT) {
-            fileType = L"Text";
-        } else if (fmt == CF_BITMAP || fmt == CF_DIB || fmt == CF_DIBV5) {
-            fileType = L"Image";
-            isImage = true;
-        } else if (fmt == CF_HDROP) {
-            fileType = L"Files";
-        } else {
-            fileType = L"Other";
-        }
-        
+        InitFormatMetadata(fmt);
+
         // Get preview - ONLY for text formats, skip complex processing
         if (fmt == CF_UNICODETEXT && d.size() >= sizeof(wchar_t) && d.size() < 100000) {
             try {
@@ -113,18 +84,86 @@ struct ClipboardItem {
         RebuildSearchIndex();
     }
     
-    // Add additional format
-    void AddFormat(UINT fmt, const std::vector<BYTE>& d) {
+    // Primary format is a blob still sitting on disk (history load). Metadata is derived
+    // from the format id alone -- only text previews read the payload, and text formats
+    // are never deferred. Delegates to the byte constructor with an empty payload, whose
+    // early-out leaves `formats` empty, which is exactly what a deferred primary wants.
+    struct DeferredPrimary {};
+    ClipboardItem(UINT fmt, DeferredPrimary)
+        : ClipboardItem(fmt, std::vector<BYTE>()) {
+        InitFormatMetadata(fmt);
+        preview = L"[" + formatName + L"]";
+        RebuildSearchIndex();
+    }
+
+    // Add additional format.
+    // Rebuilding the search index is a full pass over up to 500KB of text plus a
+    // trigram pass, so callers that add SEVERAL formats in a row (clipboard capture,
+    // history load) pass deferIndex=true and call FinalizeSearchIndex() once at the
+    // end -- otherwise an item with text + RTF + HTML reindexes itself three times.
+    // The rvalue overload avoids copying the payload a second time into the map.
+    void AddFormat(UINT fmt, const std::vector<BYTE>& d, bool deferIndex = false) {
         formats[fmt] = d;
-        if (fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT)
-            RebuildSearchIndex();  // body text changed
+        pendingBlobs.erase(fmt);   // explicit bytes supersede any on-disk reference
+        blobOrigin.erase(fmt);
+        NoteTextFormatAdded(fmt, deferIndex);
+    }
+    void AddFormat(UINT fmt, std::vector<BYTE>&& d, bool deferIndex = false) {
+        formats[fmt] = std::move(d);
+        pendingBlobs.erase(fmt);
+        blobOrigin.erase(fmt);
+        NoteTextFormatAdded(fmt, deferIndex);
+    }
+    // Rebuild the index if any deferred AddFormat touched a text format. Cheap no-op otherwise.
+    void FinalizeSearchIndex() {
+        if (searchIndexDirty) RebuildSearchIndex();
     }
     
-    // Get data for a specific format
+    // ---- Blob-backed formats (lazy load) ----
+    // Formats >= 256KB are persisted as content-addressed sidecar files under
+    // %APPDATA%\clip2\blobs. Reading every one at startup put the entire image history
+    // in RAM before the tray icon appeared, so non-text blobs are recorded here as a
+    // digest and read on first real use. Because the sidecar IS the backing store,
+    // hydrated bytes can also be handed back (DehydrateBlobFormats) and re-read later.
+    // Text blobs are never deferred -- RebuildSearchIndex needs their bytes at load time.
+    typedef std::array<BYTE, 20> BlobDigest;
+    mutable std::map<UINT, BlobDigest> pendingBlobs;  // format -> digest, bytes not read yet
+    mutable std::map<UINT, BlobDigest> blobOrigin;    // format -> digest for bytes we DID read
+
+    void AddPendingBlob(UINT fmt, const BYTE digest[20]) {
+        BlobDigest d;
+        memcpy(d.data(), digest, 20);
+        pendingBlobs[fmt] = d;
+        formats.erase(fmt);
+    }
+    // True when the item carries a format at all, loaded or still on disk. Callers that
+    // used to test formats.empty() must use this, or a deferred image looks like nothing.
+    bool HasAnyFormat() const { return !formats.empty() || !pendingBlobs.empty(); }
+    bool HasFormat(UINT fmt) const {
+        return formats.count(fmt) != 0 || pendingBlobs.count(fmt) != 0;
+    }
+    size_t FormatCount() const { return formats.size() + pendingBlobs.size(); }
+    // Read every outstanding blob. Required before iterating `formats` for its bytes.
+    void HydrateAllFormats() const;
+    // Release bytes that can be re-read from a sidecar, turning them back into pending
+    // references. Text is left alone (the search index reads it).
+    void DehydrateBlobFormats();
+    // Drop a format entirely, loaded or pending.
+    void RemoveFormat(UINT fmt) {
+        formats.erase(fmt);
+        pendingBlobs.erase(fmt);
+        blobOrigin.erase(fmt);
+    }
+
+    // Get data for a specific format. Hydrates from the sidecar on demand.
     const std::vector<BYTE>* GetFormatData(UINT fmt) const {
         auto it = formats.find(fmt);
         if (it != formats.end()) {
             return &it->second;
+        }
+        if (pendingBlobs.count(fmt) != 0 && HydrateFormat(fmt)) {
+            it = formats.find(fmt);
+            if (it != formats.end()) return &it->second;
         }
         return nullptr;
     }
@@ -136,6 +175,8 @@ struct ClipboardItem {
     std::wstring searchPreviewLower;            // lowercase preview + formatName + fileType
     std::wstring searchBodyLower;               // lowercase full searchable text (<= 500KB)
     std::vector<unsigned char> trigramBloom;    // 1KB bloom filter of text trigrams (no false negatives)
+    std::vector<unsigned char> charBloom;       // 32B presence bitmap of text chars (gates 1-2 char needles)
+    bool searchIndexDirty;                      // a deferred AddFormat changed body text
     void RebuildSearchIndex();                  // call after any text-format mutation
     
     ~ClipboardItem() {
@@ -152,7 +193,72 @@ struct ClipboardItem {
     HBITMAP GetPreviewBitmap();  // Generate larger hover preview on demand (lazy)
     void EnsureThumbnail();      // Generate the 48x48 thumbnail on first need (lazy)
 
+    // ---- Cached bitmap lifetime ----
+    // Both cached bitmaps used to live until the item itself died, so browsing a long
+    // image history grew the process without bound: hover previews are up to 500x500
+    // (~1MB each) and every thumbnail pins one GDI object. They are now released under
+    // a cap (ClipboardManager::TrimBitmapCaches) and regenerate lazily on next use.
+    // useTick orders them by recency; 0 means "never used".
+    unsigned long long previewUseTick = 0;
+    unsigned long long thumbUseTick = 0;
+    void ReleasePreviewBitmap() {
+        if (previewBitmap) { DeleteObject(previewBitmap); previewBitmap = nullptr; }
+        previewAttempted = false;   // allow regeneration on next hover
+        previewUseTick = 0;
+    }
+    void ReleaseThumbnail() {
+        if (thumbnail) { DeleteObject(thumbnail); thumbnail = nullptr; }
+        thumbnailAttempted = false;
+        thumbUseTick = 0;
+    }
+
 private:
+    // Shared tail of both AddFormat overloads: only text formats affect the index.
+    // Read one outstanding blob into `formats`. Defined in the .cpp beside the blob
+    // directory helpers. Returns false when the sidecar is missing or unreadable.
+    bool HydrateFormat(UINT fmt) const;
+
+    void NoteTextFormatAdded(UINT fmt, bool deferIndex) {
+        if (fmt != CF_TEXT && fmt != CF_UNICODETEXT && fmt != CF_OEMTEXT) return;
+        if (deferIndex) searchIndexDirty = true;
+        else RebuildSearchIndex();
+    }
+
+    // Format name / file type / isImage, all derived from the format id alone.
+    void InitFormatMetadata(UINT fmt) {
+        if (fmt == CF_TEXT) formatName = L"Text";
+        else if (fmt == CF_UNICODETEXT) formatName = L"Unicode Text";
+        else if (fmt == CF_OEMTEXT) formatName = L"OEM Text";
+        else if (fmt == CF_BITMAP) formatName = L"Bitmap";
+        else if (fmt == CF_DIB) formatName = L"DIB";
+        else if (fmt == CF_DIBV5) formatName = L"DIB v5";
+        else if (fmt == CF_HDROP) formatName = L"File Drop";
+        else {
+            // Try to get format name, but don't crash if it fails
+            try {
+                wchar_t name[256] = {0};
+                if (GetClipboardFormatNameW(fmt, name, 256)) {
+                    formatName = name;
+                }
+            } catch (...) {
+                formatName = L"Unknown Format";
+            }
+        }
+        
+        // Get file type - simple checks only
+        if (fmt == CF_TEXT || fmt == CF_UNICODETEXT || fmt == CF_OEMTEXT) {
+            fileType = L"Text";
+        } else if (fmt == CF_BITMAP || fmt == CF_DIB || fmt == CF_DIBV5) {
+            fileType = L"Image";
+            isImage = true;
+        } else if (fmt == CF_HDROP) {
+            fileType = L"Files";
+        } else {
+            fileType = L"Other";
+        }
+        
+    }
+
     std::wstring GetFormatName(UINT fmt);
     std::wstring GetFileType(UINT fmt);
     std::wstring GetPreview(const std::vector<BYTE>& data, UINT fmt);
@@ -215,6 +321,9 @@ private:
     void ComputeFilteredForPane(bool pinnedOnly, const std::wstring& search, std::vector<int>& out);
     void ShowPreviewWindow(int itemIndex, int x, int y);
     void HidePreviewWindow();
+    // Release cached thumbnails / hover previews beyond a recency cap so a long image
+    // history cannot grow the process without bound. Cheap: one pass over the history.
+    void TrimBitmapCaches();
     int GetItemAtPosition(int x, int y);
     void PasteItem(int index);
     void PasteMultipleItems();

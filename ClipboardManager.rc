@@ -3,3 +3,9 @@
 1 ICON "ico2.ico"
 101 RCDATA "click.mp3"
 
+// Application manifest, embedded through the .rc so it lands in the binary under both
+// MSVC (rc.exe) and MinGW (windres). 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST.
+// MSVC additionally generates its own manifest, so the build passes /MANIFEST:NO to keep
+// this one authoritative.
+1 24 "app.manifest"
+

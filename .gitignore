@@ -1,3 +1,6 @@
+# Stale source dump, kept on disk but not tracked
+commit_cpp.txt
+
 # Build directories
 build/
 cmake-build-*/

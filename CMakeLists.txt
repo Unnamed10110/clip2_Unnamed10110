@@ -22,6 +22,16 @@ if(WIN32)
         ico2.ico
         click.mp3
     )
+
+    # app.manifest is embedded by ClipboardManager.rc (see the RT_MANIFEST entry there),
+    # which keeps it working under both MSVC and MinGW. MSVC's linker would otherwise
+    # generate a competing manifest of its own, so suppress that and re-run the resource
+    # step whenever the manifest changes.
+    set_property(SOURCE ${RESOURCE_FILE} APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_SOURCE_DIR}/app.manifest")
+    if(MSVC)
+        target_link_options(${PROJECT_NAME} PRIVATE "/MANIFEST:NO")
+    endif()
     
     # Copy click.mp3 to build directory for fallback
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
