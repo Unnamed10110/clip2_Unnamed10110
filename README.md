@@ -78,11 +78,11 @@ Hover an image/video for a larger preview. Row thumbnails load lazily when a row
 |-----|--------|
 | **U** | Paste URL with tracking params stripped (`utm_*`, `fbclid`, `gclid`, …) |
 | **M** | **If 2+ items are multi-selected:** merge them into a **new top history item** (Unicode + RTF + HTML, unpinned). **Otherwise:** paste as a Markdown link |
-| **P** | **If 2+ items are multi-selected:** paste them as **plain text** (one line per item) **and** insert that plain merge as a new top history item. **Otherwise:** paste as file path(s) |
+| **P** | Paste as **plain text**. **If 2+ items are multi-selected:** also insert that plain merge as a new top history item (one line per item). File-path paste remains in the context menu. |
 | **H** | Paste HTML as plain text |
 | **E** | Edit selection (or joined multi-selection), then paste — history unchanged |
 | **X** | Same editor; **Save** / **Ctrl+Enter** adds a **new** history item and updates the clipboard |
-| **Z** | **Excel cell fill (needs 2+ multi-selected items):** paste each item into its own cell with full rich formats, pressing **Enter** between items to move down one row (no Enter after the last) |
+| **Z** | **Excel cell fill (needs 2+ multi-selected items):** for each item, **F2** (edit cell) → paste rich formats → **Enter** (commit and move down). Same cycle for every selected item. |
 
 Also available from the right-click menu (**Paste as…**, **Edit & Paste…**, **Edit & Save as new…**, **Merge selection into new item**, **Paste & merge as plain text**, **Paste into Excel**). Modes that don’t apply fail silently.
 
@@ -91,8 +91,8 @@ Also available from the right-click menu (**Paste as…**, **Edit & Paste…**, 
 - Multi-select text/RTF/HTML items and press **Enter**: one clipboard payload with each item on its own line (`\r\n` / RTF paragraph / HTML `<br>`), formatting preserved via RichEdit merge, single Ctrl+V (no Enter keystrokes). The same merged payload is also inserted as a **new top history item** (rich, or plain when using Ctrl+Enter).
 - Mixed image/file selections paste sequentially, with line breaks inserted as clipboard text where needed; joined text (when present) is recorded as a new plain history item.
 - **M** with 2+ selected items creates a new unpinned history entry at the top of the main list (rich formats kept).
-- **P** with 2+ selected items pastes as plain text and inserts a plain merged item at the top.
-- **Z** with 2+ selected items is the Excel special paste: items are pasted one by one (each with its original rich clipboard formats), with a real **Enter** keystroke between pastes so Excel's active cell moves down a row per item. Independent of Enter multi-paste — nothing is merged and no line breaks are embedded.
+- **P** pastes as plain text (single item or multi-select). With 2+ selected items it also inserts a plain merged item at the top.
+- **Z** with 2+ selected items is the Excel special paste: for each item, **F2** opens the cell for edit, the item is pasted with its original rich clipboard formats, then **Enter** commits and moves down one row. Same F2 → paste → Enter cycle for every selected item. Independent of Enter multi-paste — nothing is merged and no line breaks are embedded.
 
 ### Pinned items
 

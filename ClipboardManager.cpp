@@ -128,8 +128,8 @@ static void ApplyThemeId(int id) {
     Theme5250::SEL_FG = RGB(0, 0, 0);
     Theme5250::BORDER = p.border;
     Theme5250::DIM    = p.dim;
-    Theme5250::TXT    = p.txt;
-    Theme5250::SEL_BG = p.selBg;
+        Theme5250::TXT    = p.txt;
+        Theme5250::SEL_BG = p.selBg;
 
     // 2. Legacy single "Font color" accent override (kept for backward compatibility):
     //    when set, it recolors both text and selection background.
@@ -927,9 +927,9 @@ static const long long kMaxDibImageBytes   = 256LL * 1024 * 1024;
 static std::vector<BYTE> ConvertBitmapToDIB(HBITMAP hBitmap) {
     std::vector<BYTE> dibData;
     if (!hBitmap) return dibData;
-
+    
     HDC hdcScreen = GetDC(nullptr);
-
+    
     BITMAP bm;
     if (GetObject(hBitmap, sizeof(BITMAP), &bm)) {
         // Bound the dimensions BEFORE any size arithmetic. The row/image math below used
@@ -952,11 +952,11 @@ static std::vector<BYTE> ConvertBitmapToDIB(HBITMAP hBitmap) {
         bih.biPlanes = 1;
         bih.biBitCount = bm.bmBitsPixel;
         bih.biCompression = BI_RGB;
-
+        
         // Calculate size needed (64-bit throughout: 50000 x 50000 x 32bpp overflows int).
         long long rowSize = (((long long)bm.bmWidth * bm.bmBitsPixel + 31) / 32) * 4;
         long long imageSize = rowSize * absHeight;
-
+        
         // Allocate buffer for header + color table + bits
         long long colorTableSize = 0;
         if (bih.biBitCount <= 8) {
@@ -979,18 +979,18 @@ static std::vector<BYTE> ConvertBitmapToDIB(HBITMAP hBitmap) {
         }
         BITMAPINFOHEADER* pBih = (BITMAPINFOHEADER*)dibData.data();
         *pBih = bih;
-
+        
         // Get bits
         BITMAPINFO* pBmi = (BITMAPINFO*)dibData.data();
         void* pBits = dibData.data() + sizeof(BITMAPINFOHEADER) + (size_t)colorTableSize;
-
+        
         if (GetDIBits(hdcScreen, hBitmap, 0, absHeight, pBits, pBmi, DIB_RGB_COLORS)) {
             // Success
         } else {
             dibData.clear();
         }
     }
-
+    
     ReleaseDC(nullptr, hdcScreen);
     return dibData;
 }
@@ -1933,6 +1933,7 @@ static void SendVkTap(WORD vk) {
 }
 
 static void SendEnterKey() { SendVkTap(VK_RETURN); }
+static void SendF2Key() { SendVkTap(VK_F2); }
 
 // Read plain text from the clipboard (CF_UNICODETEXT, falling back to CF_TEXT).
 // Returns empty string when no text is available.
@@ -2045,7 +2046,7 @@ static std::wstring TrimTrailingForMultiPasteJoin(std::wstring s) {
 static bool ItemHasPasteableText(const ClipboardItem* item) {
     if (!item) return false;
     if (!TrimTrailingForMultiPasteJoin(GetPlainTextForDirectPaste(item)).empty())
-        return true;
+    return true;
     const std::vector<BYTE>* htmlData = item->GetFormatData(CfHtml());
     if (htmlData && !htmlData->empty()) return true;
     UINT rtf = CfRtf();
@@ -2694,7 +2695,7 @@ bool ClipboardManager::Initialize() {
 void ClipboardManager::Run() {
     isRunning = true;
     MSG msg;
-
+    
     // Plain blocking pump. GetMessage already sleeps the thread until a message
     // arrives, so neither a PeekMessage drain nor a Sleep() adds anything -- and a
     // Sleep here would put a latency floor under every keystroke, mouse move and
@@ -2973,10 +2974,10 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                         mgr->FocusListWindow();
                     } else {
                         mgr->HideListWindow();
-                    }
+                        }
                 } else {
                     // We had the foreground and lost it: the user switched away -> dismiss.
-                    mgr->HideListWindow();
+                            mgr->HideListWindow();
                 }
             } else {
                 // Window is not visible or not supposed to be visible - stop timer
@@ -3174,10 +3175,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdcWindow = BeginPaint(hwnd, &ps);
-
+        
         RECT rect;
         GetClientRect(hwnd, &rect);
-
+        
         // ---- Resolve which pane this window is rendering -------------------------
         // The live member state belongs to the focused pane; the other pane renders
         // from its snapshot (read-only look: dimmed selection, no hover, no multi-select).
@@ -3218,7 +3219,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         FillRect(hdc, &rect, tg.bg);
 
         HGDIOBJ hOldFont = SelectObject(hdc, GetOverlayFont());
-
+        
         // ---- Header bar ----------------------------------------------------------
         {
             RECT headerRect = { 0, 0, rect.right, HEADER_H };
@@ -3226,7 +3227,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
 
             // App name (bold) on the left.
             SelectObject(hdc, GetOverlayFontBold());
-            SetTextColor(hdc, Theme5250::TXT);
+        SetTextColor(hdc, Theme5250::TXT);
             RECT nameRect = { 12, 0, rect.right / 2, HEADER_H };
             DrawTextW(hdc, L"clip2", -1, &nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
@@ -3330,11 +3331,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 if (i >= (int)mgr->filteredSnippetIndices.size()) break;
                 int actualIndex = mgr->filteredSnippetIndices[i];
                 const auto& snip = mgr->snippets[actualIndex];
-
+                
                 bool isSelected = (i == pSelected && pSelected >= 0);
                 bool isHover = (i == pHover);
                 RECT rowRect = { 6, yPos + 2, rowRight, yPos + itemHeight - 2 };
-
+                
                 if (isSelected) {
                     fillRowHilite(rowRect, tg.selBg);
                 } else if (isHover) {
@@ -3370,7 +3371,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 if (i >= (int)pFiltered.size()) break;
                 int actualIndex = pFiltered[i];
                 if (actualIndex < 0 || actualIndex >= (int)mgr->clipboardHistory.size()) continue;
-                const auto& item = mgr->clipboardHistory[actualIndex];
+            const auto& item = mgr->clipboardHistory[actualIndex];
                 if (!item) continue;
 
                 bool isMultiSelected = paneIsActive && mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
@@ -3403,12 +3404,12 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 if (paneIsActive) item->EnsureThumbnail();
                 if (paneIsActive && item->thumbnail) {
                     int thumbSize = 36;
-                    int thumbY = yPos + (itemHeight - thumbSize) / 2;
+                int thumbY = yPos + (itemHeight - thumbSize) / 2;
                     HDC hdcMem = CreateCompatibleDC(hdc);
                     HGDIOBJ ob = SelectObject(hdcMem, item->thumbnail);
                     BitBlt(hdc, contentLeft, thumbY, thumbSize, thumbSize, hdcMem, 0, 0, SRCCOPY);
                     SelectObject(hdcMem, ob);
-                    DeleteDC(hdcMem);
+                DeleteDC(hdcMem);
                     contentLeft += thumbSize + 10;
                 } else {
                     // Letter badge in a rounded box indicating the item type.
@@ -3644,25 +3645,32 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             mgr->MergeSelectedItems(/*plainOnly=*/false);
             return 0;
         }
-        // P + multi-selection → paste as plain text and merge as plain text into the list.
+        // P → paste as plain text (single item or multi-select merge).
         // Same Ctrl-held rule as M/Z so Ctrl+Click multi-select still works.
-        if (!mgr->snippetsMode && wParam == 'P' && mgr->multiSelectedIndices.size() >= 2) {
-            mgr->PastePlainAndMergeSelection();
-            mgr->HideListWindow();
+        if (!mgr->snippetsMode && wParam == 'P') {
+            if (mgr->multiSelectedIndices.size() >= 2) {
+                mgr->PastePlainAndMergeSelection();
+                mgr->HideListWindow();
+            } else if (mgr->selectedIndex >= 0 &&
+                       mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                if (mgr->PasteItemAsPlainText(mgr->selectedIndex))
+                    mgr->HideListWindow();
+            }
             return 0;
         }
-        // Z + multi-selection → Excel special paste: each item rich into its own cell,
-        // Enter between items. Also runs with Ctrl still held from Ctrl+Click multi-select.
+        // Z + multi-selection → Excel special paste: F2, paste, Enter per item.
+        // Also runs with Ctrl still held from Ctrl+Click multi-select.
         if (!mgr->snippetsMode && wParam == 'Z' && mgr->multiSelectedIndices.size() >= 2) {
             mgr->PasteExcelSelection();
             mgr->HideListWindow();
             return 0;
         }
         // Smart paste one-key modes + edit (clipboard mode, no Ctrl).
-        // U = clean URL, M = Markdown link, P = file path, H = HTML->plain,
+        // U = clean URL, M = Markdown link, H = HTML->plain,
         // E = edit then paste, X = edit and save as a new history item.
+        // P is handled above (plain text, single or multi).
         if (!mgr->snippetsMode && !ctrlPressed &&
-            (wParam == 'U' || wParam == 'M' || wParam == 'P' || wParam == 'H' || wParam == 'E' || wParam == 'X')) {
+            (wParam == 'U' || wParam == 'M' || wParam == 'H' || wParam == 'E' || wParam == 'X')) {
             if (wParam == 'E') {
                 mgr->ShowEditPasteDialog(/*saveAsNew=*/false);
                 return 0;
@@ -3673,7 +3681,6 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             }
             int smartMode = (wParam == 'U') ? SMART_PASTE_URL_CLEAN
                           : (wParam == 'M') ? SMART_PASTE_MARKDOWN
-                          : (wParam == 'P') ? SMART_PASTE_FILEPATH
                                             : SMART_PASTE_HTML_PLAIN;
             if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
                 if (mgr->SmartPasteItem(mgr->selectedIndex, smartMode)) {
@@ -3974,7 +3981,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 mgr->hoveredItemIndex = itemIndex;
                 mgr->UpdateListWindow(/*includeInactive=*/false);
             }
-
+            
             if (mgr->snippetsMode) {
                 mgr->HidePreviewWindow();
             } else if (itemIndex >= 0 && itemIndex < (int)mgr->filteredIndices.size()) {
@@ -4006,7 +4013,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
     case WM_MOUSELEAVE:
         mgr->HidePreviewWindow();
         if (mgr->hoveredItemIndex != -1) {
-            mgr->hoveredItemIndex = -1;
+        mgr->hoveredItemIndex = -1;
             mgr->UpdateListWindow(/*includeInactive=*/false);
         }
         break;
@@ -4197,7 +4204,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 HMENU hSmartMenu = CreatePopupMenu();
                 AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_URL_CLEAN, L"Clean URL (strip tracking)\tU");
                 AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_MARKDOWN, L"Markdown link\tM");
-                AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_FILEPATH, L"File path\tP");
+                AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_PLAIN, L"Plain text\tP");
+                AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_FILEPATH, L"File path");
                 AppendMenu(hSmartMenu, MF_STRING, SMART_PASTE_HTML_PLAIN, L"HTML \x2192 plain text\tH");
                 AppendMenu(hMenu, MF_STRING | MF_POPUP, (UINT_PTR)hSmartMenu, L"Paste as");
                 AppendMenu(hMenu, MF_STRING, SMART_PASTE_EDIT, L"Edit && Paste...\tE");
@@ -4205,7 +4213,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 if (mgr->multiSelectedIndices.size() >= 2) {
                     AppendMenu(hMenu, MF_STRING, SMART_MERGE_SELECTION, L"Merge selection into new item\tM");
                     AppendMenu(hMenu, MF_STRING, SMART_PASTE_PLAIN_MERGE, L"Paste && merge as plain text\tP");
-                    AppendMenu(hMenu, MF_STRING, SMART_PASTE_EXCEL, L"Paste into Excel (Enter between)\tZ");
+                    AppendMenu(hMenu, MF_STRING, SMART_PASTE_EXCEL, L"Paste into Excel (F2 + paste + Enter)\tZ");
                 }
                 AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             }
@@ -4281,6 +4289,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 mgr->ShowEditPasteDialog(/*saveAsNew=*/true);
             } else if (cmd == SMART_MERGE_SELECTION && !mgr->snippetsMode) {
                 mgr->MergeSelectedItems(/*plainOnly=*/false);
+            } else if (cmd == SMART_PASTE_PLAIN && clickedItemIndex >= 0 && clickedItemIndex < listSize && !mgr->snippetsMode) {
+                if (mgr->PasteItemAsPlainText(clickedItemIndex))
+                    mgr->HideListWindow();
             } else if (cmd == SMART_PASTE_PLAIN_MERGE && !mgr->snippetsMode) {
                 mgr->PastePlainAndMergeSelection();
                 mgr->HideListWindow();
@@ -4302,8 +4313,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             // Scroll whichever panel the wheel is over, without stealing keyboard focus.
             if (wheelActive) {
                 int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
-                int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
-                int oldOffset = mgr->scrollOffset;
+            int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
+            int oldOffset = mgr->scrollOffset;
                 mgr->scrollOffset = (delta > 0) ? std::max(0, mgr->scrollOffset - 3)
                                                 : std::min(maxScroll, mgr->scrollOffset + 3);
                 if (mgr->scrollOffset != oldOffset) mgr->UpdateListWindow(/*includeInactive=*/false);
@@ -4605,15 +4616,15 @@ LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam
         if (couldBeSnippets) {
             // Snippets overlay shortcut is optional -- when unbound (vkCode == 0) we
             // never get here, so the keypress falls through untouched.
-            bool snipCtrl  = (mgr->snippetsHotkey.modifiers & MOD_CONTROL) != 0;
-            bool snipAlt   = (mgr->snippetsHotkey.modifiers & MOD_ALT) != 0;
-            bool snipShift = (mgr->snippetsHotkey.modifiers & MOD_SHIFT) != 0;
-            bool snipWin   = (mgr->snippetsHotkey.modifiers & MOD_WIN) != 0;
-            bool snipMatch = (snipCtrl == isCtrlPressed) && (snipAlt == isAltPressed) &&
-                             (snipShift == isShiftPressed) && (snipWin == isWinPressed);
+                bool snipCtrl  = (mgr->snippetsHotkey.modifiers & MOD_CONTROL) != 0;
+                bool snipAlt   = (mgr->snippetsHotkey.modifiers & MOD_ALT) != 0;
+                bool snipShift = (mgr->snippetsHotkey.modifiers & MOD_SHIFT) != 0;
+                bool snipWin   = (mgr->snippetsHotkey.modifiers & MOD_WIN) != 0;
+                bool snipMatch = (snipCtrl == isCtrlPressed) && (snipAlt == isAltPressed) &&
+                                 (snipShift == isShiftPressed) && (snipWin == isWinPressed);
             if (wParam == WM_KEYDOWN && snipMatch) {
-                PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
-                return 1;
+                    PostMessage(mgr->hwndMain, ClipboardManager::WM_SNIPPETS_OVERLAY_HOTKEY, 0, 0);
+                    return 1;
             }
         }
         
@@ -4717,7 +4728,7 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
         }
         FilterItems();
         selectedIndex = (filteredIndices.empty() ? -1 : 0);
-    }
+        }
     RefreshInactivePane();  // populate the pinned panel snapshot
     ClearMultiSelection(); // Clear multi-selection when showing list
 
@@ -4748,7 +4759,7 @@ void ClipboardManager::ShowListWindow(bool startInSnippetsMode) {
     // Show search boxes without activating (pinned search must never steal focus on open).
     if (hwndMainSearch) ShowWindow(hwndMainSearch, SW_SHOWNA);
     if (hwndPinnedSearch) ShowWindow(hwndPinnedSearch, SW_SHOWNA);
-
+    
     ShowWindow(hwndList, SW_SHOW);
     UpdateListWindow();
 
@@ -5319,7 +5330,7 @@ void ClipboardManager::PasteMultipleItems() {
         int actualIndex = filteredIndices[filteredIndex];
         if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
         if (clipboardHistory[actualIndex])
-            selectedItems.push_back(clipboardHistory[actualIndex].get());
+        selectedItems.push_back(clipboardHistory[actualIndex].get());
     }
     if (selectedItems.empty()) {
         ClearMultiSelection();
@@ -5452,7 +5463,7 @@ void ClipboardManager::PasteMultipleItems() {
                 clipboardSet = SetClipboardMergedRich(hwndMain, one, /*includeRich=*/true);
             }
             if (!clipboardSet)
-                clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
+            clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
         } else if (!pasteAsPlainText && item->HasAnyFormat()) {
             clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
         }
@@ -5509,10 +5520,10 @@ void ClipboardManager::PasteMultipleItems() {
     PlayClickSound();
 }
 
-// Excel special paste (Z): each multi-selected item is restored to the clipboard with its
-// full rich formats and pasted with Ctrl+V, then a real Enter keystroke moves Excel's
-// active cell down before the next item. No merged payload, no embedded \r\n — navigation
-// is only the Enter key between pastes, and there is no Enter after the last item.
+// Excel special paste (Z): for each multi-selected item, F2 opens the active Excel cell
+// for in-cell edit, the item is pasted with its full rich formats, then Enter commits
+// the cell and moves down one row. Same F2 → paste → Enter cycle for every selected
+// item (including the last). No merged payload, no embedded \r\n.
 void ClipboardManager::PasteExcelSelection() {
     if (multiSelectedIndices.size() < 2) return;
 
@@ -5590,15 +5601,15 @@ void ClipboardManager::PasteExcelSelection() {
 
         lastSequenceNumber = GetClipboardSequenceNumber();
         Sleep(20);
+        // F2 puts Excel into in-cell edit so the paste lands in the formula bar /
+        // cell editor instead of as a full-cell clipboard dump.
+        SendF2Key();
+        Sleep(100);
         SendCtrlV();
         Sleep(220);
-
-        // Enter moves Excel's active cell down; skip after the last item so focus
-        // stays on the last filled cell.
-        if (i + 1 < selectedItems.size()) {
-            SendEnterKey();
-            Sleep(100);
-        }
+        // Enter commits the edited cell and moves the active cell down one row.
+        SendEnterKey();
+        Sleep(100);
     }
 
     Sleep(200);
@@ -5708,6 +5719,20 @@ void ClipboardManager::MergeSelectedItems(bool plainOnly) {
 
     Sleep(80);
     isPasting = false;
+}
+
+// P + single item: paste Unicode only (strip RTF/HTML). Returns false when the
+// item has no pasteable text so the overlay can stay open.
+bool ClipboardManager::PasteItemAsPlainText(int filteredIndex) {
+    if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) return false;
+    int actualIndex = filteredIndices[filteredIndex];
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) return false;
+    const ClipboardItem* item = clipboardHistory[actualIndex].get();
+    if (!item) return false;
+    std::wstring text = GetPlainTextForDirectPaste(item);
+    if (text.empty()) return false;
+    PasteTransformedText(text);
+    return true;
 }
 
 // P + multi-select: paste the selection as plain text (one line per item) and also
@@ -6197,7 +6222,7 @@ bool ClipboardManager::CopyFocusedViaSyntheticCopy(std::wstring& outText) {
             if (tgtTid != curTid) AttachThreadInput(curTid, tgtTid, FALSE);
             Sleep(60);
         } else {
-            return false;
+    return false;
         }
     }
     if (!hTarget || !IsWindow(hTarget)) return false;
@@ -6652,7 +6677,7 @@ void ClipboardManager::ProcessClipboard() {
                     }
                     
                     if (item) item->FinalizeSearchIndex();  // one reindex for the whole format set
-
+                    
                     // Check if this matches the text we just pasted (multi-paste combined text)
                     bool isPastPaste = false;
                     if (!lastPastedText.empty() && item && item->format == CF_UNICODETEXT) {
@@ -7460,7 +7485,7 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
     isPasting = false;
     
     MarkHistoryDirty();
-
+    
     // Update the display to show the transformed preview
     FilterItems(); // Rebuild filtered indices in case search is active
     UpdateListWindow(); // Refresh the UI to show updated preview
@@ -7951,7 +7976,7 @@ void ClipboardManager::ComputeFilteredForPane(bool pinnedOnly, const std::wstrin
     } else {
         std::wstring searchLower = search;
         std::transform(searchLower.begin(), searchLower.end(), searchLower.begin(), ::towlower);
-
+        
         // Candidate gate: with a needle of >= 3 chars, an item's body can only contain the
         // needle as a substring when every needle trigram is in the item's bloom filter.
         // Shorter needles have no trigram, so they are gated on the per-character bitmap
@@ -8055,12 +8080,12 @@ void ClipboardManager::FilterItems() {
 
     // Reset scroll offset and selection when filtering (promotion may already set them)
     if (numberInput.empty()) {
-        scrollOffset = 0;
-        if (filteredIndices.empty()) {
-            selectedIndex = -1;
-        } else {
-            selectedIndex = 0;
-        }
+    scrollOffset = 0;
+    if (filteredIndices.empty()) {
+        selectedIndex = -1;
+    } else {
+        selectedIndex = 0;
+    }
     }
     RefreshInactivePane();
     UpdateListWindow();

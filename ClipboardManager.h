@@ -327,8 +327,8 @@ private:
     int GetItemAtPosition(int x, int y);
     void PasteItem(int index);
     void PasteMultipleItems();
-    // Excel special paste (Z): paste each multi-selected item rich, with an Enter
-    // keystroke between items so Excel's active cell moves down one row per item.
+    // Excel special paste (Z): for each multi-selected item, F2 (edit cell),
+    // Ctrl+V (rich formats), then Enter to commit and move down one row.
     void PasteExcelSelection();
     // Merge the current multi-selection into one new history item at the top.
     // plainOnly=false keeps RTF/HTML; plainOnly=true stores Unicode text only.
@@ -336,6 +336,8 @@ private:
     // P + multi-select: paste selection as plain text (one line per item) and also
     // insert that plain merged text as a new top history item.
     void PastePlainAndMergeSelection();
+    // P + single item: paste that item as plain Unicode (no RTF/HTML).
+    bool PasteItemAsPlainText(int filteredIndex);
     // Insert a previously built merge payload as a new unpinned history item at the top.
     // Does not touch the system clipboard. Returns false if unicode is empty / insert fails.
     bool InsertMergedPayloadIntoHistory(const MergedRichPayload& merged, bool plainOnly);
@@ -489,9 +491,9 @@ private:
     static const int HOTKEY_ID_COPY_FOCUSED = 2;  // Ctrl+F10: copy from focused control (UIA)
     static const int HOTKEY_ID_PASTE_FOCUSED = 3;           // Ctrl+F11: keystroke injection (bypass Trillex / paste blocks)
     static const int HOTKEY_ID_PASTE_FOCUSED_CLIPBOARD = 4;  // Ctrl+Shift+F11: clipboard swap + Ctrl+V (VS Code, etc.)
-    static const int DEFAULT_MAX_ITEMS = 300;   // Default history cap when no user override exists
-    static const int MIN_MAX_ITEMS = 10;        // Lower clamp for the configurable history size
-    static const int MAX_MAX_ITEMS = 2000;      // Upper clamp for the configurable history size
+    static constexpr int DEFAULT_MAX_ITEMS = 300;   // Default history cap when no user override exists
+    static constexpr int MIN_MAX_ITEMS = 10;        // Lower clamp for the configurable history size
+    static constexpr int MAX_MAX_ITEMS = 2000;      // Upper clamp for the configurable history size
     int maxItems;                               // Runtime-configurable history cap (registry: MaxItems)
     static const int WINDOW_WIDTH = 600;
     static const int WINDOW_HEIGHT = 600;
@@ -512,13 +514,14 @@ private:
     enum SmartPasteMode {
         SMART_PASTE_URL_CLEAN = 120,   // U: strip tracking params from URL, paste
         SMART_PASTE_MARKDOWN = 121,    // M: paste as Markdown link
-        SMART_PASTE_FILEPATH = 122,    // P: paste as file path(s)
+        SMART_PASTE_FILEPATH = 122,    // File path (context menu; P is now plain text)
         SMART_PASTE_HTML_PLAIN = 123,  // H: HTML -> plain text, paste
         SMART_PASTE_EDIT = 124,        // E: edit/merge before paste (menu entry)
         SMART_PASTE_EDIT_SAVE = 125,   // X: edit and save as a new history item
         SMART_MERGE_SELECTION = 126,   // M (with multi-select): merge into new top item
-        SMART_PASTE_EXCEL = 127,       // Z (with multi-select): Excel cell fill, Enter between
-        SMART_PASTE_PLAIN_MERGE = 128  // P (with multi-select): paste + merge as plain text
+        SMART_PASTE_EXCEL = 127,       // Z (with multi-select): Excel F2 + paste + Enter per item
+        SMART_PASTE_PLAIN_MERGE = 128, // P (with multi-select): paste + merge as plain text
+        SMART_PASTE_PLAIN = 129        // P (single item): paste as plain text
     };
 };
 
