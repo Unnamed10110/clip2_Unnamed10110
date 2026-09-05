@@ -1,0 +1,44 @@
+{
+  "ClipboardManager.cpp": {
+    "mtime": 1788623632.9692311,
+    "seen": 1788629108.3815212,
+    "ast_hash": "1de7546b2775b186aa3c148dbcf7c5ee",
+    "semantic_hash": "1de7546b2775b186aa3c148dbcf7c5ee"
+  },
+  "ClipboardManager.h": {
+    "mtime": 1788628889.9621818,
+    "seen": 1788629108.381528,
+    "ast_hash": "873b324ee4f5869a26460e0fcc25cd0c",
+    "semantic_hash": "873b324ee4f5869a26460e0fcc25cd0c"
+  },
+  "release_github.ps1": {
+    "mtime": 1788623958.3658447,
+    "seen": 1788629108.3815308,
+    "ast_hash": "b654bd95f4168aafb4924b1bfbbd7f3f",
+    "semantic_hash": "b654bd95f4168aafb4924b1bfbbd7f3f"
+  },
+  "CMakeLists.txt": {
+    "mtime": 1787994796.702861,
+    "seen": 1788629108.3815331,
+    "ast_hash": "44bd82aedcd38229ae20f0e6062eb2fa",
+    "semantic_hash": "44bd82aedcd38229ae20f0e6062eb2fa"
+  },
+  "README.md": {
+    "mtime": 1788623633.3980274,
+    "seen": 1788629108.3815353,
+    "ast_hash": "af205c9c83c8465a122d33f329170f21",
+    "semantic_hash": "af205c9c83c8465a122d33f329170f21"
+  },
+  "misc02.png": {
+    "mtime": 1766229325.1332467,
+    "seen": 1788629108.381537,
+    "ast_hash": "c119eae011acbd667b56ff7697bdcc94",
+    "semantic_hash": "c119eae011acbd667b56ff7697bdcc94"
+  },
+  "click.mp3": {
+    "mtime": 1772349756.13648,
+    "seen": 1788629108.381539,
+    "ast_hash": "d621c0805ab7c48d02fa9524aa846aa2",
+    "semantic_hash": "d621c0805ab7c48d02fa9524aa846aa2"
+  }
+}
