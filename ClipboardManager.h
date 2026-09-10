@@ -328,7 +328,8 @@ private:
     void PasteItem(int index);
     void PasteMultipleItems();
     // Excel special paste (Z): for each multi-selected item, F2 (edit cell),
-    // Ctrl+V (rich formats), then Enter to commit and move down one row.
+    // Ctrl+V (Unicode text — F2's in-cell editor rejects sheet/rich formats),
+    // then Enter to commit and move down one row.
     void PasteExcelSelection();
     // Merge the current multi-selection into one new history item at the top.
     // plainOnly=false keeps RTF/HTML; plainOnly=true stores Unicode text only.
@@ -415,6 +416,12 @@ private:
     int overlayPosY;          // Last main-list top-left Y
     bool historyDirty;        // History changed since the last save (debounced via TIMER_SAVE_HISTORY)
     static const UINT_PTR TIMER_SAVE_HISTORY = 2;  // hwndMain timer id (1 = overlay focus check)
+    // Unconditionally re-arms the WH_KEYBOARD_LL hook. Windows silently stops calling
+    // a low-level hook that misses LowLevelHooksTimeout, and nothing else notices.
+    static const UINT_PTR TIMER_HOOK_KEEPALIVE = 3;
+    // Last-resort clears for the re-entrancy flags. The scope guards make a latched
+    // flag essentially impossible; this catches a future path that forgets one.
+    static const UINT_PTR TIMER_FLAG_WATCHDOG = 4;
     NOTIFYICONDATA nid;
     UINT wmTaskbarCreated;
     bool isRunning;
@@ -435,7 +442,28 @@ private:
     bool ignoreNextSChar;  // Ignore next 's' to prevent stray char when entering snippets via "ss"
     bool isPasting;
     bool isProcessingClipboard;  // Prevent re-entrant clipboard processing
+    // True while a paste is injecting keystrokes. The pump keeps running during a
+    // paste (HookSafeSleep) purely to service the keyboard hook, so the window procs
+    // use this to drop input rather than start a second paste from inside the first.
+    bool pasteInFlight;
+    DWORD pasteStartTick;        // 0 when not pasting; else GetTickCount()|1 (watchdog)
+    DWORD processingStartTick;   // 0 when not processing; else GetTickCount()|1 (watchdog)
+    DWORD hookLastCallbackTick;  // Last time LowLevelKeyboardProc ran (hook liveness)
     std::wstring lastPastedText;  // Store last pasted text to ignore it if it's copied back
+    DWORD lastPastedTextTick;     // When lastPastedText was set; it expires (see kPasteEchoWindowMs)
+    // Remember what we just pasted so an app echoing it straight back to the clipboard
+    // is not recorded as a new copy. Always stamp the tick: clearing only on a match
+    // meant the string lived forever and silently ate the user's next genuine copy.
+    void SetLastPastedText(std::wstring text) {
+        lastPastedText = std::move(text);
+        lastPastedTextTick = GetTickCount();
+    }
+    // Defined in ClipboardManager.cpp. Sets isPasting + pasteInFlight for a scope and
+    // re-arms the keyboard hook if the operation blocked past LowLevelHooksTimeout.
+    class ScopedPasteGuard;
+    // False when one of our own windows still owns the foreground, i.e. injecting
+    // Ctrl+V now would paste into the overlay instead of the user's target window.
+    bool ForegroundIsSafeForPaste();
     HWND previousFocusWindow;
     int hoveredItemIndex;
     int selectedIndex;  // Currently selected item index (in filtered list)

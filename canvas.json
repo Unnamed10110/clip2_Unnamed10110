@@ -1,0 +1,7 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html", "x": 0, "y": 0, "w": 932, "h": 600, "title": "Overlay — theme switcher" },
+    { "file": "Swatches.dc.html", "x": 1032, "y": 0, "w": 932, "h": 1840, "title": "Palette spec", "print": "flow" }
+  ],
+  "launch": { "view": "canvas" }
+}

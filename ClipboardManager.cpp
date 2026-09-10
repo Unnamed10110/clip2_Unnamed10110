@@ -8,6 +8,7 @@
 #include <cwctype>
 #include <cctype>
 #include <cstring>
+#include <cstdarg>
 #include <map>
 #include <shlobj.h>
 #include <mmsystem.h>
@@ -39,6 +40,192 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
 
+// ============================================================================
+// Diagnostics
+// ============================================================================
+// This app had no logging at all, which is exactly why "the copy silently did
+// nothing" was undebuggable -- PasteExcelSelection alone has five silent exits.
+// CLIP2_TRACE writes only to the debugger (DebugView / VS Output): no files, no
+// UI, and it compiles to nothing unless built with -DCLIP2_TRACE=ON.
+#if defined(CLIP2_TRACE_ENABLED) && CLIP2_TRACE_ENABLED
+#define CLIP2_TRACE_ACTIVE 1
+static void Clip2TraceV(const char* fn, int line, const wchar_t* fmt, ...) {
+    wchar_t msg[1024];
+    msg[0] = 0;
+    va_list ap;
+    va_start(ap, fmt);
+#if defined(_MSC_VER)
+    _vsnwprintf_s(msg, _countof(msg), _TRUNCATE, fmt, ap);
+#else
+    // build.bat tries MinGW first, which has no _s variants.
+    vswprintf(msg, 1023, fmt, ap);
+    msg[1023] = 0;
+#endif
+    va_end(ap);
+    wchar_t out[1200];
+#if defined(_MSC_VER)
+    _snwprintf_s(out, _countof(out), _TRUNCATE, L"[clip2 t=%lu] %hs:%d  %ls\n",
+                 (unsigned long)GetTickCount(), fn, line, msg);
+#else
+    swprintf(out, 1199, L"[clip2 t=%lu] %hs:%d  %ls\n",
+             (unsigned long)GetTickCount(), fn, line, msg);
+    out[1199] = 0;
+#endif
+    OutputDebugStringW(out);
+}
+#define CLIP2_TRACE(...) Clip2TraceV(__func__, __LINE__, __VA_ARGS__)
+#else
+#define CLIP2_TRACE_ACTIVE 0
+#define CLIP2_TRACE(...) ((void)0)
+#endif
+
+// The single most useful line when a copy "does nothing": name the process that
+// currently owns the global clipboard lock.
+static void Clip2TraceClipboardBusy(const wchar_t* what) {
+#if CLIP2_TRACE_ACTIVE
+    DWORD err = GetLastError();
+    HWND owner = GetOpenClipboardWindow();
+    DWORD pid = 0;
+    wchar_t cls[64] = L"";
+    if (owner) {
+        GetWindowThreadProcessId(owner, &pid);
+        GetClassNameW(owner, cls, 64);
+    }
+    CLIP2_TRACE(L"%ls: clipboard busy, holder=%p pid=%lu class=%ls err=%lu",
+                what, (void*)owner, (unsigned long)pid, cls, (unsigned long)err);
+#else
+    (void)what;
+#endif
+}
+
+// ============================================================================
+// HookSafeSleep -- the one primitive that keeps the keyboard usable
+// ============================================================================
+// Sleep without starving the machine-wide WH_KEYBOARD_LL hook.
+//
+// The hook is serviced by THIS thread: Windows silently stops calling it when the
+// callback cannot run within LowLevelHooksTimeout (300 ms by default). That, plus
+// the fact that a dropped hook used to be unrecoverable, is how Ctrl+V ended up
+// globally broken until clip2 was restarted -- and why every keystroke on the
+// machine stalled while a paste was running.
+//
+// A low-level hook callback is NOT a window message: the system runs it inside the
+// thread's queue check itself, so PeekMessage(PM_NOREMOVE) is enough to service it.
+// Nothing is removed and nothing is dispatched, so no paste function can be
+// re-entered, and the elapsed wall time is identical to Sleep(ms).
+static void HookSafeSleep(DWORD ms) {
+    const DWORD kSlice = 10;  // well inside the 300 ms budget
+    DWORD start = GetTickCount();
+    for (;;) {
+        DWORD elapsed = GetTickCount() - start;
+        if (elapsed >= ms) return;
+        DWORD remain = ms - elapsed;
+        Sleep(remain < kSlice ? remain : kSlice);
+        MSG m;
+        PeekMessage(&m, nullptr, 0, 0, PM_NOREMOVE);
+    }
+}
+
+// ============================================================================
+// Scope guards for the re-entrancy flags
+// ============================================================================
+// Sets a bool for the duration of a scope and ALWAYS clears it. The raw bools these
+// replace were reset by hand at 13 sites across 9 functions; an early return or a
+// std::bad_alloc escaping through DispatchMessage left one latched, and clipboard
+// history then silently stopped recording for the rest of the session (recoverable
+// only by restarting).
+class ScopedFlag {
+public:
+    explicit ScopedFlag(bool& f, DWORD* startTick = nullptr) : flag_(f), tick_(startTick) {
+        flag_ = true;
+        if (tick_) *tick_ = GetTickCount() | 1;  // 0 means "not set"
+    }
+    ~ScopedFlag() {
+        flag_ = false;
+        if (tick_) *tick_ = 0;
+    }
+    ScopedFlag(const ScopedFlag&) = delete;
+    ScopedFlag& operator=(const ScopedFlag&) = delete;
+private:
+    bool& flag_;
+    DWORD* tick_;
+};
+
+// Re-entrancy guard: acquired() is false when the flag was already set, in which
+// case this instance owns nothing and clears nothing.
+class ScopedReentryGuard {
+public:
+    explicit ScopedReentryGuard(bool& f, DWORD* startTick = nullptr)
+        : flag_(f), tick_(startTick), owned_(!f) {
+        if (owned_) {
+            flag_ = true;
+            if (tick_) *tick_ = GetTickCount() | 1;
+        }
+    }
+    ~ScopedReentryGuard() {
+        if (owned_) {
+            flag_ = false;
+            if (tick_) *tick_ = 0;
+        }
+    }
+    bool acquired() const { return owned_; }
+    ScopedReentryGuard(const ScopedReentryGuard&) = delete;
+    ScopedReentryGuard& operator=(const ScopedReentryGuard&) = delete;
+private:
+    bool& flag_;
+    DWORD* tick_;
+    bool owned_;
+};
+
+// SPI_SETFOREGROUNDLOCKTIMEOUT is a SYSTEM-WIDE setting. Restoring it only on the
+// normal path meant any early return or exception in between left the whole machine
+// at 0 permanently. Note the 0 flags instead of SPIF_SENDCHANGE: the timeout still
+// applies, but we stop broadcasting WM_SETTINGCHANGE to every top-level window on
+// the desktop -- this runs from a 100 ms timer for up to 3 s.
+struct ForegroundLockTimeoutScope {
+    DWORD saved = 0;
+    ForegroundLockTimeoutScope() {
+        SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, &saved, 0);
+        SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)0, 0);
+    }
+    ~ForegroundLockTimeoutScope() {
+        SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)(UINT_PTR)saved, 0);
+    }
+    ForegroundLockTimeoutScope(const ForegroundLockTimeoutScope&) = delete;
+    ForegroundLockTimeoutScope& operator=(const ForegroundLockTimeoutScope&) = delete;
+};
+
+// How long lastPastedText stays eligible to suppress an echo. Every echo path is
+// well under this (the longest tail is a 500 ms sleep in TransformTextItem).
+static const DWORD kPasteEchoWindowMs = 3000;
+
+// Sets isPasting (suppresses our own clipboard echo) AND pasteInFlight (the window
+// procs drop input while the pump is only servicing the keyboard hook), and re-arms
+// the keyboard hook when the guarded operation blocked past LowLevelHooksTimeout.
+class ClipboardManager::ScopedPasteGuard {
+public:
+    explicit ScopedPasteGuard(ClipboardManager* m)
+        : mgr_(m),
+          pasting_(m->isPasting, &m->pasteStartTick),
+          busy_(m->pasteInFlight),
+          start_(GetTickCount()) {}
+    ~ScopedPasteGuard() {
+        DWORD ms = GetTickCount() - start_;
+        if (ms > 250) {
+            CLIP2_TRACE(L"blocked the hook thread for %lu ms - re-arming keyboard hook",
+                        (unsigned long)ms);
+            mgr_->InstallKeyboardHook();
+        }
+    }
+    ScopedPasteGuard(const ScopedPasteGuard&) = delete;
+    ScopedPasteGuard& operator=(const ScopedPasteGuard&) = delete;
+private:
+    ClipboardManager* mgr_;
+    ScopedFlag pasting_;
+    ScopedFlag busy_;
+    DWORD start_;
+};
+
 // AMOLED neon palette. Background stays pure black (true OLED), the rest of the
 // colors swap depending on the active theme preset selected at runtime.
 namespace Theme5250 {
@@ -59,6 +246,16 @@ enum ThemeId {
     THEME_NEON_YELLOW = 5,
     THEME_NEON_ORANGE = 6,
     THEME_NEON_WHITE  = 7,
+    // Muted dark set. Appended deliberately: the active theme is persisted to the
+    // registry as a raw index, so inserting these mid-list would silently change
+    // theme for anyone who had already picked one.
+    THEME_SLATE       = 8,
+    THEME_TEAL        = 9,
+    THEME_MOSS        = 10,
+    THEME_EMBER       = 11,
+    THEME_CLAY        = 12,
+    THEME_VIOLET      = 13,
+    THEME_GRAPHITE    = 14,
     THEME_COUNT
 };
 
@@ -79,6 +276,21 @@ static const ThemePreset kThemePresets[THEME_COUNT] = {
     { L"Neon Yellow",         RGB(255, 230, 0),   RGB(255, 230, 0),   RGB(220, 200, 0),   RGB(120, 110, 0) },
     { L"Neon Orange",         RGB(255, 128, 0),   RGB(255, 128, 0),   RGB(220, 110, 0),   RGB(130, 60, 0) },
     { L"Neon White",          RGB(240, 240, 240), RGB(240, 240, 240), RGB(200, 200, 200), RGB(110, 110, 110) },
+    // Muted dark set: one system in OKLCH where every role holds a fixed lightness
+    // and chroma and only the hue changes, so the themes stay consistent with each
+    // other. The text role carries deliberately low chroma -- that is what reads calm
+    // on the pure-black background instead of neon.
+    //
+    // Every accent clears 10:1 against black, which it has to: ApplyThemeId hardcodes
+    // SEL_FG to black, and that black is the text drawn on the selected row over selBg.
+    // An accent any darker would make the selected row unreadable.
+    { L"Slate",     RGB(182, 213, 244), RGB(131, 189, 248), RGB( 70, 108, 147), RGB( 35,  58,  81) },
+    { L"Teal",      RGB(167, 221, 220), RGB( 87, 204, 204), RGB( 39, 118, 118), RGB( 16,  64,  64) },
+    { L"Moss",      RGB(187, 219, 187), RGB(140, 201, 142), RGB( 77, 116,  78), RGB( 39,  63,  40) },
+    { L"Ember",     RGB(233, 203, 171), RGB(227, 171, 106), RGB(133,  97,  54), RGB( 73,  51,  25) },
+    { L"Clay",      RGB(243, 196, 191), RGB(243, 157, 149), RGB(143,  87,  83), RGB( 79,  45,  43) },
+    { L"Violet",    RGB(211, 203, 242), RGB(188, 170, 244), RGB(108,  96, 144), RGB( 58,  51,  79) },
+    { L"Graphite",  RGB(209, 209, 209), RGB(183, 183, 183), RGB(105, 105, 105), RGB( 56,  56,  56) },
 };
 
 static int g_currentThemeId = THEME_NEON_GREEN;
@@ -1734,6 +1946,21 @@ static void SendKeyUpIfDown(WORD vk) {
     SendInput(1, &in, sizeof(INPUT));
 }
 
+// Wait until a physically held key is up (with a synthetic keyup fallback).
+// Needed when a paste runs from WM_KEYDOWN of that key — Z still down turns
+// the following SendCtrlV into Ctrl+Z (Undo) in Excel.
+static void WaitUntilPhysicalKeyUp(WORD vk, int maxMs = 1200) {
+    const int slice = 12;
+    int waited = 0;
+    while (waited < maxMs) {
+        if (!(GetAsyncKeyState(vk) & 0x8000)) return;
+        HookSafeSleep(slice);
+        waited += slice;
+    }
+    CLIP2_TRACE(L"key 0x%02X still held after %d ms; forcing keyup", (unsigned)vk, maxMs);
+    SendKeyUpIfDown(vk);
+}
+
 // Release keys still held from Ctrl+F11 / Ctrl+Shift+F11 so typing or Ctrl+V is not corrupted.
 // Use explicit L/R virtual keys — generic VK_CONTROL / VK_SHIFT keyup can miss the physical key still down.
 static void ReleaseHotkeyModifiersForPaste() {
@@ -1742,7 +1969,7 @@ static void ReleaseHotkeyModifiersForPaste() {
     SendKeyUpIfDown(VK_RSHIFT);
     SendKeyUpIfDown(VK_LCONTROL);
     SendKeyUpIfDown(VK_RCONTROL);
-    Sleep(20);
+    HookSafeSleep(20);
 }
 
 // Release every modifier that can change how injected Unicode is interpreted (Ctrl/Alt/Shift/Win).
@@ -1758,20 +1985,46 @@ static void ReleaseAllModifierKeysForKeystrokePaste() {
     SendKeyUpIfDown(VK_RSHIFT);
     SendKeyUpIfDown(VK_LWIN);
     SendKeyUpIfDown(VK_RWIN);
-    Sleep(25);
+    HookSafeSleep(25);
 }
 
+// Robust OpenClipboard with retries. Some apps hold the clipboard briefly when copying.
+// No sleep after the LAST attempt: the old loop always burned the full 192-240 ms budget
+// even when it was going to fail, and that time is spent on the thread that services the
+// machine-wide keyboard hook.
+static bool OpenClipboardWithRetry(HWND hwnd, int attempts = 24, int sleepMs = 8) {
+    for (int i = 0; i < attempts; i++) {
+        if (OpenClipboard(hwnd)) return true;
+        if (i + 1 < attempts) HookSafeSleep(sleepMs);
+    }
+    return false;
+}
+
+// Prepare the payload BEFORE opening and emptying the clipboard. The old order --
+// EmptyClipboard() first, then allocate -- destroyed whatever the user had on any
+// failure below it, with no way to get it back. Also retries the open: a single
+// attempt loses to any app holding the clipboard, and this is the setter Excel
+// Z-mode uses, so losing it silently skipped a cell.
 static bool SetClipboardUnicodeOnly(HWND hwnd, const std::wstring& text) {
-    if (!OpenClipboard(hwnd)) return false;
-    EmptyClipboard();
     size_t byteLen = (text.size() + 1) * sizeof(wchar_t);
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
-    if (!hMem) { CloseClipboard(); return false; }
+    if (!hMem) return false;
     void* p = GlobalLock(hMem);
-    if (!p) { GlobalFree(hMem); CloseClipboard(); return false; }
+    if (!p) { GlobalFree(hMem); return false; }
     memcpy(p, text.c_str(), byteLen);
     GlobalUnlock(hMem);
-    if (!SetClipboardData(CF_UNICODETEXT, hMem)) { GlobalFree(hMem); CloseClipboard(); return false; }
+    if (!OpenClipboardWithRetry(hwnd, 24, 8)) {
+        GlobalFree(hMem);
+        Clip2TraceClipboardBusy(L"SetClipboardUnicodeOnly");
+        return false;
+    }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+        GlobalFree(hMem);
+        CloseClipboard();
+        CLIP2_TRACE(L"SetClipboardData failed err=%lu", (unsigned long)GetLastError());
+        return false;
+    }
     CloseClipboard();
     return true;
 }
@@ -1779,7 +2032,11 @@ static bool SetClipboardUnicodeOnly(HWND hwnd, const std::wstring& text) {
 // Full clipboard backup for swap+paste (not just CF_UNICODETEXT). CF_BITMAP is stored as CF_DIB bytes.
 static bool BackupClipboardSerialFormats(HWND hwnd, std::map<UINT, std::vector<BYTE>>& out) {
     out.clear();
-    if (!OpenClipboard(hwnd)) return false;
+    // Failing here aborts the whole paste, so it is worth retrying the open.
+    if (!OpenClipboardWithRetry(hwnd, 24, 8)) {
+        Clip2TraceClipboardBusy(L"BackupClipboardSerialFormats");
+        return false;
+    }
     const size_t MAX_TOTAL = 50 * 1024 * 1024;
     size_t total = 0;
     auto skipUnsupported = [](UINT f) {
@@ -1818,7 +2075,11 @@ static bool BackupClipboardSerialFormats(HWND hwnd, std::map<UINT, std::vector<B
 }
 
 static bool RestoreClipboardSerialFormats(HWND hwnd, const std::map<UINT, std::vector<BYTE>>& backup) {
-    if (!OpenClipboard(hwnd)) return false;
+    if (backup.empty()) return true;   // nothing to put back; do not empty the clipboard
+    if (!OpenClipboardWithRetry(hwnd, 30, 8)) {
+        Clip2TraceClipboardBusy(L"RestoreClipboardSerialFormats");
+        return false;
+    }
     EmptyClipboard();
     for (const auto& kv : backup) {
         if (kv.second.empty()) continue;
@@ -1838,12 +2099,27 @@ static bool RestoreClipboardSerialFormats(HWND hwnd, const std::map<UINT, std::v
     return true;
 }
 
+// The user's pre-paste clipboard exists ONLY in `backup`, so a failed restore loses it
+// permanently. Every call site used to ignore the return value entirely; give it one
+// more chance and make the loss visible in the trace when it does happen.
+static bool RestoreClipboardWithRetry(HWND hwnd, const std::map<UINT, std::vector<BYTE>>& backup) {
+    if (backup.empty()) return true;
+    if (RestoreClipboardSerialFormats(hwnd, backup)) return true;
+    HookSafeSleep(60);
+    if (RestoreClipboardSerialFormats(hwnd, backup)) return true;
+    CLIP2_TRACE(L"CLIPBOARD RESTORE FAILED - the user's pre-paste clipboard is lost");
+    return false;
+}
+
 // Restore all formats from a history item (same strategy as PasteItem rich paste).
 static bool SetClipboardFromHistoryItem(HWND hwnd, const ClipboardItem* item) {
     if (!item || !item->HasAnyFormat()) return false;
     item->HydrateAllFormats();   // the clipboard needs the actual bytes
     if (item->formats.empty()) return false;
-    if (!OpenClipboard(hwnd)) return false;
+    if (!OpenClipboardWithRetry(hwnd, 24, 8)) {
+        Clip2TraceClipboardBusy(L"SetClipboardFromHistoryItem");
+        return false;
+    }
     EmptyClipboard();
     bool success = false;
     for (const auto& formatPair : item->formats) {
@@ -1978,13 +2254,19 @@ static UINT CfHtml() {
     return cf;
 }
 
-// Robust OpenClipboard with retries. Some apps hold the clipboard briefly when copying.
-static bool OpenClipboardWithRetry(HWND hwnd, int attempts = 24, int sleepMs = 8) {
-    for (int i = 0; i < attempts; i++) {
-        if (OpenClipboard(hwnd)) return true;
-        Sleep(sleepMs);
-    }
-    return false;
+// Allocate moveable global memory and copy bytes into it, WITHOUT touching the
+// clipboard. Lets a caller prepare its payload before EmptyClipboard(), so an
+// allocation failure cannot leave the user with an emptied clipboard and nothing in it.
+// On success the caller owns the handle until SetClipboardData accepts it.
+static HGLOBAL AllocClipboardBytes(const void* data, size_t size) {
+    if (!data || size == 0) return nullptr;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!hMem) return nullptr;
+    void* p = GlobalLock(hMem);
+    if (!p) { GlobalFree(hMem); return nullptr; }
+    memcpy(p, data, size);
+    GlobalUnlock(hMem);
+    return hMem;
 }
 
 // Allocate moveable global memory, copy bytes, and put it on the clipboard for `fmt`.
@@ -2085,12 +2367,21 @@ static std::string BuildRtfWrapFromUnicode(const std::wstring& text) {
 // separate Enter keystroke or extra Ctrl+V for separators.
 static bool SetClipboardTextPayload(HWND hwnd, const std::wstring& text, bool includeRtf) {
     if (text.empty()) return false;
-    if (!OpenClipboardWithRetry(hwnd, 30, 8)) return false;
+    // Prepare the primary payload BEFORE emptying: an allocation failure after
+    // EmptyClipboard() used to leave the user's clipboard wiped and empty.
+    HGLOBAL hText = AllocClipboardBytes(text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+    if (!hText) return false;
+    if (!OpenClipboardWithRetry(hwnd, 30, 8)) {
+        GlobalFree(hText);
+        Clip2TraceClipboardBusy(L"SetClipboardTextPayload");
+        return false;
+    }
     EmptyClipboard();
     bool ok = false;
-    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-    if (PutBytesOnClipboard(CF_UNICODETEXT, text.c_str(), bytes))
+    if (SetClipboardData(CF_UNICODETEXT, hText))
         ok = true;
+    else
+        GlobalFree(hText);
     if (includeRtf && ok) {
         UINT cfRtf = CfRtf();
         if (cfRtf != 0) {
@@ -2295,12 +2586,21 @@ static bool MergeClipboardItemsRich(const std::vector<const ClipboardItem*>& ite
 // Put a merged rich payload on the clipboard (Unicode + optional RTF + optional HTML).
 static bool SetClipboardMergedRich(HWND hwnd, const MergedRichPayload& payload, bool includeRich) {
     if (payload.unicode.empty()) return false;
-    if (!OpenClipboardWithRetry(hwnd, 30, 8)) return false;
+    // Prepare the primary payload BEFORE emptying (see SetClipboardTextPayload).
+    HGLOBAL hText = AllocClipboardBytes(payload.unicode.c_str(),
+                                        (payload.unicode.size() + 1) * sizeof(wchar_t));
+    if (!hText) return false;
+    if (!OpenClipboardWithRetry(hwnd, 30, 8)) {
+        GlobalFree(hText);
+        Clip2TraceClipboardBusy(L"SetClipboardMergedRich");
+        return false;
+    }
     EmptyClipboard();
     bool ok = false;
-    size_t bytes = (payload.unicode.size() + 1) * sizeof(wchar_t);
-    if (PutBytesOnClipboard(CF_UNICODETEXT, payload.unicode.c_str(), bytes))
+    if (SetClipboardData(CF_UNICODETEXT, hText))
         ok = true;
+    else
+        GlobalFree(hText);
     if (includeRich && ok) {
         UINT cfRtf = CfRtf();
         if (cfRtf && !payload.rtf.empty())
@@ -2353,13 +2653,18 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
             if (sent == 0) {
                 DWORD err = GetLastError();
                 (void)err;
-                Sleep(10);
+                HookSafeSleep(10);
                 continue;
             }
             idx += sent;
-            if (idx < total) Sleep(4);
+            if (idx < total) HookSafeSleep(4);
         }
         b.clear();
+        // A long paste is hundreds of these batches, and the successful path above
+        // sleeps only between partial sends -- so without this the whole run could
+        // go by without a single queue check and starve the keyboard hook.
+        MSG m;
+        PeekMessage(&m, nullptr, 0, 0, PM_NOREMOVE);
         return idx == total;
     };
 
@@ -2373,19 +2678,19 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
 
         // \r\n → single VK_RETURN; lone \n/\r → VK_RETURN; literal \t → VK_TAB.
         if (ch == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') {
-            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; HookSafeSleep(2); }
             pushVK(batch, VK_RETURN);
             i += 2;
             continue;
         }
         if (ch == L'\r' || ch == L'\n') {
-            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; HookSafeSleep(2); }
             pushVK(batch, VK_RETURN);
             i += 1;
             continue;
         }
         if (ch == L'\t') {
-            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; HookSafeSleep(2); }
             pushVK(batch, VK_TAB);
             i += 1;
             continue;
@@ -2396,19 +2701,19 @@ static bool SendUnicodeTextAsKeystrokes(const std::wstring& text) {
         bool pair = isHighSurrogate && (i + 1) < text.size() &&
             text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF;
         if (pair) {
-            if (batch.size() + 4 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            if (batch.size() + 4 > kBatchCap) { if (!flushBatch(batch)) return false; HookSafeSleep(2); }
             pushUnicode(batch, ch);
             pushUnicode(batch, text[i + 1]);
             i += 2;
         } else {
             if (ch == L'\0') { i += 1; continue; }
-            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; Sleep(2); }
+            if (batch.size() + 2 > kBatchCap) { if (!flushBatch(batch)) return false; HookSafeSleep(2); }
             pushUnicode(batch, ch);
             i += 1;
         }
 
         // Larger texts: yield briefly every ~256 chars to keep the foreground app responsive.
-        if ((i & 0xFF) == 0) Sleep(1);
+        if ((i & 0xFF) == 0) HookSafeSleep(1);
     }
     return flushBatch(batch);
 }
@@ -2464,7 +2769,7 @@ static void RestartSelf(ClipboardManager* mgr) {
 }
 
 ClipboardManager::ClipboardManager()
-    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), lastPastedText(L""), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), isPasting(false), isProcessingClipboard(false), pasteInFlight(false), pasteStartTick(0), processingStartTick(0), hookLastCallbackTick(0), lastPastedText(L""), lastPastedTextTick(0), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
@@ -2680,11 +2985,31 @@ bool ClipboardManager::Initialize() {
     InstallKeyboardHook();
     RegisterHotkey();  // Global hotkey as backup when hook doesn't fire (e.g. some fullscreen/admin apps)
     
+    // Windows silently stops calling a low-level hook that misses
+    // LowLevelHooksTimeout, and nothing reports it. ScopedPasteGuard re-arms the hook
+    // after any operation that blocked too long; this is the unconditional backstop
+    // for a drop caused by anything else.
+    SetTimer(hwndMain, TIMER_HOOK_KEEPALIVE, 60000, nullptr);
+    // Last-resort recovery for a latched re-entrancy flag (see the WM_TIMER handler).
+    SetTimer(hwndMain, TIMER_FLAG_WATCHDOG, 5000, nullptr);
+
     wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
     lastSequenceNumber = GetClipboardSequenceNumber();
     
-    // Register for clipboard update notifications (instant notification when clipboard changes)
-    AddClipboardFormatListener(hwndMain);
+    // Register for clipboard update notifications (instant notification when clipboard
+    // changes). Without this there is no capture at all -- a silently inert clipboard
+    // manager -- so it is worth a retry and, failing that, telling the user.
+    if (!AddClipboardFormatListener(hwndMain)) {
+        CLIP2_TRACE(L"AddClipboardFormatListener failed err=%lu, retrying",
+                    (unsigned long)GetLastError());
+        HookSafeSleep(150);
+        if (!AddClipboardFormatListener(hwndMain)) {
+            MessageBoxW(nullptr,
+                        L"clip2 could not register for clipboard notifications, so "
+                        L"history will not record copies.\n\nTry restarting clip2.",
+                        L"clip2", MB_OK | MB_ICONWARNING);
+        }
+    }
     
     // Warm up MCI so first copy plays sound (cold MCI often fails on first use)
     WarmUpClickSound();
@@ -2714,7 +3039,11 @@ void ClipboardManager::Run() {
 
 void ClipboardManager::Stop() {
     isRunning = false;
-    if (hwndMain) KillTimer(hwndMain, TIMER_SAVE_HISTORY);
+    if (hwndMain) {
+        KillTimer(hwndMain, TIMER_SAVE_HISTORY);
+        KillTimer(hwndMain, TIMER_HOOK_KEEPALIVE);
+        KillTimer(hwndMain, TIMER_FLAG_WATCHDOG);
+    }
     if (historyDirty) {
         historyDirty = false;
         SaveClipboardHistory();  // flush pending debounced save
@@ -2766,6 +3095,32 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }
     
+    // A paste is in flight. The pump keeps running during a paste (HookSafeSleep)
+    // purely so the machine-wide keyboard hook stays serviced -- it is NOT an
+    // invitation to start a second paste, or to hand a queued keystroke to the overlay
+    // from inside the first one. TIMER_FLAG_WATCHDOG is deliberately let through: it
+    // is the path that recovers a latched pasteInFlight, so dropping it here would
+    // make that recovery unreachable.
+    if (mgr->pasteInFlight) {
+        switch (uMsg) {
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+        case WM_CHAR:
+        case WM_SYSCHAR:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+            return 0;
+        case WM_TIMER:
+            if (wParam != TIMER_FLAG_WATCHDOG) return 0;
+            break;
+        default:
+            break;
+        }
+    }
+
     if (uMsg == mgr->wmTaskbarCreated && mgr->wmTaskbarCreated) {
         mgr->CreateTrayIcon();
         return 0;
@@ -2930,24 +3285,33 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
         return 0;
     
     case WM_CLIPBOARDUPDATE:
-        // Clipboard changed - instant notification from Windows
+        // Clipboard changed - instant notification from Windows.
         if (!mgr->isPasting) {
-            // Get current sequence number
             DWORD currentSequence = GetClipboardSequenceNumber();
-            
-            // If this matches the sequence number we set when pasting, ignore it
-            // This prevents re-adding items we just pasted
+
+            // Our own writes stamp lastSequenceNumber, so this skips the notification
+            // we caused ourselves when pasting.
             if (currentSequence != mgr->lastSequenceNumber) {
-                // Play sound immediately when clipboard changes
+                // Beat the copying app to the content FIRST: some apps clear or replace
+                // the clipboard right after copying. The click sound used to run before
+                // this, and on a Media Foundation failure that meant re-running MFStartup
+                // plus a full mp3 decode on every single clipboard change -- ahead of the
+                // capture it was supposed to be announcing.
+                bool captured = mgr->TryCaptureClipboardImmediately();
                 mgr->PlayClickSound();
-                
-                // Bypass copy blocks: capture clipboard content immediately before any app can clear/replace it
-                mgr->TryCaptureClipboardImmediately();
-                
-                // Update sequence number
-                mgr->lastSequenceNumber = currentSequence;
-                
-                // Post message to process clipboard asynchronously
+
+                // Only consume the event once we actually hold the bytes. This used to be
+                // stamped unconditionally, so a capture that lost the race threw the copy
+                // away for good -- there was nothing left to retry from.
+                if (captured) {
+                    mgr->lastSequenceNumber = currentSequence;
+                } else {
+                    CLIP2_TRACE(L"capture lost the race; seq %lu not consumed",
+                                (unsigned long)currentSequence);
+                }
+
+                // Process asynchronously: ProcessClipboard() retries the capture if the
+                // one above failed, then builds the item with the clipboard released.
                 PostMessage(hwnd, WM_PROCESS_CLIPBOARD, 0, 0);
             }
         }
@@ -2990,6 +3354,31 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 mgr->historyDirty = false;
                 mgr->SaveClipboardHistory();
             }
+        } else if (wParam == TIMER_HOOK_KEEPALIVE) {
+            // Unconditional re-arm. Windows gives no notification when it drops a
+            // low-level hook, so rather than trying to detect it (a keyboard hook never
+            // sees mouse input, which makes every "is it alive?" heuristic unreliable),
+            // just re-install periodically. It is two cheap syscalls and idempotent.
+            if (!mgr->pasteInFlight) mgr->InstallKeyboardHook();
+        } else if (wParam == TIMER_FLAG_WATCHDOG) {
+            // The scope guards make a latched flag essentially impossible; this catches
+            // a future code path that forgets one. The windows are deliberately generous
+            // so the watchdog can never fight a legitimately long paste -- Excel Z-mode
+            // waits on the user's key release and then spends ~580 ms per item.
+            DWORD now = GetTickCount();
+            if (mgr->processingStartTick && now - mgr->processingStartTick > 30000) {
+                CLIP2_TRACE(L"WATCHDOG: isProcessingClipboard latched, clearing");
+                mgr->isProcessingClipboard = false;
+                mgr->processingStartTick = 0;
+                mgr->immediateClipboardSnapshot.clear();
+                mgr->hasImmediateClipboardSnapshot = false;
+            }
+            if (mgr->pasteStartTick && now - mgr->pasteStartTick > 60000) {
+                CLIP2_TRACE(L"WATCHDOG: isPasting latched, clearing");
+                mgr->isPasting = false;
+                mgr->pasteInFlight = false;
+                mgr->pasteStartTick = 0;
+            }
         }
         return 0;
         
@@ -3011,6 +3400,36 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
 LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     ClipboardManager* mgr = instance;
     
+    if (!mgr) {
+        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    }
+
+    // A paste is in flight. The pump keeps running during a paste (HookSafeSleep)
+    // purely so the machine-wide keyboard hook stays serviced -- it is NOT an
+    // invitation to start a second paste, or to hand a queued keystroke to the overlay
+    // from inside the first one. TIMER_FLAG_WATCHDOG is deliberately let through: it
+    // is the path that recovers a latched pasteInFlight, so dropping it here would
+    // make that recovery unreachable.
+    if (mgr->pasteInFlight) {
+        switch (uMsg) {
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+        case WM_CHAR:
+        case WM_SYSCHAR:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+            return 0;
+        case WM_TIMER:
+            if (wParam != TIMER_FLAG_WATCHDOG) return 0;
+            break;
+        default:
+            break;
+        }
+    }
+
     // Handle preview window separately
     if (hwnd == mgr->hwndPreview) {
         switch (uMsg) {
@@ -4567,11 +4986,28 @@ void ClipboardManager::UnregisterHotkey() {
     }
 }
 
+// Install (or re-install) the low-level keyboard hook. Also used for NumPad key
+// detection, which generic hotkeys handle poorly.
+//
+// Deliberately NOT guarded on `hKeyboardHook == nullptr`. When Windows drops a
+// low-level hook for exceeding LowLevelHooksTimeout, our HHOOK is stale but still
+// non-null -- so that guard made re-installation impossible for the rest of the
+// session, which is why Esc-to-dismiss and the snippets shortcut stayed dead until
+// clip2 was restarted. Calling this repeatedly is cheap and idempotent.
 void ClipboardManager::InstallKeyboardHook() {
-    // Install low-level keyboard hook for reliable NumPad key detection
-    if (hKeyboardHook == nullptr) {
-        hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0);
+    HHOOK old = hKeyboardHook;
+    // Install the replacement FIRST so a failure leaves us no worse off than before.
+    HHOOK fresh = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(nullptr), 0);
+    if (!fresh) {
+        CLIP2_TRACE(L"SetWindowsHookEx failed err=%lu (keeping old=%p)",
+                    (unsigned long)GetLastError(), (void*)old);
+        return;
     }
+    hKeyboardHook = fresh;
+    // A dropped hook is already gone, so this failing is fine.
+    if (old) UnhookWindowsHookEx(old);
+    hookLastCallbackTick = 0;
+    CLIP2_TRACE(L"keyboard hook installed %p (replaced %p)", (void*)fresh, (void*)old);
 }
 
 void ClipboardManager::UninstallKeyboardHook() {
@@ -4584,6 +5020,10 @@ void ClipboardManager::UninstallKeyboardHook() {
 LRESULT CALLBACK ClipboardManager::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     ClipboardManager* mgr = instance;
     
+    // Proof of life for the hook, stamped before the injected-key bail below so our
+    // own SendCtrlV counts too. One store; nothing reads it on the hot path.
+    if (nCode >= HC_ACTION && mgr != nullptr) mgr->hookLastCallbackTick = GetTickCount() | 1;
+
     if (nCode >= HC_ACTION && mgr != nullptr && mgr->hwndMain != nullptr) {
         KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
         // Do not handle keys we inject ourselves (e.g. Ctrl+V from SendCtrlV) — breaks paste in target apps.
@@ -4785,8 +5225,17 @@ void ClipboardManager::HideListWindow() {
     // an item's format map: a safe point to hand back image bytes we can re-read from
     // their sidecars. Deliberately NOT done from TrimBitmapCaches, which runs mid-repaint
     // where a GetFormatData() pointer could still be live.
-    for (auto& it : clipboardHistory)
-        if (it) it->DehydrateBlobFormats();
+    //
+    // A paste in flight is the other case that breaks that invariant. Waits inside a
+    // paste now pump the message queue (HookSafeSleep, so the keyboard hook keeps
+    // getting serviced), which means an activation message can land here between a
+    // paste's HydrateAllFormats() and its read of item->formats -- and dehydrating
+    // underneath it would silently turn a rich paste into a plain-text one. Dehydration
+    // is only a memory optimisation, so skip it and let the next hide do it.
+    if (!pasteInFlight) {
+        for (auto& it : clipboardHistory)
+            if (it) it->DehydrateBlobFormats();
+    }
 
     if (listVisible) {
         HidePreviewWindow();
@@ -4856,6 +5305,21 @@ bool ClipboardManager::IsOverlayWindow(HWND h) {
     if (hwndList && IsChild(hwndList, h)) return true;
     if (hwndPinned && IsChild(hwndPinned, h)) return true;
     return false;
+}
+
+// Guard for every synthetic Ctrl+V. No paste path used to verify that the target
+// window actually took the foreground, so a lost focus race typed the paste into our
+// own overlay (its search box) and the user just saw "nothing was pasted".
+//
+// This is a bail, not a retry loop, so paste timing is unchanged. The payload is
+// already on the clipboard by this point, so a manual Ctrl+V still works.
+bool ClipboardManager::ForegroundIsSafeForPaste() {
+    HWND fg = GetForegroundWindow();
+    if (fg == hwndMain || IsOverlayWindow(fg)) {
+        CLIP2_TRACE(L"aborting paste: foreground is still ours (%p)", (void*)fg);
+        return false;
+    }
+    return true;
 }
 
 // Recompute the non-focused pane's snapshot list (used only for rendering it read-only).
@@ -5078,14 +5542,21 @@ void ClipboardManager::FocusListWindow() {
     // lock", which makes SetForegroundWindow silently fail (the overlay shows but never
     // activates, and the focus-check timer then hides it). Temporarily drop the lock
     // timeout, and nudge Windows with a synthetic Alt keypress so it honors the request.
-    DWORD savedLockTimeout = 0;
-    SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, &savedLockTimeout, 0);
-    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)0, SPIF_SENDCHANGE);
+    // RAII: this is a SYSTEM-WIDE setting, and restoring it only on the normal path
+    // meant an early return or an exception in between left the whole machine at 0
+    // permanently. The scope also drops SPIF_SENDCHANGE -- the timeout still applies,
+    // but we stop broadcasting WM_SETTINGCHANGE to every top-level window on the
+    // desktop, which this was doing ~20 times a second via the 100 ms focus retry.
+    ForegroundLockTimeoutScope lockScope;
 
     // The "phantom Alt" trick: pressing/releasing Alt makes the current process eligible
     // to set the foreground window (works around the Start menu / shell foreground lock).
-    keybd_event(VK_MENU, 0, 0, 0);
-    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    // Only when we actually need to steal the foreground: this injects a real global Alt,
+    // and on the 100 ms retry path it was firing 10 times a second while the user typed.
+    if (GetForegroundWindow() != target) {
+        keybd_event(VK_MENU, 0, 0, 0);
+        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    }
 
     // Keep the pinned panel just under the main list in Z-order, both topmost — never activate it.
     if (hwndPinned && IsWindowVisible(hwndPinned)) {
@@ -5099,12 +5570,9 @@ void ClipboardManager::FocusListWindow() {
         SetActiveWindow(target);
         SetFocus(target);
         if (GetForegroundWindow() == target) break;
-        Sleep(10);
+        HookSafeSleep(10);
     }
     if (GetForegroundWindow() == target) overlayGotForeground = true;
-
-    SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
-                         (PVOID)(UINT_PTR)savedLockTimeout, SPIF_SENDCHANGE);
 
     if (fgThread != 0 && fgThread != currentThread) {
         AttachThreadInput(fgThread, currentThread, FALSE);
@@ -5142,25 +5610,44 @@ void ClipboardManager::PasteItem(int index) {
 
     bool pasteAsPlainText = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
 
     std::wstring plainText = GetPlainTextForDirectPaste(item.get());
 
+    // Read any on-disk blobs BEFORE taking the clipboard lock. HydrateAllFormats() can
+    // do a dozen whole-file reads of up to 16 MB each out of %APPDATA%\clip2\blobs, and
+    // doing that under the lock blocked every other process's copy and paste for the
+    // duration. SetClipboardFromHistoryItem() already hydrates first; this matches it.
+    const bool wantRichFormats = !pasteAsPlainText && item->HasAnyFormat();
+    if (wantRichFormats) item->HydrateAllFormats();
+
+    // Decide there is something to publish before opening: EmptyClipboard() followed by
+    // a failed set wiped whatever the user had, with no way back.
+    const std::wstring plainToSet = pasteAsPlainText
+        ? (plainText.empty() ? item->preview : plainText)
+        : plainText;
+    if ((!wantRichFormats || item->formats.empty()) && plainToSet.empty()) {
+        CLIP2_TRACE(L"nothing to publish for index=%d", index);
+        return;
+    }
+
     if (!OpenClipboardWithRetry(hwndMain, 24, 8)) {
-        isPasting = false;
+        Clip2TraceClipboardBusy(L"PasteItem");
         return;
     }
     EmptyClipboard();
 
     bool success = false;
     if (pasteAsPlainText) {
-        std::wstring t = plainText.empty() ? item->preview : plainText;
-        if (!t.empty()) {
-            size_t bytes = (t.size() + 1) * sizeof(wchar_t);
-            success = PutBytesOnClipboard(CF_UNICODETEXT, t.c_str(), bytes);
+        if (!plainToSet.empty()) {
+            size_t bytes = (plainToSet.size() + 1) * sizeof(wchar_t);
+            success = PutBytesOnClipboard(CF_UNICODETEXT, plainToSet.c_str(), bytes);
         }
-    } else if (item->HasAnyFormat()) {
-        item->HydrateAllFormats();
+    } else if (wantRichFormats) {
         for (const auto& fp : item->formats) {
             if (fp.second.empty()) continue;
             if (PutBytesOnClipboard(fp.first, fp.second.data(), fp.second.size()))
@@ -5177,56 +5664,59 @@ void ClipboardManager::PasteItem(int index) {
     CloseClipboard();
 
     if (!success) {
-        isPasting = false;
+        CLIP2_TRACE(L"failed to put anything on the clipboard for index=%d", index);
         return;
     }
 
     if (!plainText.empty())
-        lastPastedText = plainText;
+        SetLastPastedText(plainText);
     else
-        lastPastedText = item->preview;
+        SetLastPastedText(item->preview);
     lastSequenceNumber = GetClipboardSequenceNumber();
 
     if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
         SetForegroundWindow(previousFocusWindow);
         SetFocus(previousFocusWindow);
-        Sleep(40);
+        HookSafeSleep(40);
     }
     ReleaseHotkeyModifiersForPaste();
-    Sleep(20);
+    HookSafeSleep(20);
 
+    if (!ForegroundIsSafeForPaste()) return;
     SendCtrlV();
 
     // Keep isPasting set for a while: some apps echo what was pasted right back to the clipboard,
     // and we want the duplicate detector to ignore that.
-    Sleep(420);
-    isPasting = false;
+    HookSafeSleep(420);
 }
 
 // Put derived plain text on the clipboard and paste it into the previously focused window.
 void ClipboardManager::PasteTransformedText(const std::wstring& text) {
     if (text.empty()) return;
 
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
     if (!SetClipboardTextPayload(hwndMain, text, /*includeRtf=*/false)) {
-        isPasting = false;
         return;
     }
-    lastPastedText = text;
+    SetLastPastedText(text);
     lastSequenceNumber = GetClipboardSequenceNumber();
 
     if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
         SetForegroundWindow(previousFocusWindow);
         SetFocus(previousFocusWindow);
-        Sleep(40);
+        HookSafeSleep(40);
     }
     ReleaseHotkeyModifiersForPaste();
-    Sleep(20);
+    HookSafeSleep(20);
 
+    if (!ForegroundIsSafeForPaste()) return;
     SendCtrlV();
 
-    Sleep(420);
-    isPasting = false;
+    HookSafeSleep(420);
 }
 
 // One-key smart paste. Builds the derived text for the mode; silently returns false
@@ -5348,18 +5838,21 @@ void ClipboardManager::PasteMultipleItems() {
         if (!ItemHasPasteableText(it)) { fastPath = false; break; }
     }
 
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
 
     if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
         SetForegroundWindow(previousFocusWindow);
         SetFocus(previousFocusWindow);
-        Sleep(70);
+        HookSafeSleep(70);
     }
     ReleaseHotkeyModifiersForPaste();
 
     std::map<UINT, std::vector<BYTE>> backup;
     if (!BackupClipboardSerialFormats(hwndMain, backup)) {
-        isPasting = false;
         ClearMultiSelection();
         return;
     }
@@ -5371,8 +5864,7 @@ void ClipboardManager::PasteMultipleItems() {
         MergedRichPayload merged;
         if (!MergeClipboardItemsRich(selectedItems, merged, pasteAsPlainText) ||
             merged.unicode.empty()) {
-            RestoreClipboardSerialFormats(hwndMain, backup);
-            isPasting = false;
+            RestoreClipboardWithRetry(hwndMain, backup);
             ClearMultiSelection();
             return;
         }
@@ -5388,24 +5880,29 @@ void ClipboardManager::PasteMultipleItems() {
             if (!fixed.empty()) merged.unicode = fixed;
         }
         if (!SetClipboardMergedRich(hwndMain, merged, !pasteAsPlainText)) {
-            RestoreClipboardSerialFormats(hwndMain, backup);
-            isPasting = false;
+            RestoreClipboardWithRetry(hwndMain, backup);
             ClearMultiSelection();
             return;
         }
 
-        lastPastedText = merged.unicode;
+        SetLastPastedText(merged.unicode);
         lastSequenceNumber = GetClipboardSequenceNumber();
-        Sleep(30);
+        HookSafeSleep(30);
+        if (!ForegroundIsSafeForPaste()) {
+            // Same shape as the two set-failure paths above: put the user's clipboard
+            // back before giving up, since `backup` is the only copy of it.
+            RestoreClipboardWithRetry(hwndMain, backup);
+            ClearMultiSelection();
+            return;
+        }
         SendCtrlV();
-        Sleep(320);
-        RestoreClipboardSerialFormats(hwndMain, backup);
+        HookSafeSleep(320);
+        RestoreClipboardWithRetry(hwndMain, backup);
         lastSequenceNumber = GetClipboardSequenceNumber();
         // Multi-paste also becomes a new top history item (rich or plain matching the paste).
         if (selectedItems.size() >= 2)
             InsertMergedPayloadIntoHistory(merged, pasteAsPlainText);
-        Sleep(70);
-        isPasting = false;
+        HookSafeSleep(70);
         ClearMultiSelection();
         PlayClickSound();
         return;
@@ -5420,7 +5917,7 @@ void ClipboardManager::PasteMultipleItems() {
     auto waitForClipboardReady = [&]() {
         for (int attempt = 0; attempt < 32; attempt++) {
             if (OpenClipboard(hwndMain)) { CloseClipboard(); return true; }
-            Sleep(8);
+            HookSafeSleep(8);
         }
         return false;
     };
@@ -5482,9 +5979,10 @@ void ClipboardManager::PasteMultipleItems() {
         }
 
         lastSequenceNumber = GetClipboardSequenceNumber();
-        Sleep(20);
+        HookSafeSleep(20);
+        if (!ForegroundIsSafeForPaste()) break;
         SendCtrlV();
-        Sleep(kAfterItemMs);
+        HookSafeSleep(kAfterItemMs);
 
         // After a non-text item (image/file), paste a clipboard \r\n so the next item
         // starts on a new line — still no Enter keystroke.
@@ -5492,18 +5990,20 @@ void ClipboardManager::PasteMultipleItems() {
             waitForClipboardReady();
             if (SetClipboardUnicodeOnly(hwndMain, L"\r\n")) {
                 lastSequenceNumber = GetClipboardSequenceNumber();
-                Sleep(20);
+                HookSafeSleep(20);
+                // break, not return: the clipboard restore after this loop has to run.
+                if (!ForegroundIsSafeForPaste()) break;
                 SendCtrlV();
-                Sleep(kAfterItemMs);
+                HookSafeSleep(kAfterItemMs);
             }
         }
     }
 
-    Sleep(kTailBeforeRestore);
-    RestoreClipboardSerialFormats(hwndMain, backup);
+    HookSafeSleep(kTailBeforeRestore);
+    RestoreClipboardWithRetry(hwndMain, backup);
     lastSequenceNumber = GetClipboardSequenceNumber();
     if (!pastedTextAggregate.empty())
-        lastPastedText = pastedTextAggregate;
+        SetLastPastedText(pastedTextAggregate);
 
     // Mixed image/file multi-paste: still record the joined text body as a new history item
     // when at least two text segments were involved.
@@ -5514,48 +6014,87 @@ void ClipboardManager::PasteMultipleItems() {
         InsertMergedPayloadIntoHistory(textOnly, /*plainOnly=*/true);
     }
 
-    Sleep(80);
-    isPasting = false;
+    HookSafeSleep(80);
     ClearMultiSelection();
     PlayClickSound();
 }
 
 // Excel special paste (Z): for each multi-selected item, F2 opens the active Excel cell
-// for in-cell edit, the item is pasted with its full rich formats, then Enter commits
+// for in-cell edit, the item's Unicode text is pasted with Ctrl+V, then Enter commits
 // the cell and moves down one row. Same F2 → paste → Enter cycle for every selected
 // item (including the last). No merged payload, no embedded \r\n.
 void ClipboardManager::PasteExcelSelection() {
-    if (multiSelectedIndices.size() < 2) return;
+    if (multiSelectedIndices.size() < 2) {
+        CLIP2_TRACE(L"Z-paste needs 2+ selected rows, have %zu", multiSelectedIndices.size());
+        return;
+    }
 
     // Collect multi-selected history items in visible top-to-bottom order.
     std::vector<int> sortedIndices(multiSelectedIndices.begin(), multiSelectedIndices.end());
     std::sort(sortedIndices.begin(), sortedIndices.end());
-    std::vector<const ClipboardItem*> selectedItems;
-    selectedItems.reserve(sortedIndices.size());
+    std::vector<std::wstring> segments;
+    segments.reserve(sortedIndices.size());
     for (int filteredIndex : sortedIndices) {
         if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) continue;
         int actualIndex = filteredIndices[filteredIndex];
         if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
-        if (clipboardHistory[actualIndex])
-            selectedItems.push_back(clipboardHistory[actualIndex].get());
+        const ClipboardItem* item = clipboardHistory[actualIndex].get();
+        if (!item) continue;
+        std::wstring text = GetPlainTextForDirectPaste(item);
+        if (text.empty()) continue;
+        segments.push_back(std::move(text));
     }
-    if (selectedItems.size() < 2) {
+    if (segments.size() < 2) {
+        CLIP2_TRACE(L"Z-paste: only %zu pasteable text segments from %zu selected rows",
+                    segments.size(), sortedIndices.size());
         ClearMultiSelection();
         return;
     }
 
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
 
-    if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
-        SetForegroundWindow(previousFocusWindow);
-        SetFocus(previousFocusWindow);
-        Sleep(70);
-    }
+    // This runs from WM_KEYDOWN of Z (and Ctrl may still be down from Ctrl+Click).
+    // If we inject Ctrl+V while Z is held, Excel sees Ctrl+Z and undoes instead of pasting.
+    // Stay on the overlay until those keys are up so auto-repeat cannot type into Excel.
+    WaitUntilPhysicalKeyUp('Z');
+    WaitUntilPhysicalKeyUp(VK_LCONTROL);
+    WaitUntilPhysicalKeyUp(VK_RCONTROL);
+    WaitUntilPhysicalKeyUp(VK_LSHIFT);
+    WaitUntilPhysicalKeyUp(VK_RSHIFT);
+    SendKeyUpIfDown('Z');
     ReleaseHotkeyModifiersForPaste();
+
+    HWND hTarget = previousFocusWindow;
+    HideListWindow();
+
+#if CLIP2_TRACE_ACTIVE
+    {
+        wchar_t cls[64] = L"";
+        if (hTarget) GetClassNameW(hTarget, cls, 64);
+        CLIP2_TRACE(L"Z-paste: %zu segments -> target=%p class=%ls",
+                    segments.size(), (void*)hTarget, cls);
+    }
+#endif
+
+    if (hTarget && hTarget != hwndList && hTarget != hwndMain && IsWindow(hTarget)) {
+        DWORD tgtTid = GetWindowThreadProcessId(hTarget, nullptr);
+        DWORD curTid = GetCurrentThreadId();
+        if (tgtTid != curTid)
+            AttachThreadInput(curTid, tgtTid, TRUE);
+        SetForegroundWindow(hTarget);
+        SetFocus(hTarget);
+        if (tgtTid != curTid)
+            AttachThreadInput(curTid, tgtTid, FALSE);
+        HookSafeSleep(80);
+    }
 
     std::map<UINT, std::vector<BYTE>> backup;
     if (!BackupClipboardSerialFormats(hwndMain, backup)) {
-        isPasting = false;
+        CLIP2_TRACE(L"Z-paste aborted: could not back up the clipboard");
         ClearMultiSelection();
         return;
     }
@@ -5563,63 +6102,53 @@ void ClipboardManager::PasteExcelSelection() {
     auto waitForClipboardReady = [&]() {
         for (int attempt = 0; attempt < 32; attempt++) {
             if (OpenClipboard(hwndMain)) { CloseClipboard(); return true; }
-            Sleep(8);
+            HookSafeSleep(8);
         }
         return false;
     };
 
     std::wstring lastSegment;
 
-    for (size_t i = 0; i < selectedItems.size(); i++) {
-        const ClipboardItem* item = selectedItems[i];
-        if (!item) continue;
+    for (size_t i = 0; i < segments.size(); i++) {
+        const std::wstring& plainText = segments[i];
+        // The result was previously discarded; a busy clipboard here is exactly why a
+        // cell would come out blank.
+        if (!waitForClipboardReady())
+            Clip2TraceClipboardBusy(L"Z-paste waitForClipboardReady");
 
-        waitForClipboardReady();
-
-        // Prefer the item's original full rich formats; fall back to merged rich text,
-        // then Unicode-only so one bad item does not abort the whole run.
-        bool clipboardSet = false;
-        if (item->HasAnyFormat())
-            clipboardSet = SetClipboardFromHistoryItem(hwndMain, item);
-        if (!clipboardSet && ItemHasPasteableText(item)) {
-            MergedRichPayload one;
-            std::vector<const ClipboardItem*> oneVec = { item };
-            if (MergeClipboardItemsRich(oneVec, one, /*plainOnly=*/false))
-                clipboardSet = SetClipboardMergedRich(hwndMain, one, /*includeRich=*/true);
+        // F2's formula-bar / in-cell editor only accepts text. Restoring the item's
+        // full formats (BIFF / XML Spreadsheet / HTML / RTF) makes Excel treat Ctrl+V
+        // as a sheet paste and silently refuse it while the cell is being edited.
+        if (!SetClipboardUnicodeOnly(hwndMain, plainText)) {
+            CLIP2_TRACE(L"Z-paste: skipped segment %zu (%zu chars) - clipboard set failed",
+                        i, plainText.size());
+            continue;
         }
-        if (!clipboardSet) {
-            std::wstring plainText = GetPlainTextForDirectPaste(item);
-            if (!plainText.empty())
-                clipboardSet = SetClipboardUnicodeOnly(hwndMain, plainText);
-        }
-        if (!clipboardSet) continue;
+        CLIP2_TRACE(L"Z-paste: segment %zu/%zu, %zu chars",
+                    i + 1, segments.size(), plainText.size());
 
-        {
-            std::wstring segment = GetPlainTextForDirectPaste(item);
-            if (!segment.empty()) lastSegment = segment;
-        }
-
+        lastSegment = plainText;
         lastSequenceNumber = GetClipboardSequenceNumber();
-        Sleep(20);
+        HookSafeSleep(30);
         // F2 puts Excel into in-cell edit so the paste lands in the formula bar /
         // cell editor instead of as a full-cell clipboard dump.
         SendF2Key();
-        Sleep(100);
+        HookSafeSleep(180);
+        if (!ForegroundIsSafeForPaste()) break;
         SendCtrlV();
-        Sleep(220);
+        HookSafeSleep(220);
         // Enter commits the edited cell and moves the active cell down one row.
         SendEnterKey();
-        Sleep(100);
+        HookSafeSleep(150);
     }
 
-    Sleep(200);
-    RestoreClipboardSerialFormats(hwndMain, backup);
+    HookSafeSleep(200);
+    RestoreClipboardWithRetry(hwndMain, backup);
     lastSequenceNumber = GetClipboardSequenceNumber();
     if (!lastSegment.empty())
-        lastPastedText = lastSegment;
+        SetLastPastedText(lastSegment);
 
-    Sleep(80);
-    isPasting = false;
+    HookSafeSleep(80);
     ClearMultiSelection();
     PlayClickSound();
 }
@@ -5705,20 +6234,23 @@ void ClipboardManager::MergeSelectedItems(bool plainOnly) {
     if (merged.unicode.empty()) return;
 
     // Publish to the system clipboard so the merge is immediately pasteable.
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
     if (plainOnly)
         SetClipboardTextPayload(hwndMain, merged.unicode, /*includeRtf=*/false);
     else
         SetClipboardMergedRich(hwndMain, merged, /*includeRich=*/true);
-    lastPastedText = merged.unicode;
+    SetLastPastedText(merged.unicode);
     lastSequenceNumber = GetClipboardSequenceNumber();
 
     InsertMergedPayloadIntoHistory(merged, plainOnly);
     ClearMultiSelection();
     PlayClickSound();
 
-    Sleep(80);
-    isPasting = false;
+    HookSafeSleep(80);
 }
 
 // P + single item: paste Unicode only (strip RTF/HTML). Returns false when the
@@ -5796,12 +6328,26 @@ void ClipboardManager::ClearMultiSelection() {
     UpdateListWindow();
 }
 
-// Try to grab clipboard content immediately (e.g. before a blocking app clears it). Call from WM_CLIPBOARDUPDATE.
+// Grab clipboard content immediately (e.g. before a blocking app clears it). Called
+// from WM_CLIPBOARDUPDATE, and the only path that reads the clipboard on a copy.
+//
+// This is deliberately the ONLY thing that happens under the clipboard lock: copy the
+// raw bytes out and close. Everything expensive -- building the item, indexing it,
+// hydrating blobs to dedup against, repainting -- happens afterwards in
+// ProcessClipboardFromSnapshot() with the lock released, because the clipboard is a
+// single global exclusive lock and holding it blocks every other process's copy.
 bool ClipboardManager::TryCaptureClipboardImmediately() {
     hasImmediateClipboardSnapshot = false;
     immediateClipboardSnapshot.clear();
     if (!hwndMain) return false;
-    if (!OpenClipboard(hwndMain)) return false;
+    // Called straight from the notification, so this has to stay fast -- but a single
+    // attempt loses to any app that briefly holds the clipboard while copying, which is
+    // the whole reason the old fallback path had a retry ladder. ~35 ms worst case.
+    if (!OpenClipboardWithRetry(hwndMain, 8, 5)) {
+        Clip2TraceClipboardBusy(L"immediate capture");
+        return false;
+    }
+    DWORD lockStart = GetTickCount();
 
     auto isHandleBased = [](UINT fmt) {
         return fmt == CF_BITMAP || fmt == CF_PALETTE || fmt == CF_METAFILEPICT ||
@@ -5879,16 +6425,51 @@ bool ClipboardManager::TryCaptureClipboardImmediately() {
             format = EnumClipboardFormats(format);
         }
         hasImmediateClipboardSnapshot = true;
+        CLIP2_TRACE(L"captured primary=%u storage=%u formats=%d bytes=%zu",
+                    primaryFormat, storageFormat, formatCount, totalSize);
     } catch (...) {
+        CLIP2_TRACE(L"exception while copying clipboard bytes");
         immediateClipboardSnapshot.clear();
     }
     CloseClipboard();
+    // If this is ever more than a few tens of ms, other apps' Ctrl+C is being starved.
+    CLIP2_TRACE(L"clipboard lock held %lu ms (ok=%d)",
+                (unsigned long)(GetTickCount() - lockStart),
+                (int)hasImmediateClipboardSnapshot);
     return hasImmediateClipboardSnapshot;
 }
 
-// Process a previously captured snapshot (bypasses apps that clear the clipboard after copy).
+// Turn a captured snapshot into a history item. Runs with the clipboard CLOSED, so
+// everything here -- allocation, search indexing, blob hydration for the duplicate
+// check, repainting -- is off the global clipboard lock.
 void ClipboardManager::ProcessClipboardFromSnapshot() {
+    // AddFormat + FinalizeSearchIndex below allocate heavily (up to 10 MB of formats
+    // plus a 500 KB lowercasing pass). A std::bad_alloc used to escape from here all
+    // the way out through DispatchMessage, leaving isProcessingClipboard latched true
+    // -- after which clipboard history silently stopped recording for the rest of the
+    // session, recoverable only by restarting. Always drop the snapshot on the way out,
+    // and never let an exception past this frame.
+    struct SnapshotScope {
+        ClipboardManager* m;
+        ~SnapshotScope() {
+            m->immediateClipboardSnapshot.clear();
+            m->hasImmediateClipboardSnapshot = false;
+        }
+    } snapshotScope{ this };
+
+    try {
     if (immediateClipboardSnapshot.empty()) return;
+
+    // lastPastedText exists only to swallow an app echoing back what we just pasted,
+    // which arrives within a few hundred ms. It used to be cleared ONLY on a match, so
+    // in the normal case (no echo at all) it was retained indefinitely and silently ate
+    // the user's own next genuine copy of that same text.
+    if (!lastPastedText.empty() &&
+        GetTickCount() - lastPastedTextTick > kPasteEchoWindowMs) {
+        CLIP2_TRACE(L"lastPastedText expired (%zu chars)", lastPastedText.size());
+        lastPastedText.clear();
+    }
+
     UINT primaryFormat = 0;
     for (UINT pf : kClipboardPriorityFormats) {
         if (pf == CF_BITMAP) continue;  // snapshot stores BITMAP as CF_DIB already
@@ -5900,25 +6481,13 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
     }
     if (primaryFormat == 0 && !immediateClipboardSnapshot.empty())
         primaryFormat = immediateClipboardSnapshot.begin()->first;
-    if (primaryFormat == 0) {
-        immediateClipboardSnapshot.clear();
-        hasImmediateClipboardSnapshot = false;
-        return;
-    }
+    if (primaryFormat == 0) return;
     const std::vector<BYTE>& primaryData = immediateClipboardSnapshot[primaryFormat];
     if (primaryData.empty() || primaryData.size() >= 200 * 1024 * 1024) {
-        immediateClipboardSnapshot.clear();
-        hasImmediateClipboardSnapshot = false;
+        CLIP2_TRACE(L"rejected primary=%u size=%zu", primaryFormat, primaryData.size());
         return;
     }
-    std::unique_ptr<ClipboardItem> item;
-    try {
-        item = std::make_unique<ClipboardItem>(primaryFormat, primaryData);
-    } catch (...) {
-        immediateClipboardSnapshot.clear();
-        hasImmediateClipboardSnapshot = false;
-        return;
-    }
+    std::unique_ptr<ClipboardItem> item = std::make_unique<ClipboardItem>(primaryFormat, primaryData);
     // Safe to move out of the snapshot: it is cleared before this function returns, and
     // primaryData references a different element than any we move from.
     for (auto& kv : immediateClipboardSnapshot) {
@@ -5961,10 +6530,18 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
             TrimHistory();
             MarkHistoryDirty();
             if (listVisible) FilterItems();  // FilterItems() already repaints
-        } catch (...) {}
+            CLIP2_TRACE(L"recorded item, primary=%u", primaryFormat);
+        } catch (...) {
+            CLIP2_TRACE(L"exception inserting item into history");
+        }
+    } else {
+        CLIP2_TRACE(L"not recorded: duplicate=%d pastEcho=%d",
+                    (int)isDuplicate, (int)isPastPaste);
     }
-    immediateClipboardSnapshot.clear();
-    hasImmediateClipboardSnapshot = false;
+    } catch (...) {
+        // The SnapshotScope destructor still clears the snapshot.
+        CLIP2_TRACE(L"exception while building item from snapshot");
+    }
 }
 
 #ifdef HAVE_UIAUTOMATION
@@ -6186,20 +6763,16 @@ void ClipboardManager::CommitCapturedText(const std::wstring& text, bool setClip
         // Even if history insertion fails, still try to set the clipboard below.
     }
 
-    if (setClipboard && hwndMain && OpenClipboard(hwndMain)) {
+    if (setClipboard && hwndMain && OpenClipboardWithRetry(hwndMain, 24, 8)) {
         EmptyClipboard();
-        size_t byteLen = (text.size() + 1) * sizeof(wchar_t);
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteLen);
-        if (hMem) {
-            void* p = GlobalLock(hMem);
-            if (p) {
-                memcpy(p, text.c_str(), byteLen);
-                GlobalUnlock(hMem);
-                SetClipboardData(CF_UNICODETEXT, hMem);
-                lastSequenceNumber = GetClipboardSequenceNumber();
-            } else {
-                GlobalFree(hMem);
-            }
+        // PutBytesOnClipboard checks SetClipboardData and frees on failure. The inline
+        // version here ignored that return, so a failed set orphaned the HGLOBAL --
+        // small, but it leaked once per failure for the life of the process.
+        if (PutBytesOnClipboard(CF_UNICODETEXT, text.c_str(),
+                                (text.size() + 1) * sizeof(wchar_t))) {
+            lastSequenceNumber = GetClipboardSequenceNumber();
+        } else {
+            CLIP2_TRACE(L"SetClipboardData failed err=%lu", (unsigned long)GetLastError());
         }
         CloseClipboard();
     }
@@ -6220,7 +6793,7 @@ bool ClipboardManager::CopyFocusedViaSyntheticCopy(std::wstring& outText) {
             if (tgtTid != curTid) AttachThreadInput(curTid, tgtTid, TRUE);
             SetForegroundWindow(hTarget);
             if (tgtTid != curTid) AttachThreadInput(curTid, tgtTid, FALSE);
-            Sleep(60);
+            HookSafeSleep(60);
         } else {
     return false;
         }
@@ -6228,7 +6801,11 @@ bool ClipboardManager::CopyFocusedViaSyntheticCopy(std::wstring& outText) {
     if (!hTarget || !IsWindow(hTarget)) return false;
 
     // Suppress our own clipboard monitor while we drive the copy.
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
     // A held hotkey (e.g. Ctrl+F10) must not corrupt the injected Ctrl+C.
     ReleaseAllModifierKeysForKeystrokePaste();
 
@@ -6237,7 +6814,7 @@ bool ClipboardManager::CopyFocusedViaSyntheticCopy(std::wstring& outText) {
 
     auto tryCapture = [&](std::wstring& captured) -> bool {
         for (int i = 0; i < 8; i++) {
-            Sleep(15);
+            HookSafeSleep(15);
             DWORD seq = GetClipboardSequenceNumber();
             if (seq != priorSeq) {
                 std::wstring t = ReadClipboardUnicodeText(hwndMain);
@@ -6258,7 +6835,7 @@ bool ClipboardManager::CopyFocusedViaSyntheticCopy(std::wstring& outText) {
         // User approved: select-all then copy. This changes the target's current selection.
         priorSeq = GetClipboardSequenceNumber();
         SendCtrlA();
-        Sleep(40);
+        HookSafeSleep(40);
         SendCtrlC();
         ok = tryCapture(captured);
     }
@@ -6266,7 +6843,6 @@ bool ClipboardManager::CopyFocusedViaSyntheticCopy(std::wstring& outText) {
     // Keep our sequence number in sync with whatever is now on the clipboard so the monitor
     // does not re-process this as a fresh external copy.
     lastSequenceNumber = GetClipboardSequenceNumber();
-    isPasting = false;
 
     if (!ok || captured.empty()) return false;
     outText = std::move(captured);
@@ -6355,31 +6931,32 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
     if (tgtTid != curTid)
         AttachThreadInput(curTid, tgtTid, FALSE);
 
-    Sleep(80);
+    HookSafeSleep(80);
     ReleaseHotkeyModifiersForPaste();
 
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
 
     if (!useClipboardSwap) {
         if (text.empty()) {
-            isPasting = false;
             return false;
         }
         // SendUnicodeTextAsKeystrokes handles batching, partial-send retries, and \r\n.
         bool ok = SendUnicodeTextAsKeystrokes(text);
         if (ok) {
-            lastPastedText = text;
+            SetLastPastedText(text);
             // Give the receiving app a beat before the next event so trailing chars actually land.
-            Sleep(60);
+            HookSafeSleep(60);
         }
-        isPasting = false;
         if (ok) PlayClickSound();
         return ok;
     }
 
     std::map<UINT, std::vector<BYTE>> backup;
     if (!BackupClipboardSerialFormats(hwndMain, backup)) {
-        isPasting = false;
         return false;
     }
 
@@ -6389,388 +6966,76 @@ bool ClipboardManager::PasteToFocusedControlWithoutClipboard(bool useClipboardSw
     if (!clipboardSet && !text.empty())
         clipboardSet = SetClipboardUnicodeOnly(hwndMain, text);
     if (!clipboardSet) {
-        RestoreClipboardSerialFormats(hwndMain, backup);
-        isPasting = false;
+        RestoreClipboardWithRetry(hwndMain, backup);
         return false;
     }
 
     if (!text.empty())
-        lastPastedText = text;
+        SetLastPastedText(text);
     else
-        lastPastedText = LastPastedTextFromItem(item);
+        SetLastPastedText(LastPastedTextFromItem(item));
 
     lastSequenceNumber = GetClipboardSequenceNumber();
 
-    Sleep(20);
+    HookSafeSleep(20);
+    if (!ForegroundIsSafeForPaste()) {
+        // `backup` is the only copy of the user's clipboard; restore before bailing.
+        RestoreClipboardWithRetry(hwndMain, backup);
+        return false;
+    }
     SendCtrlV();
-    Sleep(260);
-    RestoreClipboardSerialFormats(hwndMain, backup);
+    HookSafeSleep(260);
+    RestoreClipboardWithRetry(hwndMain, backup);
     lastSequenceNumber = GetClipboardSequenceNumber();
 
-    isPasting = false;
     PlayClickSound();
     return true;
 }
 
+// Turn the captured clipboard snapshot into a history item.
+//
+// Snapshot, close, THEN process. This function used to do the capture itself, holding
+// the global clipboard lock from OpenClipboard all the way to CloseClipboard -- across
+// item construction, a 500 KB lowercase + trigram indexing pass, a duplicate check that
+// reads up to 16 MB of sidecar blobs off disk, and a synchronous repaint that extracts
+// shell thumbnails (which can reach a network share). The Windows clipboard is a single
+// global exclusive lock, so while we held it every other process's OpenClipboard failed
+// -- which is exactly why the user's Ctrl+C in the SOURCE app did nothing at all.
+//
+// TryCaptureClipboardImmediately() already had the right shape: copy the bytes, close
+// the clipboard, and only then do the expensive work. It is now the only capture path.
 void ClipboardManager::ProcessClipboard() {
-    // Prevent re-entrant calls
-    if (isProcessingClipboard) {
+    ScopedReentryGuard guard(isProcessingClipboard, &processingStartTick);
+    if (!guard.acquired()) {
+        CLIP2_TRACE(L"re-entrant call, skipping");
         return;
     }
-    
-    isProcessingClipboard = true;
-    
-    // If we captured the clipboard immediately (to bypass copy blocks), process that snapshot and exit
-    if (hasImmediateClipboardSnapshot) {
-        ProcessClipboardFromSnapshot();
-        isProcessingClipboard = false;
+
+    if (!hasImmediateClipboardSnapshot) {
+        // WM_CLIPBOARDUPDATE's snapshot lost the race -- some app was holding the
+        // clipboard. Retry the SNAPSHOT, which is cheap and lock-scoped, rather than
+        // the whole pipeline. Same backoff the old retry ladder used.
+        CLIP2_TRACE(L"no snapshot from the notification; retrying capture");
+        for (int retry = 1; retry <= 4 && !hasImmediateClipboardSnapshot; retry++) {
+            HookSafeSleep(50u * (DWORD)retry);
+            if (TryCaptureClipboardImmediately()) break;
+        }
+        if (hasImmediateClipboardSnapshot) {
+            // The content may have changed since the notification, so re-stamp to avoid
+            // processing this same state again.
+            lastSequenceNumber = GetClipboardSequenceNumber();
+            CLIP2_TRACE(L"late capture succeeded, seq=%lu", (unsigned long)lastSequenceNumber);
+        }
+    }
+
+    if (!hasImmediateClipboardSnapshot) {
+        // Leave lastSequenceNumber alone: the copy was NOT consumed, so the next
+        // notification for it can still be captured.
+        CLIP2_TRACE(L"nothing captured; sequence number left unconsumed");
         return;
     }
-    
-    // Retry logic with delays to avoid interfering with copy operations
-    const int MAX_RETRIES = 5;
-    const int RETRY_DELAY_MS = 50;
-    
-    for (int retry = 0; retry < MAX_RETRIES; retry++) {
-        // Wait before retrying (except first attempt)
-        if (retry > 0) {
-            Sleep(RETRY_DELAY_MS * retry); // Exponential backoff
-        }
-        
-        // Try to open clipboard with a timeout approach
-        // Use a very short timeout by trying multiple times quickly
-        bool opened = false;
-        for (int quickRetry = 0; quickRetry < 10; quickRetry++) {
-            if (OpenClipboard(hwndMain)) {
-                opened = true;
-                break;
-            }
-            Sleep(5); // Very short delay
-        }
-        
-        if (!opened) {
-            continue; // Try again in next iteration
-        }
-        
-        // Successfully opened clipboard - process it quickly
-        try {
-            // Determine primary format (for display) - process in priority order
-            // (native DIB before CF_BITMAP — see kClipboardPriorityFormats)
-            UINT primaryFormat = 0;
-            for (UINT priorityFormat : kClipboardPriorityFormats) {
-                if (IsClipboardFormatAvailable(priorityFormat)) {
-                    primaryFormat = priorityFormat;
-                    break;
-                }
-            }
-            
-            // If no priority format found, get first available format
-            if (primaryFormat == 0) {
-                primaryFormat = EnumClipboardFormats(0);
-            }
-            
-            if (primaryFormat != 0) {
-                std::vector<BYTE> data;
-                UINT storageFormat = primaryFormat;
-                
-                // Check if primary format is handle-based
-                bool isPrimaryHandleBased = (
-                    primaryFormat == CF_BITMAP ||
-                    primaryFormat == CF_PALETTE ||
-                    primaryFormat == CF_METAFILEPICT ||
-                    primaryFormat == CF_ENHMETAFILE ||
-                    primaryFormat == 0x0082 ||  // CF_DSPBITMAP
-                    primaryFormat == 0x008E ||  // CF_DSPENHMETAFILE
-                    primaryFormat == 0x0083     // CF_DSPMETAFILEPICT
-                );
-                
-                // CF_BITMAP is handle-based, not memory-based - convert to DIB
-                if (primaryFormat == CF_BITMAP) {
-                    HBITMAP hBitmap = (HBITMAP)GetClipboardData(CF_BITMAP);
-                    if (hBitmap) {
-                        data = ConvertBitmapToDIB(hBitmap);
-                        if (!data.empty()) {
-                            storageFormat = CF_DIB; // Store as DIB instead of CF_BITMAP
-                        } else {
-                            // Conversion failed, skip this item
-                            CloseClipboard();
-                            isProcessingClipboard = false;
-                            return;
-                        }
-                    } else {
-                        CloseClipboard();
-                        isProcessingClipboard = false;
-                        return;
-                    }
-                } else if (isPrimaryHandleBased) {
-                    // Other handle-based formats - skip them as we can't easily convert
-                    CloseClipboard();
-                    isProcessingClipboard = false;
-                    return;
-                } else {
-                    // Get primary format data (for memory-based formats)
-                    try {
-                        HGLOBAL hMem = GetClipboardData(primaryFormat);
-                        if (hMem) {
-                            SIZE_T size = GlobalSize(hMem);
-                            if (size > 0 && size < 100 * 1024 * 1024) { // Limit to 100MB
-                                void* pMem = GlobalLock(hMem);
-                                if (pMem) {
-                                    try {
-                                        data.resize(size);
-                                        memcpy(data.data(), pMem, size);
-                                        GlobalUnlock(hMem);
-                                    } catch (...) {
-                                        // If memcpy fails, unlock and abort
-                                        GlobalUnlock(hMem);
-                                        CloseClipboard();
-                                        isProcessingClipboard = false;
-                                        return;
-                                    }
-                                } else {
-                                    CloseClipboard();
-                                    isProcessingClipboard = false;
-                                    return;
-                                }
-                            } else {
-                                CloseClipboard();
-                                isProcessingClipboard = false;
-                                return;
-                            }
-                        } else {
-                            CloseClipboard();
-                            isProcessingClipboard = false;
-                            return;
-                        }
-                    } catch (...) {
-                        // Error accessing clipboard data, abort
-                        CloseClipboard();
-                        isProcessingClipboard = false;
-                        return;
-                    }
-                }
-                
-                if (!data.empty()) {
-                    // Create clipboard item with storage format (which may be different from primary if converted)
-                    // Use storageFormat instead of primaryFormat so the item knows it's DIB data, not CF_BITMAP
-                    std::unique_ptr<ClipboardItem> item;
-                    try {
-                        // Validate data size before creating item
-                        if (data.size() > 0 && data.size() < 200 * 1024 * 1024) { // Limit to 200MB
-                            // Use storageFormat so converted CF_BITMAP->CF_DIB items are created with CF_DIB format
-                            item = std::make_unique<ClipboardItem>(storageFormat, data);
-                            if (!item) {
-                                CloseClipboard();
-                                isProcessingClipboard = false;
-                                return;
-                            }
-                            
-                            // If we converted CF_BITMAP to DIB, also store the original format for compatibility
-                            if (primaryFormat == CF_BITMAP && storageFormat == CF_DIB) {
-                                // The item is already created with CF_DIB format and data
-                                // No need to add it again, it's already there
-                            }
-                        } else {
-                            // Data too large or invalid, skip
-                            CloseClipboard();
-                            isProcessingClipboard = false;
-                            return;
-                        }
-                    } catch (const std::bad_alloc&) {
-                        // Out of memory, skip this item
-                        CloseClipboard();
-                        isProcessingClipboard = false;
-                        return;
-                    } catch (const std::exception&) {
-                        // Standard exception, skip this item
-                        CloseClipboard();
-                        isProcessingClipboard = false;
-                        return;
-                    } catch (...) {
-                        // Any other error creating item, abort
-                        CloseClipboard();
-                        isProcessingClipboard = false;
-                        return;
-                    }
-                    
-                    // Store ALL available formats to preserve formatting
-                    // CRITICAL: Limit formats aggressively to prevent memory crashes
-                    int formatCount = 0;
-                    size_t totalFormatSize = 0;
-                    const int MAX_FORMATS_PER_ITEM = 12;
-                    const size_t MAX_FORMAT_SIZE_PER_ITEM = 10 * 1024 * 1024; // 10MB per item total
-                    
-                    UINT format = EnumClipboardFormats(0);
-                    while (format != 0 && formatCount < MAX_FORMATS_PER_ITEM) {
-                        // Skip CF_BITMAP (we already converted it) and already stored primary format
-                        // CRITICAL: Skip handle-based formats that can't be treated as HGLOBAL
-                        // These formats cause crashes when we try to GlobalSize/GlobalLock them
-                        bool isHandleBasedFormat = (
-                            format == CF_BITMAP ||
-                            format == CF_PALETTE ||
-                            format == CF_METAFILEPICT ||
-                            format == CF_ENHMETAFILE ||
-                            format == 0x0082 ||  // CF_DSPBITMAP
-                            format == 0x008E ||  // CF_DSPENHMETAFILE  
-                            format == 0x0083     // CF_DSPMETAFILEPICT
-                        );
-                        
-                        if (format != primaryFormat && !isHandleBasedFormat) {
-                            try {
-                                // Use GetClipboardData to get handle
-                                HANDLE hFormatData = GetClipboardData(format);
-                                if (hFormatData) {
-                                    // Try to get size - this will fail for handle-based formats
-                                    SIZE_T formatSize = 0;
-                                    try {
-                                        formatSize = GlobalSize((HGLOBAL)hFormatData);
-                                    } catch (...) {
-                                        // GlobalSize failed, skip this format
-                                        format = EnumClipboardFormats(format);
-                                        continue;
-                                    }
-                                    
-                                    // CRITICAL: Very strict limits to prevent crashes
-                                    if (formatSize > 0 && formatSize < 5 * 1024 * 1024 && // Max 5MB per format
-                                        totalFormatSize + formatSize < MAX_FORMAT_SIZE_PER_ITEM) {
-                                        void* pFormatMem = nullptr;
-                                        try {
-                                            pFormatMem = GlobalLock((HGLOBAL)hFormatData);
-                                        } catch (...) {
-                                            // GlobalLock failed, skip this format
-                                            format = EnumClipboardFormats(format);
-                                            continue;
-                                        }
-                                        
-                                        if (pFormatMem) {
-                                            try {
-                                                std::vector<BYTE> formatData(formatSize);
-                                                memcpy(formatData.data(), pFormatMem, formatSize);
-                                                GlobalUnlock((HGLOBAL)hFormatData);
-                                                // Defer: several text formats often arrive together.
-                                                item->AddFormat(format, std::move(formatData), /*deferIndex=*/true);
-                                                totalFormatSize += formatSize;
-                                                formatCount++;
-                                            } catch (...) {
-                                                // If memcpy fails, unlock and skip this format
-                                                try {
-                                                    GlobalUnlock((HGLOBAL)hFormatData);
-                                                } catch (...) {
-                                                    // Ignore unlock errors
-                                                }
-                                                // Continue to next format instead of breaking
-                                            }
-                                        }
-                                    }
-                                }
-                            } catch (...) {
-                                // Skip this format if there's any error - continue to next format
-                            }
-                        }
-                        
-                        // Get next format - wrapped in try-catch to handle Excel's weird formats
-                        try {
-                            format = EnumClipboardFormats(format);
-                        } catch (...) {
-                            break; // Stop enumeration if EnumClipboardFormats crashes
-                        }
-                    }
-                    
-                    if (item) item->FinalizeSearchIndex();  // one reindex for the whole format set
-                    
-                    // Check if this matches the text we just pasted (multi-paste combined text)
-                    bool isPastPaste = false;
-                    if (!lastPastedText.empty() && item && item->format == CF_UNICODETEXT) {
-                        try {
-                            const std::vector<BYTE>* textData = item->GetFormatData(CF_UNICODETEXT);
-                            if (textData && textData->size() >= sizeof(wchar_t)) {
-                                size_t len = textData->size() / sizeof(wchar_t);
-                                if (len > 0) {
-                                    const wchar_t* textPtr = (const wchar_t*)textData->data();
-                                    size_t actualLen = len;
-                                    for (size_t j = 0; j < len; j++) {
-                                        if (textPtr[j] == L'\0') {
-                                            actualLen = j;
-                                            break;
-                                        }
-                                    }
-                                    if (actualLen > 0) {
-                                        std::wstring clipboardText(textPtr, actualLen);
-                                        if (clipboardText == lastPastedText) {
-                                            isPastPaste = true;
-                                            // Clear lastPastedText after matching to allow future pastes
-                                            lastPastedText.clear();
-                                        }
-                                    }
-                                }
-                            }
-                        } catch (...) {
-                            // Error comparing, treat as not matching
-                        }
-                    }
-                    
-                    // Check if this is a duplicate of the last item (text, images, or full format set).
-                    // Image copies often fire WM_CLIPBOARDUPDATE twice with different format counts.
-                    bool isDuplicate = false;
-                    if (!clipboardHistory.empty() && item) {
-                        try {
-                            isDuplicate = AreDuplicateClipboardItems(item.get(), clipboardHistory[0].get());
-                        } catch (...) {
-                            isDuplicate = false;
-                        }
-                    }
-                    
-                    // Only add if not a duplicate and not something we just pasted
-                    if (!isDuplicate && !isPastPaste && item) {
-                        try {
-                            // Add to front of list (most recent first)
-                            clipboardHistory.insert(
-                                clipboardHistory.begin(),
-                                std::move(item)
-                            );
-                            
-                            // Limit to maxItems (never evicting pinned items)
-                            TrimHistory();
-                            MarkHistoryDirty();
-                            
-                            // Update filter if list is visible
-                            if (listVisible) {
-                                FilterItems();  // already repaints both panes
-                            }
-                        } catch (...) {
-                            // Error adding item to history, skip it
-                            // Don't crash, just continue
-                        }
-                    }
-                }
-            }
-            
-            // Close clipboard immediately after processing
-            CloseClipboard();
-            
-            // Successfully processed, exit retry loop
-            isProcessingClipboard = false;
-            return;
-        } catch (...) {
-            // Error occurred, ensure clipboard is closed and reset flag
-            // Note: CloseClipboard can be called even if clipboard wasn't opened
-            try {
-                CloseClipboard();
-            } catch (...) {
-                // Ignore errors closing clipboard
-            }
-            isProcessingClipboard = false;
-        }
-    }
-    
-    // Finished all retries, ensure clipboard is closed and reset flag
-    // Note: CloseClipboard can be called even if clipboard wasn't opened
-    try {
-        CloseClipboard();
-    } catch (...) {
-        // Ignore errors closing clipboard
-    }
-    isProcessingClipboard = false;
+
+    ProcessClipboardFromSnapshot();
 }
 
 // Resource ID for embedded click.mp3 (must match ClipboardManager.rc)
@@ -6830,7 +7095,18 @@ static std::wstring GetClickMp3PathFromResource() {
 static std::wstring GetOrCreateClickWavPath() {
     static std::wstring s_wavPath;
     static bool s_succeeded = false;
+    static int s_attempts = 0;
     if (s_succeeded) return s_wavPath;
+
+    // Only success used to be cached. A permanently failing decode (no Media Foundation,
+    // missing click.mp3, unwritable temp dir) therefore re-ran MFStartup, a full mp3
+    // decode and a CreateFileW on EVERY clipboard change -- and the click sound runs on
+    // the copy path, so that latency landed squarely between the copy and our capture.
+    // WarmUpClickSound() already spends attempt 1 at startup, so a healthy install still
+    // decodes exactly once and a broken one costs at most two attempts per process.
+    if (s_attempts >= 2) return s_wavPath;
+    s_attempts++;
+    CLIP2_TRACE(L"decoding click.mp3 (attempt %d)", s_attempts);
 
     std::wstring mp3Path = GetClickMp3PathFromResource();
     if (mp3Path.empty()) return s_wavPath;
@@ -7143,7 +7419,7 @@ void ClipboardManager::CopyItemAsPlainText(int filteredIndex) {
     if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) return;
     std::wstring text = GetPlainTextForDirectPaste(clipboardHistory[actualIndex].get());
     if (text.empty()) return;
-    lastPastedText = text;  // avoid re-capturing our own clipboard write
+    SetLastPastedText(text);  // avoid re-capturing our own clipboard write
     SetClipboardUnicodeOnly(hwndMain, text);
     PlayClickSound();
 }
@@ -7451,10 +7727,14 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
     
     // Copy transformed text to clipboard
     // Store the transformed text so we can ignore it if it's copied back
-    lastPastedText = transformedText;
+    SetLastPastedText(transformedText);
     
-    isPasting = true;
-    Sleep(10);
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
+    HookSafeSleep(10);
     
     if (OpenClipboard(hwndMain)) {
         EmptyClipboard();
@@ -7480,9 +7760,8 @@ void ClipboardManager::TransformTextItem(int filteredIndex, int transformType) {
     }
     
     // Keep isPasting flag true longer to prevent re-adding the transformed item
-    Sleep(500); // Delay to ignore clipboard updates from transform operation
+    HookSafeSleep(500); // Delay to ignore clipboard updates from transform operation
     
-    isPasting = false;
     
     MarkHistoryDirty();
     
@@ -8465,10 +8744,14 @@ void ClipboardManager::PasteSnippet(int index) {
 
     if (rtfBytes.empty() && plainText.empty()) return;
 
-    isPasting = true;
+    // Suppresses our own clipboard echo, makes the window procs drop input while
+    // this runs, and re-arms the keyboard hook if we blocked past its timeout.
+    // Replaces a raw bool that was cleared by hand on every exit path -- one
+    // missed return or a throw left it latched and killed capture for the session.
+    ScopedPasteGuard pasteGuard(this);
 
     if (!OpenClipboardWithRetry(hwndMain, 24, 8)) {
-        isPasting = false;
+        Clip2TraceClipboardBusy(L"PasteSnippet");
         return;
     }
     EmptyClipboard();
@@ -8486,23 +8769,22 @@ void ClipboardManager::PasteSnippet(int index) {
     CloseClipboard();
 
     if (!rtfSet && !plainSet) {
-        isPasting = false;
         return;
     }
 
-    lastPastedText = plainText;
+    SetLastPastedText(plainText);
     lastSequenceNumber = GetClipboardSequenceNumber();
 
     if (previousFocusWindow && previousFocusWindow != hwndList && IsWindow(previousFocusWindow)) {
         SetForegroundWindow(previousFocusWindow);
         SetFocus(previousFocusWindow);
-        Sleep(40);
+        HookSafeSleep(40);
     }
     ReleaseHotkeyModifiersForPaste();
-    Sleep(30);
+    HookSafeSleep(30);
+    if (!ForegroundIsSafeForPaste()) return;
     SendCtrlV();
-    Sleep(460);
-    isPasting = false;
+    HookSafeSleep(460);
     PlayClickSound();
 }
 
@@ -9244,10 +9526,13 @@ void ClipboardManager::ShowSettingsDialog() {
     }
 
     yPos += 14;
-    CreateHotkeyLabel(hwndSettings, L"Overlay theme (AMOLED neon):", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+    // "neon" no longer describes the whole list -- the muted dark set is half of it now.
+    CreateHotkeyLabel(hwndSettings, L"Overlay theme (AMOLED):", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+    // The last parameter is the DROPPED-DOWN height, not the control height: sized so
+    // the full preset list fits without scrolling.
     HWND hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-        HK_X, yPos, HK_W, 200, hwndSettings, (HMENU)(INT_PTR)IDC_THEME_COMBO,
+        HK_X, yPos, HK_W, 300, hwndSettings, (HMENU)(INT_PTR)IDC_THEME_COMBO,
         GetModuleHandle(nullptr), nullptr);
     if (hCombo) {
         SendMessageW(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);

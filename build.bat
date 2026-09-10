@@ -3,6 +3,16 @@ setlocal EnableExtensions
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
+rem "build.bat trace" builds with the OutputDebugString diagnostics compiled in; view
+rem the output in Sysinternals DebugView (Capture Win32, filter "[clip2"). Use it when a
+rem copy is not captured or a paste silently does nothing. A plain "build.bat" leaves the
+rem tracing out entirely. Switching modes needs a reconfigure, which the flag forces.
+set "TRACEFLAG=-DCLIP2_TRACE=OFF"
+if /i "%~1"=="trace" (
+    set "TRACEFLAG=-DCLIP2_TRACE=ON"
+    echo Tracing ENABLED for this build.
+)
+
 echo Building clip2...
 if not exist build mkdir build
 
@@ -15,7 +25,7 @@ rem is not installed here, makes every later configure fail. Wipe it and start o
 rem instead of giving up.
 rem ---------------------------------------------------------------------------------
 if exist "build\CMakeCache.txt" (
-    cmake -S . -B build >nul 2>&1
+    cmake -S . -B build %TRACEFLAG% >nul 2>&1
     if not errorlevel 1 goto build
     echo Existing CMake cache is unusable - reconfiguring from scratch.
 )
@@ -64,7 +74,7 @@ rem --- helpers ----------------------------------------------------------------
 :try
 call :wipe
 echo Configuring with %~1 ...
-cmake -S . -B build -G %1 %~2 >nul 2>&1
+cmake -S . -B build -G %1 %~2 %TRACEFLAG% >nul 2>&1
 if errorlevel 1 (
     set "OK="
     goto :eof

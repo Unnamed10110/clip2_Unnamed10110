@@ -7,6 +7,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Enable Unicode
 add_definitions(-DUNICODE -D_UNICODE)
 
+# Diagnostics. OFF by default, so a normal release build is unchanged. Turn on with
+#   cmake -S . -B build -DCLIP2_TRACE=ON
+# and watch the output in Sysinternals DebugView (Capture Win32, filter "[clip2").
+# Useful when a copy is not captured or a paste silently does nothing: the trace names
+# the process holding the clipboard, how long we held it, and every paste bail-out.
+option(CLIP2_TRACE "Enable OutputDebugString tracing" OFF)
+
 # Windows-specific settings
 if(WIN32)
     set(CMAKE_RC_COMPILER_INIT windres)
@@ -70,6 +77,10 @@ if(WIN32)
         message(STATUS "UIAutomation found: ${UIAUTOMATION_LIB}")
     else()
         message(STATUS "UIAutomation not found; 'Copy from focused control' will be disabled")
+    endif()
+    if(CLIP2_TRACE)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE CLIP2_TRACE_ENABLED=1)
+        message(STATUS "clip2 tracing ENABLED (OutputDebugString; view in DebugView)")
     endif()
     target_link_libraries(${PROJECT_NAME} ${CLIP2_LIBS})
     
