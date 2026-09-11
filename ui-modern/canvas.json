@@ -1,0 +1,35 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html",   "x": 0,    "y": 0,   "w": 972, "h": 560, "title": "Soft — leading candidate" },
+    { "file": "Studio.dc.html", "x": 1080, "y": 0,   "w": 972, "h": 560, "title": "Studio" },
+    { "file": "Bold.dc.html",   "x": 0,    "y": 860, "w": 972, "h": 560, "title": "Bold" }
+  ],
+  "annotations": [
+    {
+      "id": "whats-old",
+      "x": 0, "y": -250, "w": 900,
+      "text": "What actually reads as old in the current build, and what all three of these change:\n\n- Pure black with no surface layering. Modern dark UI stacks near-blacks (#0D0D10 base, #16161C raised) so panels read as depth rather than as outlined boxes.\n- Monospace for everything. Chrome is now a UI sans; monospace is kept for clipboard CONTENT, which is usually code and paths anyway.\n- A 1px border around every element. Replaced by fills and spacing, with borders only where a real edge is needed.\n- Every glyph tinted the accent colour. Text is now near-white; the accent is spent on the selection and one primary button.\n- No radii, uppercase letterspaced labels, a function-key legend, 3-letter type codes. Replaced by radii, sentence case, key caps and real icons.\n\nStructure is unchanged: lateral pinned pane, no sections, selected item opens in place (still optional)."
+    },
+    {
+      "id": "note-soft",
+      "x": 0, "y": 600, "w": 470,
+      "text": "SOFT — leading candidate\n\nLayered near-black surfaces, 9-11px radii, 40px rows, real icons. The selected item becomes a raised card rather than an inverted row.\n\nKeeps the neon green, but spends it sparingly -- selection, one badge, the primary button -- which is what lets it read modern instead of retro. This is the direction that changes the look most while keeping the app recognisably itself.\n\nTradeoff: the most spacing of the three, so around 9 rows visible against the current 17."
+    },
+    {
+      "id": "note-studio",
+      "x": 1080, "y": 600, "w": 470,
+      "text": "STUDIO\n\nProfessional-tool density: 32px rows, 5px radii, a column header, a real status bar. Cool neutral greys with a blue accent used only for selection and the primary action.\n\nThe closest of the three to the density you have now -- about 13 rows -- while still looking current. If Soft feels too airy, this is the one.\n\nTradeoff: the least distinctive. It looks like a well-made tool panel rather than like clip2."
+    },
+    {
+      "id": "note-bold",
+      "x": 0, "y": 1460, "w": 470,
+      "text": "BOLD\n\n52px rows, 14px type, 12-16px radii, and a solid accent block for the selection. Amber rather than green, to show the palette is not load-bearing.\n\nReads instantly and is the easiest on the eyes at a glance.\n\nTradeoff: roughly 6 rows visible. For a clipboard history you hunt through, that is a real cost -- this suits someone who mostly takes one of the last few copies."
+    },
+    {
+      "id": "code-note",
+      "x": 1080, "y": 1460, "w": 470,
+      "text": "One code implication, whichever you pick.\n\nAll three style the selected row as a tinted surface with LIGHT text, rather than as inverse video. ApplyThemeId hardcodes SEL_FG to black, so a preset cannot express that today -- it needs the fifth field I raised when the themes went in, or a per-element override.\n\nThe other two are straightforward: BG stops being pure black (it is currently hardcoded too), and the chrome needs a UI sans alongside the existing monospace, so the font setting becomes two faces rather than one."
+    }
+  ],
+  "launch": { "view": "canvas" }
+}

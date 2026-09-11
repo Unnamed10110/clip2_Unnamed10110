@@ -1,0 +1,218 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; background: #08080A; }
+    a { color: #3DDC84; } a:hover { color: #6FE8A6; }
+    /* Chrome is a UI sans; only clipboard CONTENT is monospace. Using mono for labels
+       and counts is most of what made the old overlay read as a terminal. */
+    .win {
+      box-sizing: border-box; height: 560px; background: #0D0D10;
+      border-radius: 12px; overflow: hidden;
+      display: flex; flex-direction: column;
+      font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+      font-size: 13px; line-height: 1;
+      box-shadow: inset 0 0 0 1px #1E1E24;
+    }
+    .head { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 12px 12px 8px; }
+    .field {
+      flex: 1 1 auto; display: flex; align-items: center; gap: 9px;
+      height: 34px; padding: 0 11px; border-radius: 9px; background: #17171C;
+      box-shadow: inset 0 0 0 1px #23232B;
+    }
+    .seg { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; padding: 2px; border-radius: 9px; background: #141419; }
+    .seg > div { height: 28px; padding: 0 11px; border-radius: 7px; display: flex; align-items: center; font-size: 12px; color: #7C7C88; }
+    .seg > div.on { background: #24242C; color: #E9E9EF; }
+    .list { flex: 1 1 auto; display: flex; flex-direction: column; gap: 1px; padding: 4px 8px; overflow: hidden; }
+    .row {
+      flex: 0 0 auto; display: flex; align-items: center; gap: 11px;
+      height: 40px; padding: 0 11px; border-radius: 9px; position: relative;
+    }
+    .row.hov { background: #131318; }
+    .ico { flex: 0 0 16px; display: flex; align-items: center; justify-content: center; }
+    .txt {
+      flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      color: #D6D6DE; font-family: Consolas, ui-monospace, monospace; font-size: 12.5px;
+    }
+    .age { flex: 0 0 auto; color: #62626E; font-size: 11.5px; }
+    .pin { position: absolute; left: 0; top: 12px; width: 2px; height: 16px; border-radius: 1px; background: #3DDC84; }
+    /* Selected: a tinted surface and an accent rail, not inverse video. */
+    .card {
+      flex: 0 0 auto; border-radius: 11px; background: #16161C; padding: 12px 13px;
+      display: flex; flex-direction: column; gap: 10px; box-shadow: inset 0 0 0 1px #262630;
+    }
+    .card-top { display: flex; align-items: center; gap: 9px; }
+    .badge { height: 19px; padding: 0 8px; border-radius: 6px; background: #143024; color: #3DDC84; font-size: 11px; display: flex; align-items: center; }
+    .card-meta { color: #62626E; font-size: 11.5px; }
+    .body {
+      white-space: pre; overflow: hidden; color: #DCDCE4; font-size: 12.5px; line-height: 1.6;
+      font-family: Consolas, ui-monospace, monospace;
+    }
+    .acts { display: flex; align-items: center; gap: 6px; }
+    .btn { height: 26px; padding: 0 11px; border-radius: 7px; background: #23232C; color: #C8C8D2; font-size: 12px; display: flex; align-items: center; gap: 7px; }
+    .btn.pri { background: #3DDC84; color: #06160D; }
+    .kbd { font-size: 10.5px; color: #7C7C88; }
+    .btn.pri .kbd { color: #0B2A18; }
+    .foot { flex: 0 0 auto; display: flex; align-items: center; gap: 16px; padding: 9px 16px 12px; color: #55555F; font-size: 11.5px; }
+    .cap { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; border-radius: 5px; background: #17171C; color: #9A9AA6; font-size: 10.5px; margin-right: 6px; }
+    .plabel { padding: 12px 14px 6px; color: #62626E; font-size: 11.5px; }
+  </style>
+</helmet>
+
+<div style="display: flex; gap: 12px; align-items: flex-start; background: #08080A">
+
+  <!-- ============ PINNED, lateral ============ -->
+  <div class="win" style="width: 320px">
+    <div class="plabel">Pinned</div>
+    <div class="list">
+      <sc-for list="{{pinned}}" as="row" hint-placeholder-count="6">
+        <div class="row">
+          <div class="pin"></div>
+          <div class="ico">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#4B4B56" stroke-width="1.5" stroke-linecap="round">
+              <path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5"></path>
+            </svg>
+          </div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+    </div>
+    <div class="foot"><div><span class="cap">Tab</span>List</div></div>
+  </div>
+
+  <!-- ============ MAIN ============ -->
+  <div class="win" style="width: 640px">
+
+    <div class="head">
+      <div class="field">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#62626E" stroke-width="1.5">
+          <circle cx="7.2" cy="7.2" r="4.3"></circle>
+          <path d="M10.4 10.4 L13.5 13.5" stroke-linecap="round"></path>
+        </svg>
+        <div style="flex: 1 1 auto; color: #55555F">Search clipboard</div>
+      </div>
+      <div class="seg">
+        <div class="on">All <span style="color: #62626E; margin-left: 5px">47</span></div>
+        <div>Snippets <span style="color: #4A4A54; margin-left: 5px">12</span></div>
+      </div>
+    </div>
+
+    <div class="list">
+      <sc-for list="{{before}}" as="row" hint-placeholder-count="2">
+        <div class="row {{row.cls}}">
+          <div class="ico">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#4B4B56" stroke-width="1.5" stroke-linecap="round">
+              <path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5"></path>
+            </svg>
+          </div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+
+      <div class="card">
+        <div class="card-top">
+          <div class="badge">Text</div>
+          <div class="card-meta">7 lines &#183; 214 bytes</div>
+          <div style="flex: 1 1 auto"></div>
+          <div class="card-meta">8m ago</div>
+        </div>
+        <div class="body">SELECT c.id, c.name, c.email, o.total
+  FROM customers c
+  JOIN orders o ON o.customer_id = c.id
+ WHERE c.active = 1
+ ORDER BY o.total DESC</div>
+        <div class="acts">
+          <div class="btn pri"><span class="kbd">&#8629;</span>Paste</div>
+          <div class="btn"><span class="kbd">P</span>Plain</div>
+          <div class="btn"><span class="kbd">E</span>Edit</div>
+          <div class="btn"><span class="kbd">M</span>Merge</div>
+        </div>
+      </div>
+
+      <sc-for list="{{after}}" as="row" hint-placeholder-count="6">
+        <div class="row {{row.cls}}">
+          <sc-if value="{{row.pinned}}" hint-placeholder-val="{{true}}">
+            <div class="pin"></div>
+          </sc-if>
+          <div class="ico">
+            <sc-if value="{{row.isText}}" hint-placeholder-val="{{true}}">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#4B4B56" stroke-width="1.5" stroke-linecap="round">
+                <path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5"></path>
+              </svg>
+            </sc-if>
+            <sc-if value="{{row.isImage}}" hint-placeholder-val="{{true}}">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#4B4B56" stroke-width="1.5">
+                <rect x="2.4" y="3.4" width="11.2" height="9.2" rx="2.2"></rect>
+                <circle cx="5.9" cy="6.6" r="1.05"></circle>
+                <path d="M3.2 11.2 L6.6 8.4 L9 10 L11 8.7 L12.8 10.2" stroke-linecap="round"></path>
+              </svg>
+            </sc-if>
+            <sc-if value="{{row.isFile}}" hint-placeholder-val="{{true}}">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#4B4B56" stroke-width="1.5">
+                <path d="M4.4 2.8h4.2L12 6.2v7H4.4z" stroke-linejoin="round"></path>
+                <path d="M8.5 3v3.2h3.3"></path>
+              </svg>
+            </sc-if>
+          </div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <div class="foot">
+      <div><span class="cap">&#8629;</span>Paste</div>
+      <div><span class="cap">Tab</span>Pinned</div>
+      <div><span class="cap">?</span>Shortcuts</div>
+    </div>
+
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{ "$preview": { "width": 972, "height": 560 } }'>
+// Direction: "Soft". Layered near-black surfaces instead of pure black, 9-11px radii,
+// a UI sans for chrome with monospace reserved for clipboard content, real icons, and
+// the accent spent sparingly -- selection and one primary button, not every glyph.
+class Component extends DCLogic {
+  renderVals() {
+    const mk = (d) => ({
+      text: d[0], age: d[2], pinned: !!d[3], cls: d[4] || '',
+      isText: d[1] === 'text', isImage: d[1] === 'image', isFile: d[1] === 'file'
+    });
+    return {
+      before: [
+        mk(['SELECT id, name FROM customers WHERE active = 1', 'text', '2m']),
+        mk(['https://github.com/Unnamed10110/clip2/releases', 'text', '5m', 0, 'hov'])
+      ],
+      after: [
+        mk(['Screenshot 2026-09-11 075812.png', 'image', '12m']),
+        mk(['3 files - history.dat, blobs\\, settings.reg', 'file', '18m']),
+        mk(['HookSafeSleep keeps the low-level hook serviced', 'text', '24m']),
+        mk(['cmake -S . -B build -DCLIP2_TRACE=ON', 'text', '31m']),
+        mk(['%APPDATA%\\clip2\\history.dat', 'text', '1h']),
+        mk(['HKCU\\Software\\clip2', 'text', '4h', 1])
+      ],
+      pinned: [
+        { text: 'ClipboardManager.cpp:6461', age: '8m' },
+        { text: 'HKCU\\Software\\clip2', age: '4h' },
+        { text: 'Ctrl+NumPadDot', age: '4d' },
+        { text: 'clip2.exe', age: '4d' },
+        { text: 'RGB(0, 255, 102)', age: '1w' },
+        { text: 'ico2.ico', age: '2w' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

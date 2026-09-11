@@ -1,0 +1,174 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; background: #08080A; }
+    a { color: #6E9BFF; } a:hover { color: #9FBCFF; }
+    .win {
+      box-sizing: border-box; height: 560px; background: #101013;
+      border-radius: 6px; overflow: hidden; display: flex; flex-direction: column;
+      font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+      font-size: 12px; line-height: 1;
+      box-shadow: inset 0 0 0 1px #1F1F26;
+    }
+    .bar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 10px; box-shadow: inset 0 -1px 0 #1C1C23; }
+    .field { flex: 1 1 auto; display: flex; align-items: center; gap: 8px; height: 26px; padding: 0 9px; border-radius: 5px; background: #17171C; box-shadow: inset 0 0 0 1px #24242C; }
+    .tab { height: 26px; padding: 0 9px; border-radius: 5px; display: flex; align-items: center; color: #6E6E7A; }
+    .tab.on { background: #1C1C24; color: #D4D4DC; }
+    .cols { flex: 0 0 auto; display: flex; align-items: center; height: 22px; padding: 0 12px; color: #4E4E5A; font-size: 10.5px; box-shadow: inset 0 -1px 0 #1A1A21; }
+    .list { flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; }
+    .row { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 12px; position: relative; }
+    .row.hov { background: #15151B; }
+    .row.on { background: #17202F; }
+    .row.on .rail { position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: #6E9BFF; }
+    .ico { flex: 0 0 15px; display: flex; align-items: center; justify-content: center; }
+    .txt { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #C3C3CC; font-family: Consolas, ui-monospace, monospace; font-size: 12px; }
+    .row.on .txt { color: #E6EDFA; }
+    .age { flex: 0 0 44px; text-align: right; color: #5A5A66; font-size: 11px; }
+    .dot { flex: 0 0 5px; width: 5px; height: 5px; border-radius: 50%; background: #6E9BFF; }
+    .card { flex: 0 0 auto; margin: 3px 8px; border-radius: 6px; background: #15151B; box-shadow: inset 0 0 0 1px #262630; padding: 10px 11px; display: flex; flex-direction: column; gap: 9px; }
+    .meta { display: flex; align-items: center; gap: 8px; color: #5A5A66; font-size: 10.5px; }
+    .tag { height: 17px; padding: 0 7px; border-radius: 4px; background: #1B2536; color: #6E9BFF; display: flex; align-items: center; }
+    .body { white-space: pre; overflow: hidden; color: #CFCFD8; font-size: 12px; line-height: 1.58; font-family: Consolas, ui-monospace, monospace; }
+    .acts { display: flex; align-items: center; gap: 5px; }
+    .btn { height: 23px; padding: 0 9px; border-radius: 4px; background: #1E1E26; color: #B4B4C0; font-size: 11px; display: flex; align-items: center; gap: 6px; }
+    .btn.pri { background: #6E9BFF; color: #0A1425; }
+    .k { font-size: 10px; color: #6E6E7A; }
+    .btn.pri .k { color: #16304F; }
+    .status { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; height: 24px; padding: 0 12px; color: #4E4E5A; font-size: 10.5px; box-shadow: inset 0 1px 0 #1C1C23; }
+  </style>
+</helmet>
+
+<div style="display: flex; gap: 12px; align-items: flex-start; background: #08080A">
+
+  <div class="win" style="width: 320px">
+    <div class="bar"><div style="color: #8A8A96">Pinned</div><div style="flex: 1 1 auto"></div><div style="color: #4E4E5A">6</div></div>
+    <div class="list">
+      <sc-for list="{{pinned}}" as="row" hint-placeholder-count="7">
+        <div class="row">
+          <div class="dot"></div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+    </div>
+    <div class="status"><div>Tab to list</div></div>
+  </div>
+
+  <div class="win" style="width: 640px">
+    <div class="bar">
+      <div class="field">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#5A5A66" stroke-width="1.5">
+          <circle cx="7.2" cy="7.2" r="4.3"></circle>
+          <path d="M10.4 10.4 L13.5 13.5" stroke-linecap="round"></path>
+        </svg>
+        <div style="flex: 1 1 auto; color: #4E4E5A">Search</div>
+      </div>
+      <div class="tab on">All 47</div>
+      <div class="tab">Snippets 12</div>
+    </div>
+
+    <div class="cols">
+      <div style="flex: 0 0 25px"></div>
+      <div style="flex: 1 1 auto">CONTENT</div>
+      <div style="flex: 0 0 44px; text-align: right">AGE</div>
+    </div>
+
+    <div class="list">
+      <sc-for list="{{before}}" as="row" hint-placeholder-count="3">
+        <div class="row {{row.cls}}">
+          <div class="ico">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#4A4A55" stroke-width="1.5" stroke-linecap="round">
+              <path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5"></path>
+            </svg>
+          </div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+
+      <div class="card">
+        <div class="meta">
+          <div class="tag">Text</div>
+          <div>7 lines &#183; 214 bytes</div>
+          <div style="flex: 1 1 auto"></div>
+          <div>8m ago</div>
+        </div>
+        <div class="body">SELECT c.id, c.name, c.email, o.total
+  FROM customers c
+  JOIN orders o ON o.customer_id = c.id
+ WHERE c.active = 1
+ ORDER BY o.total DESC</div>
+        <div class="acts">
+          <div class="btn pri"><span class="k">&#8629;</span>Paste</div>
+          <div class="btn"><span class="k">P</span>Plain</div>
+          <div class="btn"><span class="k">E</span>Edit</div>
+          <div class="btn"><span class="k">M</span>Merge</div>
+        </div>
+      </div>
+
+      <sc-for list="{{after}}" as="row" hint-placeholder-count="8">
+        <div class="row {{row.cls}}">
+          <div class="ico">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#4A4A55" stroke-width="1.5" stroke-linecap="round">
+              <path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5"></path>
+            </svg>
+          </div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <div class="status">
+      <div>Enter paste</div><div>Tab pinned</div><div>? shortcuts</div>
+      <div style="flex: 1 1 auto"></div><div>47 items</div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{ "$preview": { "width": 972, "height": 560 } }'>
+// Direction: "Studio". Professional-tool density -- 32px rows, 5px radii, a cool
+// neutral palette and a blue accent used only for selection and the primary action.
+class Component extends DCLogic {
+  renderVals() {
+    const mk = (t, a, cls) => ({ text: t, age: a, cls: cls || '' });
+    return {
+      before: [
+        mk('SELECT id, name FROM customers WHERE active = 1', '2m'),
+        mk('https://github.com/Unnamed10110/clip2/releases', '5m', 'hov'),
+        mk('ClipboardManager.cpp:6461', '8m')
+      ],
+      after: [
+        mk('Screenshot 2026-09-11 075812.png', '12m'),
+        mk('3 files - history.dat, blobs\\, settings.reg', '18m'),
+        mk('HookSafeSleep keeps the low-level hook serviced', '24m'),
+        mk('cmake -S . -B build -DCLIP2_TRACE=ON', '31m'),
+        mk('RGB(0, 255, 102)', '47m'),
+        mk('%APPDATA%\\clip2\\history.dat', '1h'),
+        mk('git rebase -i HEAD~3', '2h'),
+        mk('HKCU\\Software\\clip2', '4h')
+      ],
+      pinned: [
+        mk('ClipboardManager.cpp:6461', '8m'),
+        mk('HKCU\\Software\\clip2', '4h'),
+        mk('Ctrl+NumPadDot', '4d'),
+        mk('clip2.exe', '4d'),
+        mk('RGB(0, 255, 102)', '1w'),
+        mk('ico2.ico', '2w'),
+        mk('build.bat trace', '3w')
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

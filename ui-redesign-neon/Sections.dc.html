@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; background: #000; }
+    a { color: #00ff66; } a:hover { color: #00c850; }
+    .win {
+      box-sizing: border-box; height: 520px; background: #000;
+      box-shadow: inset 0 0 0 1px #00c850;
+      display: flex; flex-direction: column; overflow: hidden;
+      font-family: Consolas, "DejaVu Sans Mono", ui-monospace, monospace;
+      font-size: 13px; line-height: 1;
+    }
+    .search { flex: 0 0 auto; height: 40px; display: flex; align-items: center; gap: 9px; padding: 0 11px; }
+    .rule { flex: 0 0 auto; height: 1px; background: #004b17; }
+    .list { flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; }
+    .sect {
+      flex: 0 0 auto; height: 20px; display: flex; align-items: center; gap: 9px; padding: 0 11px;
+      font-size: 9px; letter-spacing: 1.2px; color: #008028;
+    }
+    .sect .line { flex: 1 1 auto; height: 1px; background: #002f0e; }
+    .row { flex: 0 0 auto; height: 30px; display: flex; align-items: center; padding: 0 5px; }
+    .rowin { display: flex; align-items: center; width: 100%; height: 26px; border-radius: 3px; padding: 0 6px; box-sizing: border-box; }
+    .on .rowin { background: #00ff66; }
+    .c-mark { flex: 0 0 11px; color: #00ff66; font-size: 11px; }
+    .c-typ  { flex: 0 0 30px; color: #008028; font-size: 9px; letter-spacing: 0.5px; }
+    .c-con  { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #00ff66; }
+    .c-age  { flex: 0 0 44px; text-align: right; color: #00963c; font-size: 11px; }
+    .on .c-mark, .on .c-typ, .on .c-age { color: #004b17; }
+    .on .c-con { color: #000; }
+    .foot {
+      flex: 0 0 auto; height: 22px; background: #00260f; display: flex; align-items: center;
+      gap: 16px; padding: 0 11px; font-size: 11px; color: #00963c; box-shadow: inset 0 1px 0 #004b17;
+    }
+    .foot b { color: #00ff66; font-weight: 400; }
+  </style>
+</helmet>
+
+<div style="display: flex; gap: 12px; align-items: flex-start; background: #000">
+
+  <div class="win" style="width: 320px">
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#008028" stroke-width="1.4">
+        <circle cx="7" cy="7" r="4.5"></circle>
+        <path d="M10.5 10.5 L14 14" stroke-linecap="round"></path>
+      </svg>
+      <div style="flex: 1 1 auto; color: #005c1c; font-size: 12px">Search pinned</div>
+      <div style="font-size: 11px; color: #008028">6</div>
+    </div>
+    <div class="rule"></div>
+    <div class="list">
+      <sc-for list="{{pinned}}" as="row" hint-placeholder-count="6">
+        <div class="row">
+          <div class="rowin">
+            <div class="c-mark">*</div>
+            <div class="c-con">{{row.text}}</div>
+            <div class="c-age">{{row.age}}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+    <div class="foot"><div><b>&#8677;</b> list</div><div><b>&#8629;</b> paste</div></div>
+  </div>
+
+  <div class="win" style="width: 640px">
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#00963c" stroke-width="1.4">
+        <circle cx="7" cy="7" r="4.5"></circle>
+        <path d="M10.5 10.5 L14 14" stroke-linecap="round"></path>
+      </svg>
+      <div style="flex: 1 1 auto; color: #005c1c">Search clipboard</div>
+      <div style="font-size: 11px; color: #00963c">All 47</div>
+      <div style="font-size: 11px; color: #005c1c; margin-left: 14px">Snippets 12</div>
+    </div>
+    <div class="rule"></div>
+
+    <!-- Grouped by recency, so scanning is structural: you look in a band, not down
+         a flat 47-item list trying to remember roughly how long ago it was. -->
+    <div class="list">
+      <sc-for list="{{groups}}" as="g" hint-placeholder-count="3">
+        <div class="sect">
+          <div>{{g.name}}</div>
+          <div class="line"></div>
+          <div>{{g.count}}</div>
+        </div>
+        <sc-for list="{{g.rows}}" as="row" hint-placeholder-count="5">
+          <div class="row {{row.cls}}">
+            <div class="rowin">
+              <div class="c-mark">{{row.mark}}</div>
+              <div class="c-typ">{{row.type}}</div>
+              <div class="c-con">{{row.text}}</div>
+              <div class="c-age">{{row.age}}</div>
+            </div>
+          </div>
+        </sc-for>
+      </sc-for>
+    </div>
+
+    <div class="foot">
+      <div><b>&#8629;</b> paste</div>
+      <div><b>&#8677;</b> pinned</div>
+      <div><b>?</b> shortcuts</div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{ "$preview": { "width": 972, "height": 520 } }'>
+// Direction: "Sections". Same rows, different information architecture.
+class Component extends DCLogic {
+  renderVals() {
+    const mk = (d, sel) => ({
+      text: d[0], type: d[1], age: d[2], mark: d[3] ? '*' : '', cls: sel ? 'on' : ''
+    });
+    return {
+      groups: [
+        {
+          name: 'LAST HOUR', count: '8',
+          rows: [
+            mk(['SELECT id, name FROM customers WHERE active = 1', 'TXT', '2m']),
+            mk(['https://github.com/Unnamed10110/clip2/releases', 'TXT', '5m'], true),
+            mk(['ClipboardManager.cpp:6461', 'TXT', '8m', 1]),
+            mk(['Screenshot 2026-09-11 075812.png', 'IMG', '12m']),
+            mk(['3 files - history.dat, blobs\\, settings.reg', 'FIL', '18m']),
+            mk(['HookSafeSleep keeps the low-level hook serviced', 'TXT', '24m'])
+          ]
+        },
+        {
+          name: 'TODAY', count: '21',
+          rows: [
+            mk(['cmake -S . -B build -DCLIP2_TRACE=ON', 'TXT', '3h']),
+            mk(['RGB(0, 255, 102)', 'TXT', '4h']),
+            mk(['%APPDATA%\\clip2\\history.dat', 'TXT', '5h']),
+            mk(['overlay-dual-pane.png', 'IMG', '6h'])
+          ]
+        },
+        {
+          name: 'EARLIER', count: '18',
+          rows: [
+            mk(['HKCU\\Software\\clip2', 'TXT', '2d', 1]),
+            mk(['git rebase -i HEAD~3', 'TXT', '3d']),
+            mk(['clip2.exe', 'FIL', '5d']),
+            mk(['ico2.ico', 'IMG', '1w'])
+          ]
+        }
+      ],
+      pinned: [
+        { text: 'ClipboardManager.cpp:6461', age: '8m' },
+        { text: 'HKCU\\Software\\clip2',     age: '4h' },
+        { text: 'Ctrl+NumPadDot',            age: '4d' },
+        { text: 'clip2.exe',                 age: '4d' },
+        { text: 'RGB(0, 255, 102)',          age: '1w' },
+        { text: 'ico2.ico',                  age: '2w' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

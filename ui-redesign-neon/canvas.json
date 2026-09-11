@@ -1,0 +1,36 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html",     "x": 0,    "y": 0,   "w": 972, "h": 520, "title": "Terminal — leading candidate" },
+    { "file": "Columns.dc.html",  "x": 1080, "y": 0,   "w": 972, "h": 520, "title": "Columns" },
+    { "file": "Sections.dc.html", "x": 0,    "y": 820, "w": 972, "h": 520, "title": "Sections" },
+    { "file": "Expand.dc.html",   "x": 1080, "y": 820, "w": 972, "h": 520, "title": "Expand" }
+  ],
+  "annotations": [
+    {
+      "id": "framing",
+      "x": 0, "y": -170, "w": 900,
+      "text": "Neon Green on black in all four, with the app's own derived tones (wash = accent at 15%, rules = dim at 59%), so structure is the only variable. The lateral pinned pane stays in every one.\n\nAll four are drawable in GDI: flat fills, 1px rules, text, blitted thumbnails. Terminal is the only one that needs no icon work at all."
+    },
+    {
+      "id": "note-terminal",
+      "x": 0, "y": 570, "w": 460,
+      "text": "TERMINAL — leading candidate\n\nAxis: identity.\n\nCommits to the 5250 heritage the neon palette comes from. Character-grid columns, hard edges, no radii, inverse-video selection, and a function-key legend along the bottom instead of a cramped hint strip — which is also the honest fix for discoverability. A command-line prompt replaces the boxed search field. 17 rows.\n\nTradeoff: it is a strong period style. If you ever want clip2 to look contemporary rather than deliberately retro, this is the hardest direction to walk back."
+    },
+    {
+      "id": "note-columns",
+      "x": 1080, "y": 570, "w": 460,
+      "text": "COLUMNS\n\nAxis: density.\n\nSplits the main list into two columns: 34 items on screen against today's 12, with no reduction in row height or type size.\n\nTradeoff: each item gets about 210px of content width, so anything longer than a short path or identifier truncates. Best if you mostly recognise items by their first few words."
+    },
+    {
+      "id": "note-sections",
+      "x": 0, "y": 1390, "w": 460,
+      "text": "SECTIONS\n\nAxis: information architecture.\n\nGroups the list by recency — Last hour / Today / Earlier — so you scan a band rather than a flat 47-item list. The row design barely changes; what changes is how you find things.\n\nTradeoff: headers cost roughly three rows of space, and grouping only earns that back once history is genuinely old and varied. Useless on a short list."
+    },
+    {
+      "id": "note-expand",
+      "x": 1080, "y": 1390, "w": 460,
+      "text": "EXPAND\n\nAxis: depth.\n\nThe selected item opens in place as a panel showing the whole thing plus its actions — the preview pane's benefit without spending a third column on it. Multi-line content stops being one clipped line.\n\nTradeoff: the open panel costs about four rows, and the list shifts under you as you arrow through it. The closest of the four to what is already built."
+    }
+  ],
+  "launch": { "view": "canvas" }
+}

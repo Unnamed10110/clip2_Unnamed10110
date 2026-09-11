@@ -303,6 +303,15 @@ static COLORREF g_themeFontColor = kThemeFontColorPreset;
 // Overlay/search font family. Empty means use the default. Default font keeps the
 // terminal aesthetic of the original 5250 theme.
 static const wchar_t* kDefaultThemeFontFace = L"Consolas";
+
+// Overlay font size. Everything in the list is laid out from this: row height, the
+// command line, the column offsets and the open panel's line spacing all derive from it
+// in RecomputeUiMetrics(), so changing it rescales the whole overlay rather than
+// overflowing rows that were sized for 14px text.
+static const int kDefaultThemeFontSize = 14;
+static const int kMinThemeFontSize = 10;
+static const int kMaxThemeFontSize = 24;
+static int g_themeFontSize = kDefaultThemeFontSize;
 static std::wstring g_themeFontFace = kDefaultThemeFontFace;
 
 // ---- Per-element color overrides -------------------------------------------------
@@ -493,6 +502,51 @@ static int LoadMaxItemsFromRegistry(int defaultValue, int minValue, int maxValue
     return v;
 }
 
+static void SaveThemeFontSizeToRegistry(int value) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD v = (DWORD)value;
+    RegSetValueExW(hKey, L"ThemeFontSize", 0, REG_DWORD, (BYTE*)&v, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
+static int LoadThemeFontSizeFromRegistry() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return kDefaultThemeFontSize;
+    DWORD val = kDefaultThemeFontSize, sz = sizeof(DWORD), type = REG_DWORD;
+    if (RegQueryValueExW(hKey, L"ThemeFontSize", nullptr, &type, (BYTE*)&val, &sz) != ERROR_SUCCESS)
+        val = kDefaultThemeFontSize;
+    RegCloseKey(hKey);
+    int v = (int)val;
+    if (v < kMinThemeFontSize) v = kMinThemeFontSize;
+    if (v > kMaxThemeFontSize) v = kMaxThemeFontSize;
+    return v;
+}
+
+static void SaveExpandSelectedToRegistry(bool value) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD v = value ? 1 : 0;
+    RegSetValueExW(hKey, L"ExpandSelected", 0, REG_DWORD, (BYTE*)&v, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
+static bool LoadExpandSelectedFromRegistry() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return true;   // on by default
+    DWORD val = 1, sz = sizeof(DWORD), type = REG_DWORD;
+    if (RegQueryValueExW(hKey, L"ExpandSelected", nullptr, &type, (BYTE*)&val, &sz) != ERROR_SUCCESS)
+        val = 1;
+    RegCloseKey(hKey);
+    return val != 0;
+}
+
 static void SaveMaxItemsToRegistry(int value) {
     HKEY hKey;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
@@ -664,7 +718,7 @@ static HFONT GetOverlayFont() {
         DeleteObject(g_overlayFont);
         g_overlayFont = nullptr;
     }
-    g_overlayFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_overlayFont = CreateFontW(g_themeFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, want.c_str());
     g_overlayFontCachedFace = want;
@@ -674,23 +728,62 @@ static HFONT GetOverlayFont() {
 // Bold + small variants of the overlay font, used for the header chrome and metadata.
 static HFONT g_overlayFontBold = nullptr;
 static HFONT g_overlayFontSmall = nullptr;
+// The open card is the one place the content is meant to be read rather than scanned,
+// so it gets its own, larger monospace.
+static HFONT g_overlayFontLarge = nullptr;
 static std::wstring g_overlayFontVariantFace;
 
 static void EnsureOverlayFontVariants() {
     const std::wstring want = g_themeFontFace.empty() ? std::wstring(kDefaultThemeFontFace) : g_themeFontFace;
-    if (g_overlayFontBold && g_overlayFontSmall && g_overlayFontVariantFace == want) return;
+    if (g_overlayFontBold && g_overlayFontSmall && g_overlayFontLarge &&
+        g_overlayFontVariantFace == want) return;
     if (g_overlayFontBold) { DeleteObject(g_overlayFontBold); g_overlayFontBold = nullptr; }
     if (g_overlayFontSmall) { DeleteObject(g_overlayFontSmall); g_overlayFontSmall = nullptr; }
-    g_overlayFontBold = CreateFontW(15, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    if (g_overlayFontLarge) { DeleteObject(g_overlayFontLarge); g_overlayFontLarge = nullptr; }
+    g_overlayFontBold = CreateFontW(g_themeFontSize + 1, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, want.c_str());
-    g_overlayFontSmall = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_overlayFontSmall = CreateFontW(std::max(9, g_themeFontSize - 2), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, want.c_str());
+    g_overlayFontLarge = CreateFontW(g_themeFontSize + 3, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, want.c_str());
     g_overlayFontVariantFace = want;
 }
+// Defined below, next to the other font helpers.
+static bool FontFamilyExists(const std::wstring& face);
+
+// Chrome (labels, counts, buttons, the footer) is drawn in a UI sans; only clipboard
+// CONTENT uses the monospace face the user picks. Setting everything in monospace is
+// most of what made the overlay read as a terminal.
+static HFONT g_uiFont = nullptr;
+static HFONT g_uiFontSmall = nullptr;
+static HFONT g_uiFontBold = nullptr;
+
+static HFONT MakeUiFont(int size, int weight) {
+    const wchar_t* face = FontFamilyExists(L"Segoe UI Variable Text") ? L"Segoe UI Variable Text"
+                        : FontFamilyExists(L"Segoe UI")               ? L"Segoe UI"
+                                                                     : L"Tahoma";
+    return CreateFontW(size, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                       VARIABLE_PITCH | FF_SWISS, face);
+}
+
+static void EnsureUiFonts() {
+    if (g_uiFont) return;
+    g_uiFont      = MakeUiFont(g_themeFontSize, FW_NORMAL);
+    g_uiFontSmall = MakeUiFont(std::max(9, g_themeFontSize - 2), FW_NORMAL);
+    g_uiFontBold  = MakeUiFont(g_themeFontSize, FW_SEMIBOLD);
+}
+
+static HFONT GetUiFont()      { EnsureUiFonts(); return g_uiFont; }
+static HFONT GetUiFontSmall() { EnsureUiFonts(); return g_uiFontSmall; }
+static HFONT GetUiFontBold()  { EnsureUiFonts(); return g_uiFontBold; }
+
 static HFONT GetOverlayFontBold()  { EnsureOverlayFontVariants(); return g_overlayFontBold; }
 static HFONT GetOverlayFontSmall() { EnsureOverlayFontVariants(); return g_overlayFontSmall; }
+static HFONT GetOverlayFontLarge() { EnsureOverlayFontVariants(); return g_overlayFontLarge; }
 
 static COLORREF BlendColor(COLORREF a, COLORREF b, int t);  // defined below
 
@@ -867,14 +960,91 @@ static std::wstring RelativeTimeString(const std::chrono::system_clock::time_poi
     return std::to_wstring(days / 30) + L"mo";
 }
 
+// ---- Overlay metrics, derived from the overlay font size --------------------------
+// These were fixed constants sized for a 14px font. Anything larger overflowed its row
+// and the columns stopped lining up, so they are recomputed whenever the size changes.
+static int UI_CMD_H = 24;            // command line ("> " + caret)
+static int UI_CONTENT_TOP = 43;      // CMD + COLHEAD + 1px rule
+static int UI_ROW_H = 26;            // one item
+static int UI_KEYS_H = 22;           // function-key legend
+static int UI_EXPAND_LINE_H = 18;    // one line inside the open panel
+static int UI_EXPAND_CHROME = 60;    // panel header + actions + padding
+static const int UI_EXPAND_MAX_LINES = 4;  // beyond this the panel would eat the list
+
+// Layout insets and radii.
+static int UI_RADIUS_ROW = 9;
+static int UI_RADIUS_CARD = 11;
+static int UI_RADIUS_FIELD = 9;
+static int UI_RADIUS_BTN = 7;
+static int UI_PAD_X = 8;
+static int UI_ICON_W = 26;
+static int UI_AGE_W = 42;
+
+// Soft's surfaces are derived from the background by lightening it, so the whole ramp
+// still works whether BG is pure black (AMOLED) or a near-black. Layered surfaces are
+// what give the overlay depth without drawing a border around every element.
+static COLORREF UiSurface(int amount) {
+    return BlendColor(Theme5250::BG, RGB(255, 255, 255), amount);
+}
+// Text is neutral in this design: the accent is spent on the selection and one primary
+// button, not on every glyph. That restraint is most of what reads as modern.
+static COLORREF UiInk(int amount) {
+    return BlendColor(Theme5250::BG, RGB(255, 255, 255), amount);
+}
+
+// Where the search pill sits, and where its edit control goes inside it. The painter
+// draws the pill and the icon; the EDIT control draws the text and its own cue banner,
+// so only one of them ever renders the query.
+static RECT UiSearchFieldRect(int paneWidth, bool pinnedPane) {
+    int fieldH = g_themeFontSize + 20;
+    int left = UI_PAD_X;
+    int right = paneWidth - UI_PAD_X;
+    if (!pinnedPane) right -= (g_themeFontSize * 13) + 10;   // room for the scope control
+    RECT r = { left, 12, right, 12 + fieldH };
+    return r;
+}
+
+static RECT UiSearchEditRect(int paneWidth, bool pinnedPane) {
+    RECT f = UiSearchFieldRect(paneWidth, pinnedPane);
+    int h = g_themeFontSize + 3;
+    int y = f.top + ((f.bottom - f.top) - h) / 2;
+    RECT r = { f.left + 30, y, f.right - 10, y + h };
+    return r;
+}
+
+static void RecomputeUiMetrics() {
+    const int s = g_themeFontSize;
+
+    UI_ROW_H         = s + 26;   // 40 at the default size: room to breathe
+    UI_CMD_H         = s + 40;   // the search header
+    UI_CONTENT_TOP   = UI_CMD_H;
+    UI_KEYS_H        = s + 24;   // footer hints
+    UI_EXPAND_LINE_H = s + 9;   // the card body is drawn 3pt larger than the rows
+    // Card padding + the meta row + the action buttons + the gaps between them.
+    UI_EXPAND_CHROME = s + 75;
+
+    // Radii and insets, all proportional so they survive a font-size change.
+    UI_RADIUS_ROW    = 9;
+    UI_RADIUS_CARD   = 11;
+    UI_RADIUS_FIELD  = 9;
+    UI_RADIUS_BTN    = 7;
+    UI_PAD_X         = 8;        // list inset from the window edge
+    UI_ICON_W        = s + 12;   // icon gutter
+    UI_AGE_W         = s * 3;
+}
+
 static void ResetOverlayFontCache() {
     if (g_overlayFont) {
         DeleteObject(g_overlayFont);
         g_overlayFont = nullptr;
     }
     g_overlayFontCachedFace.clear();
+    if (g_uiFont) { DeleteObject(g_uiFont); g_uiFont = nullptr; }
+    if (g_uiFontSmall) { DeleteObject(g_uiFontSmall); g_uiFontSmall = nullptr; }
+    if (g_uiFontBold) { DeleteObject(g_uiFontBold); g_uiFontBold = nullptr; }
     if (g_overlayFontBold) { DeleteObject(g_overlayFontBold); g_overlayFontBold = nullptr; }
     if (g_overlayFontSmall) { DeleteObject(g_overlayFontSmall); g_overlayFontSmall = nullptr; }
+    if (g_overlayFontLarge) { DeleteObject(g_overlayFontLarge); g_overlayFontLarge = nullptr; }
     g_overlayFontVariantFace.clear();
 }
 
@@ -1688,6 +1858,65 @@ static bool AreDuplicateClipboardItems(const ClipboardItem* a, const ClipboardIt
 
     if (AreDuplicateImages(a, b)) return true;
     return false;
+}
+
+// Defined further down, beside the other clipboard-payload parsers.
+static std::vector<std::wstring> ExtractHdropPaths(const std::vector<BYTE>& bytes);
+
+// The preview is built from the PRIMARY format while the item is being constructed,
+// but sibling formats are added afterwards. An item whose primary is HTML, RTF or some
+// unrecognised registered format therefore kept a bracketed label even when a perfectly
+// good CF_UNICODETEXT sibling was sitting right beside it -- which is what put
+// "[Unknown Format]" in the list instead of the content. Only placeholders are touched,
+// so a real text preview is never overwritten.
+void ClipboardItem::RefinePreviewFromText() {
+    if (!preview.empty() && preview[0] != L'[') return;
+
+    auto take = [this](const std::wstring& s) {
+        size_t n = 0;
+        while (n < s.size() && n < kPreviewChars && s[n] != L'\0') n++;
+        if (n == 0) return false;
+        preview.assign(s, 0, n);
+        return true;
+    };
+
+    const std::vector<BYTE>* d = GetFormatData(CF_UNICODETEXT);
+    if (d && d->size() >= sizeof(wchar_t)) {
+        size_t len = d->size() / sizeof(wchar_t);
+        const wchar_t* p = (const wchar_t*)d->data();
+        size_t n = 0;
+        while (n < len && n < kPreviewChars && p[n] != L'\0') n++;
+        if (n > 0) { preview.assign(p, n); return; }
+    }
+
+    d = GetFormatData(CF_TEXT);
+    if (d && !d->empty()) {
+        const char* p = (const char*)d->data();
+        size_t n = 0;
+        while (n < d->size() && n < kPreviewChars && p[n] != '\0') n++;
+        if (n > 0) {
+            std::string s(p, n);
+            preview.assign(s.begin(), s.end());
+            return;
+        }
+    }
+
+    // A file drop has no text format, but its paths are the content as far as the
+    // user is concerned -- far more use than "[File Drop]".
+    d = GetFormatData(CF_HDROP);
+    if (d && !d->empty()) {
+        std::vector<std::wstring> paths = ExtractHdropPaths(*d);
+        if (!paths.empty()) {
+            std::wstring joined;
+            for (size_t i = 0; i < paths.size(); i++) {
+                if (i) joined += L", ";
+                joined += paths[i];
+                if (joined.size() >= kPreviewChars) break;
+            }
+            if (take(joined)) return;
+        }
+    }
+    // Anything else (an image, say) keeps its label: there is no text to show.
 }
 
 // Plain text from a history item for direct injection (paste without system clipboard).
@@ -2816,7 +3045,7 @@ static void RestartSelf(ClipboardManager* mgr) {
 }
 
 ClipboardManager::ClipboardManager()
-    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), overlayScope(SCOPE_ALL), showShortcuts(false), chipHitCount(0), isPasting(false), isProcessingClipboard(false), pasteInFlight(false), pasteStartTick(0), processingStartTick(0), hookLastCallbackTick(0), lastPastedText(L""), lastPastedTextTick(0), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), overlayScope(SCOPE_ALL), showShortcuts(false), chipHitCount(0), expandSelected(true), isPasting(false), isProcessingClipboard(false), pasteInFlight(false), pasteStartTick(0), processingStartTick(0), hookLastCallbackTick(0), lastPastedText(L""), lastPastedTextTick(0), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
@@ -2858,6 +3087,9 @@ bool ClipboardManager::Initialize() {
         g_themeFontFace = kDefaultThemeFontFace;
     ResetOverlayFontCache();
     LoadThemeColorsFromRegistry();
+    g_themeFontSize = LoadThemeFontSizeFromRegistry();
+    RecomputeUiMetrics();
+    expandSelected = LoadExpandSelectedFromRegistry();
     ApplyThemeId(LoadThemeIdFromRegistry());
     maxItems = LoadMaxItemsFromRegistry(DEFAULT_MAX_ITEMS, MIN_MAX_ITEMS, MAX_MAX_ITEMS);
     hasSavedOverlayPos = LoadOverlayPosFromRegistry(overlayPosX, overlayPosY);
@@ -2934,7 +3166,8 @@ bool ClipboardManager::Initialize() {
     }
     
     // Set window region - sharp corners for 5250 terminal look
-    HRGN hRgn = CreateRectRgn(0, 0, WINDOW_WIDTH + 1, WINDOW_HEIGHT + 1);
+    // Rounded window, not a rectangle with a painted border.
+    HRGN hRgn = CreateRoundRectRgn(0, 0, WINDOW_WIDTH + 1, WINDOW_HEIGHT + 1, 22, 22);
     SetWindowRgn(hwndList, hRgn, TRUE);
     DeleteObject(hRgn);
     
@@ -2951,7 +3184,7 @@ bool ClipboardManager::Initialize() {
         nullptr, nullptr, GetModuleHandle(nullptr), nullptr
     );
     if (hwndPinned) {
-        HRGN hRgnP = CreateRectRgn(0, 0, PINNED_WIDTH + 1, WINDOW_HEIGHT + 1);
+        HRGN hRgnP = CreateRoundRectRgn(0, 0, PINNED_WIDTH + 1, WINDOW_HEIGHT + 1, 22, 22);
         SetWindowRgn(hwndPinned, hRgnP, TRUE);
         DeleteObject(hRgnP);
         ShowWindow(hwndPinned, SW_HIDE);
@@ -2963,7 +3196,7 @@ bool ClipboardManager::Initialize() {
         L"EDIT",
         L"",
         WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL,
-        34, 13, WINDOW_WIDTH - 34 - 250, 22,   // inside the search header, clear of the scope row
+        0, 0, 10, 10,   // positioned by UiSearchEditRect right after creation
         hwndList,
         nullptr,
         GetModuleHandle(nullptr),
@@ -2971,6 +3204,8 @@ bool ClipboardManager::Initialize() {
     );
     
     if (hwndMainSearch) {
+        RECT er = UiSearchEditRect(WINDOW_WIDTH, false);
+        MoveWindow(hwndMainSearch, er.left, er.top, er.right - er.left, er.bottom - er.top, FALSE);
         SendMessage(hwndMainSearch, WM_SETFONT, (WPARAM)GetOverlayFont(), TRUE);
         SendMessage(hwndMainSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search... (Ctrl+F)");
         // Subclass the edit control to handle Enter key
@@ -2984,10 +3219,12 @@ bool ClipboardManager::Initialize() {
         hwndPinnedSearch = CreateWindowEx(
             0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL,
-            34, 13, PINNED_WIDTH - 34 - 110, 22,   // inside the search header, clear of the PINNED label
+            0, 0, 10, 10,   // positioned by UiSearchEditRect right after creation
             hwndPinned, nullptr, GetModuleHandle(nullptr), nullptr
         );
         if (hwndPinnedSearch) {
+            RECT er = UiSearchEditRect(PINNED_WIDTH, true);
+            MoveWindow(hwndPinnedSearch, er.left, er.top, er.right - er.left, er.bottom - er.top, FALSE);
             SendMessage(hwndPinnedSearch, WM_SETFONT, (WPARAM)GetOverlayFont(), TRUE);
             SendMessage(hwndPinnedSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search pinned");
             SetWindowLongPtr(hwndPinnedSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
@@ -3201,6 +3438,8 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             // Add "Start with Windows" option with checkmark
             bool startupEnabled = mgr->IsStartupWithWindows();
             AppendMenu(hMenu, startupEnabled ? (MF_STRING | MF_CHECKED) : MF_STRING, 3, L"Start with Windows");
+            AppendMenu(hMenu, mgr->expandSelected ? (MF_STRING | MF_CHECKED) : MF_STRING, 8,
+                       L"Expand selected item");
             AppendMenu(hMenu, MF_STRING, 4, L"Settings");
             AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenu(hMenu, MF_STRING, 7, L"Restart");
@@ -3229,6 +3468,8 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             } else if (cmd == 3) {
                 // Toggle startup with Windows
                 mgr->SetStartupWithWindows(!startupEnabled);
+            } else if (cmd == 8) {
+                mgr->SetExpandSelected(!mgr->expandSelected);
             } else if (cmd == 4) {
                 // Show settings dialog
                 mgr->ShowSettingsDialog();
@@ -3672,331 +3913,407 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
         // Layout constants. NOTE: content top (60), row height (50) and the search box
         // position (y=30) are part of the interaction contract used by hit-testing and
         // navigation; keep them in sync with GetItemAtPosition / WM_NCHITTEST.
-        // ---- Palette layout ------------------------------------------------------
-        // The search field IS the header: no app-name bar and no mode pill, because a
-        // single window with a scope row does not need to announce which pane it is.
-        const int CONTENT_TOP = OVERLAY_CONTENT_TOP;
-        const int FOOTER_H    = OVERLAY_FOOTER_H;
-        const int listBottom  = rect.bottom - FOOTER_H;
-        const int rowRight    = rect.right - 9;   // leave room for the scrollbar
+        // ---- Soft layout ---------------------------------------------------------
+        // Layered surfaces instead of a border around everything, a UI sans for chrome
+        // with monospace kept for clipboard content, and the accent spent only on the
+        // selection and one primary button.
+        const int CONTENT_TOP = UI_CONTENT_TOP;
+        const int KEYS_H      = UI_KEYS_H;
+        const int listBottom  = rect.bottom - KEYS_H;
+        const int padX        = UI_PAD_X;
+        const int rowLeft     = padX;
+        const int rowRight    = rect.right - padX;
 
         SetBkMode(hdc, TRANSPARENT);
         FillRect(hdc, &rect, tg.bg);
-        HGDIOBJ hOldFont = SelectObject(hdc, GetOverlayFont());
+        HGDIOBJ hOldFont = SelectObject(hdc, GetUiFont());
 
-        const COLORREF metaCol  = BlendColor(Theme5250::BG, Theme5250::TXT, 150);
-        const COLORREF faintCol = BlendColor(Theme5250::BG, Theme5250::TXT, 78);
+        const COLORREF inkHi    = UiInk(214);   // primary text
+        const COLORREF inkMid   = UiInk(120);   // labels
+        const COLORREF inkLo    = UiInk(86);    // ages, hints
+        const COLORREF inkFaint = UiInk(62);    // placeholder
+        const COLORREF surfRow  = UiSurface(12);   // hover
+        const COLORREF surfFld  = UiSurface(18);   // search field, card
+        const COLORREF surfRaise= UiSurface(30);   // buttons, segmented active
+        const COLORREF lineSoft = UiSurface(26);   // hairlines
+        const COLORREF accent   = Theme5250::SEL_BG;
 
-        // ---- Search header -------------------------------------------------------
-        {
-            RECT hdrRect = { 0, 0, rect.right, SEARCH_H };
-            FillRect(hdc, &hdrRect, tg.accent);
-            DrawTypeGlyph(hdc, 20, SEARCH_H / 2, GLYPH_SEARCH, metaCol);
-
-            SelectObject(hdc, GetOverlayFontSmall());
-            if (paneIsPinned) {
-                // Its own window, so it names itself rather than carrying a scope row
-                // it has no business changing.
-                int pinnedCount = 0;
-                for (const auto& it : mgr->clipboardHistory)
-                    if (it && it->pinned) pinnedCount++;
-                wchar_t buf[64];
-                swprintf_s(buf, L"PINNED %d", pinnedCount);
-                RECT r = { rect.right - 110, 0, rect.right - 14, SEARCH_H };
-                SetTextColor(hdc, paneIsActive ? Theme5250::TXT : faintCol);
-                DrawTextW(hdc, buf, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-            } else {
-                const wchar_t* names[2] = { L"All", L"Snippets" };
-                int counts[2] = { (int)mgr->clipboardHistory.size(), (int)mgr->snippets.size() };
-                int xRight = rect.right - 14;
-                for (int s = 1; s >= 0; s--) {
-                    wchar_t buf[64];
-                    swprintf_s(buf, L"%ls %d", names[s], counts[s]);
-                    SIZE sz{};
-                    GetTextExtentPoint32W(hdc, buf, (int)wcslen(buf), &sz);
-                    RECT r = { xRight - sz.cx, 0, xRight, SEARCH_H };
-                    if (paneIsActive) mgr->scopeTabRect[s] = r;
-                    SetTextColor(hdc, (s == mgr->overlayScope) ? Theme5250::TXT : faintCol);
-                    DrawTextW(hdc, buf, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-                    xRight -= sz.cx + 16;
-                }
-            }
-            SelectObject(hdc, GetOverlayFont());
-
-            // Number-jump feedback replaces nothing: it only appears while typing digits.
-            if (paneIsActive && !mgr->numberInput.empty()) {
-                std::wstring t = L"#" + mgr->numberInput;
-                RECT r = { 34, 0, 200, SEARCH_H };
-                SetTextColor(hdc, Theme5250::TXT);
-                DrawTextW(hdc, t.c_str(), -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            }
-
-            HGDIOBJ op = SelectObject(hdc, tg.dividerPen);
-            MoveToEx(hdc, 0, SEARCH_H, nullptr);
-            LineTo(hdc, rect.right, SEARCH_H);
-            SelectObject(hdc, op);
-        }
-
-        // Outer window border.
-        {
-            HGDIOBJ op = SelectObject(hdc, tg.borderPen);
-            HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, 0, 0, rect.right, rect.bottom);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-        }
-
-        // ---- Scroll / paging math ------------------------------------------------
-        int totalItems = pSnippets ? (int)mgr->filteredSnippetIndices.size()
-                                   : (int)pFiltered.size();
-        int visibleHeight = listBottom - CONTENT_TOP;
-        // One row is taller than the rest, so the page size is what fits once that
-        // extra height is set aside.
-        int itemsPerPage = std::max(1, (visibleHeight - (ROW_SEL_H - ROW_H)) / ROW_H);
-        if (paneIsActive) mgr->itemsPerPage = itemsPerPage;
-        int maxScroll = std::max(0, totalItems - itemsPerPage);
-        if (pScroll > maxScroll) pScroll = maxScroll;
-        if (pScroll < 0) pScroll = 0;
-        if (paneIsActive) mgr->scrollOffset = pScroll; else mgr->inactivePane.scrollOffset = pScroll;
-
-        int startIndex = pScroll;
-        int endIndex = std::min(startIndex + itemsPerPage, totalItems);
-        int selVis = (pSelected >= startIndex && pSelected < endIndex) ? (pSelected - startIndex) : -1;
-
-        // Cleared before the loop, not inside it: an empty list draws no rows at all,
-        // and stale chip rects would otherwise stay clickable.
-        if (paneIsActive) mgr->chipHitCount = 0;
-
-        auto fillRow = [&](const RECT& r, HBRUSH b) {
-            HRGN rgn = CreateRoundRectRgn(r.left, r.top, r.right, r.bottom, 8, 8);
-            if (rgn) { FillRgn(hdc, rgn, b); DeleteObject(rgn); }
+        auto fillRound = [&](int l, int t, int r, int b, int rad, COLORREF col) {
+            HRGN rgn = CreateRoundRectRgn(l, t, r, b, rad * 2, rad * 2);
+            if (!rgn) return;
+            HBRUSH br = CreateSolidBrush(col);
+            if (br) { FillRgn(hdc, rgn, br); DeleteObject(br); }
+            DeleteObject(rgn);
         };
 
-        // Empty state.
+        // ---- Header --------------------------------------------------------------
+        {
+            // The pill and its icon. The text inside is the EDIT control's job -- drawing
+            // it here as well would double up on every keystroke.
+            RECT fld = UiSearchFieldRect(rect.right, paneIsPinned);
+            fillRound(fld.left, fld.top, fld.right, fld.bottom, UI_RADIUS_FIELD, surfFld);
+            DrawTypeGlyph(hdc, fld.left + 15, (fld.top + fld.bottom) / 2, GLYPH_SEARCH, inkLo);
+            (void)inkFaint;
+
+            if (!paneIsPinned) {
+                // Segmented scope control.
+                int segL = fld.right + 10;
+                fillRound(segL, fld.top, rowRight, fld.bottom, UI_RADIUS_FIELD, UiSurface(10));
+                SelectObject(hdc, GetUiFontSmall());
+                const wchar_t* names[2] = { L"All", L"Snippets" };
+                int counts[2] = { (int)mgr->clipboardHistory.size(), (int)mgr->snippets.size() };
+                int cellW = (rowRight - segL - 4) / 2;
+                for (int s = 0; s < 2; s++) {
+                    int cl = segL + 2 + s * cellW;
+                    int cr = cl + cellW;
+                    bool on = (s == mgr->overlayScope);
+                    if (on) fillRound(cl, fld.top + 2, cr, fld.bottom - 2, UI_RADIUS_BTN, surfRaise);
+                    if (paneIsActive) {
+                        RECT hit = { cl, fld.top, cr, fld.bottom };
+                        mgr->scopeTabRect[s] = hit;
+                    }
+                    wchar_t buf[64];
+                    swprintf_s(buf, L"%ls  %d", names[s], counts[s]);
+                    RECT cr2 = { cl, fld.top, cr, fld.bottom };
+                    SetTextColor(hdc, on ? inkHi : inkLo);
+                    DrawTextW(hdc, buf, -1, &cr2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                SelectObject(hdc, GetUiFont());
+            }
+        }
+
+        // Hairline window edge, drawn inside the rounded region.
+        {
+            HPEN pen = CreatePen(PS_SOLID, 1, lineSoft);
+            HGDIOBJ op = SelectObject(hdc, pen);
+            HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            RoundRect(hdc, 0, 0, rect.right, rect.bottom, 22, 22);
+            SelectObject(hdc, ob);
+            SelectObject(hdc, op);
+            DeleteObject(pen);
+        }
+
+        int totalItems = pSnippets ? (int)mgr->filteredSnippetIndices.size()
+                                   : (int)pFiltered.size();
+        int itemsPerPage = std::max(1, (listBottom - CONTENT_TOP) / UI_ROW_H);
+        int maxScroll = std::max(0, totalItems - itemsPerPage);
+        int scrollCap = (paneIsPinned || pSnippets) ? maxScroll : std::max(0, totalItems - 1);
+        if (pScroll > scrollCap) pScroll = scrollCap;
+        if (pScroll < 0) pScroll = 0;
+        if (paneIsActive) mgr->scrollOffset = pScroll; else mgr->inactivePane.scrollOffset = pScroll;
+        if (paneIsActive) mgr->chipHitCount = 0;
+
         if (totalItems == 0) {
-            SetTextColor(hdc, BlendColor(Theme5250::BG, Theme5250::DIM, 220));
+            SelectObject(hdc, GetUiFont());
+            SetTextColor(hdc, inkLo);
             RECT emptyRect = { 0, CONTENT_TOP, rect.right, listBottom };
             const wchar_t* msg;
             if (!pSearch.empty())                         msg = L"No matches";
-            else if (paneIsPinned)                        msg = L"No pinned items";
+            else if (paneIsPinned)                        msg = L"Nothing pinned yet";
             else if (mgr->overlayScope == SCOPE_SNIPPETS) msg = L"No snippets yet";
             else                                          msg = L"Clipboard history is empty";
             DrawTextW(hdc, msg, -1, &emptyRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
-        // ---- Rows ----------------------------------------------------------------
-        for (int i = startIndex; i < endIndex; i++) {
-            int vis = i - startIndex;
-            int top = mgr->RowTopForVisible(vis, selVis);
-            bool isSelected = (i == pSelected && pSelected >= 0);
-            int rh = isSelected ? ROW_SEL_H : ROW_H;
-            if (top + rh > listBottom) break;
+        // One plain row: icon gutter, monospace content, age.
+        auto drawItemRow = [&](int top, int filteredIndex, bool selected, bool isHover) {
+            int actualIndex = -1;
+            if (filteredIndex >= 0 && filteredIndex < (int)pFiltered.size())
+                actualIndex = pFiltered[filteredIndex];
+            if (actualIndex < 0 || actualIndex >= (int)mgr->clipboardHistory.size()) return;
+            const auto& item = mgr->clipboardHistory[actualIndex];
+            if (!item) return;
 
-            bool isMultiSelected = paneIsActive && !pSnippets &&
-                                   mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
-            bool isHover = (i == pHover);
-            bool hot = isSelected || isMultiSelected;
+            int bot = top + UI_ROW_H - 2;
+            if (selected) {
+                // A tinted surface with LIGHT text, not inverse video.
+                fillRound(rowLeft, top, rowRight, bot, UI_RADIUS_ROW,
+                          BlendColor(Theme5250::BG, accent, paneIsActive ? 40 : 20));
+            } else if (isHover) {
+                fillRound(rowLeft, top, rowRight, bot, UI_RADIUS_ROW, surfRow);
+            }
 
-            RECT rowRect = { 6, top + 1, rowRight, top + rh - 1 };
-            if (hot)          fillRow(rowRect, paneIsActive ? tg.selBg : tg.accent);
-            else if (isHover) fillRow(rowRect, tg.accent);
+            if (item->pinned) {
+                RECT rail = { rowLeft, top + 11, rowLeft + 2, bot - 11 };
+                HBRUSH br = CreateSolidBrush(accent);
+                if (br) { FillRect(hdc, &rail, br); DeleteObject(br); }
+            }
 
-            COLORREF fg   = (hot && paneIsActive) ? Theme5250::SEL_FG : Theme5250::TXT;
-            COLORREF meta = (hot && paneIsActive) ? Theme5250::SEL_FG : metaCol;
-
-            // Row line 1 occupies ROW_H whether or not the row is expanded.
-            int lineTop = top, lineBot = top + ROW_H;
-
-            std::wstring preview, info;
             int glyph = GLYPH_TEXT;
-            bool pinned = false, isUrl = false;
+            if (item->isImage)                   glyph = GLYPH_IMAGE;
+            else if (item->fileType == L"Files") glyph = GLYPH_FILE;
+            DrawTypeGlyph(hdc, rowLeft + 12 + UI_ICON_W / 2, (top + bot) / 2, glyph,
+                          selected ? inkHi : UiInk(78));
 
-            if (pSnippets) {
-                if (i >= (int)mgr->filteredSnippetIndices.size()) break;
-                const auto& snip = mgr->snippets[mgr->filteredSnippetIndices[i]];
-                preview = snip.name;
-                info = L"snippet";
-            } else {
-                if (i >= (int)pFiltered.size()) break;
-                int actualIndex = pFiltered[i];
+            std::wstring age = RelativeTimeString(item->timestamp);
+            SelectObject(hdc, GetUiFontSmall());
+            RECT ar = { rowRight - UI_AGE_W - 12, top, rowRight - 12, bot };
+            SetTextColor(hdc, inkLo);
+            DrawTextW(hdc, age.c_str(), -1, &ar, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+            std::wstring preview = item->preview;
+            for (auto& ch : preview) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+            SelectObject(hdc, GetOverlayFont());   // content stays monospace
+            RECT pr = { rowLeft + 12 + UI_ICON_W + 8, top, rowRight - UI_AGE_W - 20, bot };
+            SetTextColor(hdc, inkHi);
+            DrawTextW(hdc, preview.c_str(), -1, &pr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(hdc, GetUiFont());
+        };
+
+        if (paneIsPinned || pSnippets) {
+            int y = CONTENT_TOP;
+            for (int i = pScroll; i < totalItems && y + UI_ROW_H <= listBottom; i++) {
+                bool isSel = (i == pSelected && pSelected >= 0);
+                if (pSnippets) {
+                    if (i >= (int)mgr->filteredSnippetIndices.size()) break;
+                    const auto& snip = mgr->snippets[mgr->filteredSnippetIndices[i]];
+                    int bot = y + UI_ROW_H - 2;
+                    if (isSel)
+                        fillRound(rowLeft, y, rowRight, bot, UI_RADIUS_ROW,
+                                  BlendColor(Theme5250::BG, accent, 40));
+                    else if (i == pHover)
+                        fillRound(rowLeft, y, rowRight, bot, UI_RADIUS_ROW, surfRow);
+                    SelectObject(hdc, GetUiFont());
+                    RECT pr = { rowLeft + 14, y, rowRight - 12, bot };
+                    SetTextColor(hdc, inkHi);
+                    DrawTextW(hdc, snip.name.c_str(), -1, &pr,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                } else {
+                    bool multi = paneIsActive &&
+                                 mgr->multiSelectedIndices.find(i) != mgr->multiSelectedIndices.end();
+                    drawItemRow(y, i, isSel || multi, i == pHover);
+                }
+                y += UI_ROW_H;
+            }
+        } else {
+            std::vector<ClipboardManager::RowBand> bands;
+            mgr->BuildVisibleBands(listBottom, bands);
+            if (paneIsActive) {
+                itemsPerPage = std::max(1, (int)bands.size());
+                mgr->itemsPerPage = itemsPerPage;
+                maxScroll = std::max(0, totalItems - itemsPerPage);
+            }
+
+            for (const auto& b : bands) {
+                bool multi = paneIsActive &&
+                             mgr->multiSelectedIndices.find(b.filteredIndex) != mgr->multiSelectedIndices.end();
+                bool isSel = (b.filteredIndex == pSelected && pSelected >= 0);
+
+                if (!b.expanded) {
+                    drawItemRow(b.top, b.filteredIndex, multi || isSel, b.filteredIndex == pHover);
+                    continue;
+                }
+
+                // ---- The open card ---------------------------------------------------
+                int actualIndex = (b.filteredIndex >= 0 && b.filteredIndex < (int)pFiltered.size())
+                                      ? pFiltered[b.filteredIndex] : -1;
                 if (actualIndex < 0 || actualIndex >= (int)mgr->clipboardHistory.size()) continue;
                 const auto& item = mgr->clipboardHistory[actualIndex];
                 if (!item) continue;
-                preview = item->preview;
-                info = RelativeTimeString(item->timestamp);
-                pinned = item->pinned;
-                if (item->isImage)                 glyph = GLYPH_IMAGE;
-                else if (item->fileType == L"Files") glyph = GLYPH_FILE;
-                isUrl = (preview.find(L"http://") == 0 || preview.find(L"https://") == 0);
-            }
-            for (auto& ch : preview) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
 
-            // Pinned marker keeps the existing 3px accent bar idiom.
-            if (pinned) {
-                RECT pinBar = { rowRect.left, lineTop + 7, rowRect.left + 3, lineTop + 27 };
-                FillRect(hdc, &pinBar, (fg == Theme5250::SEL_FG) ? tg.selFg : tg.txt);
-            }
-
-            // Gutter: a drawn glyph instead of the old outlined letter badge. While the
-            // user is typing a number the gutter shows that number instead.
-            if (paneIsActive && !mgr->numberInput.empty() && !pSnippets) {
-                SelectObject(hdc, GetOverlayFontSmall());
-                RECT nr = { 6, lineTop, 32, lineBot };
-                SetTextColor(hdc, meta);
-                DrawTextW(hdc, std::to_wstring(mgr->OriginalItemNumber(i)).c_str(), -1, &nr,
-                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                SelectObject(hdc, GetOverlayFont());
-            } else {
-                DrawTypeGlyph(hdc, 19, (lineTop + lineBot) / 2, glyph, meta);
-            }
-
-            // Age, right-aligned and short.
-            SelectObject(hdc, GetOverlayFontSmall());
-            RECT infoRect = { rowRight - 60, lineTop, rowRight - 14, lineBot };
-            SetTextColor(hdc, meta);
-            DrawTextW(hdc, info.c_str(), -1, &infoRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SelectObject(hdc, GetOverlayFont());
-
-            // Content.
-            RECT previewRect = { 32, lineTop, rowRight - 66, lineBot };
-            SetTextColor(hdc, fg);
-            DrawTextW(hdc, preview.c_str(), -1, &previewRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-            // ---- Action chips on the selected row --------------------------------
-            // These are the paste modes that used to hide in the footer strip. The keys
-            // they name are the existing handlers, so the chips are an affordance for
-            // shortcuts that already work.
-            if (isSelected && paneIsActive && !pSnippets) {
-                struct Chip { const wchar_t* key; const wchar_t* label; };
-                Chip chips[6];
-                int nChips = 0;
-                chips[nChips++] = { L"\x21B5", L"Paste" };
-                if (isUrl) {
-                    chips[nChips++] = { L"U", L"Clean URL" };
-                    chips[nChips++] = { L"M", L"Markdown link" };
-                } else {
-                    chips[nChips++] = { L"M", L"Markdown" };
+                int cardTop = b.top, cardBot = b.top + b.height - 4;
+                fillRound(rowLeft, cardTop, rowRight, cardBot, UI_RADIUS_CARD, surfFld);
+                {
+                    HPEN pen = CreatePen(PS_SOLID, 1, UiSurface(38));
+                    HGDIOBJ op = SelectObject(hdc, pen);
+                    HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                    RoundRect(hdc, rowLeft, cardTop, rowRight, cardBot,
+                              UI_RADIUS_CARD * 2, UI_RADIUS_CARD * 2);
+                    SelectObject(hdc, ob);
+                    SelectObject(hdc, op);
+                    DeleteObject(pen);
                 }
-                chips[nChips++] = { L"P", L"Plain" };
-                chips[nChips++] = { L"E", L"Edit" };
 
-                SelectObject(hdc, GetOverlayFontSmall());
-                COLORREF chipInk = Theme5250::SEL_FG;
-                HPEN chipPen = CreatePen(PS_SOLID, 1, BlendColor(Theme5250::SEL_BG, Theme5250::SEL_FG, 90));
-                HGDIOBJ op = SelectObject(hdc, chipPen);
-                HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                int cx = 32;
-                int cyTop = top + ROW_H + 6, cyBot = cyTop + 20;
-                mgr->chipHitCount = 0;
-                for (int c = 0; c < nChips; c++) {
-                    wchar_t buf[64];
-                    swprintf_s(buf, L"%ls  %ls", chips[c].key, chips[c].label);
-                    SIZE sz{};
-                    GetTextExtentPoint32W(hdc, buf, (int)wcslen(buf), &sz);
-                    int cw = sz.cx + 16;
-                    if (cx + cw > rowRight - 12) break;
-                    RoundRect(hdc, cx, cyTop, cx + cw, cyBot, 6, 6);
-                    RECT cr = { cx, cyTop, cx + cw, cyBot };
-                    if (mgr->chipHitCount < 6) {
-                        mgr->chipHitRect[mgr->chipHitCount] = cr;
-                        // Chips stand for keys that already work, so a click just
-                        // replays the keystroke rather than duplicating its handler.
-                        mgr->chipHitKey[mgr->chipHitCount] =
-                            (c == 0) ? (WPARAM)VK_RETURN : (WPARAM)chips[c].key[0];
-                        mgr->chipHitCount++;
+                const wchar_t* kindLabel = L"Text";
+                if (item->isImage)                   kindLabel = L"Image";
+                else if (item->fileType == L"Files") kindLabel = L"Files";
+
+                std::vector<std::wstring> lines = mgr->ExpandedLinesFor(b.filteredIndex);
+                int padIn = 12;
+                int metaH = g_themeFontSize + 5;
+
+                // Kind badge: a tinted pill, the one place the accent appears as a fill.
+                SelectObject(hdc, GetUiFontSmall());
+                {
+                    // The list rows carry no index in this design, so the open card is
+                    // where the number lives -- it is what "digits then Enter" targets.
+                    int labelNum = (paneIsActive && !mgr->numberInput.empty())
+                                       ? mgr->OriginalItemNumber(b.filteredIndex)
+                                       : (b.filteredIndex + 1);
+                    wchar_t numBuf[24];
+                    swprintf_s(numBuf, L"#%d", labelNum);
+                    SIZE ns{};
+                    GetTextExtentPoint32W(hdc, numBuf, (int)wcslen(numBuf), &ns);
+                    RECT nr = { rowLeft + padIn, cardTop + padIn,
+                                rowLeft + padIn + ns.cx, cardTop + padIn + metaH };
+                    SetTextColor(hdc, inkMid);
+                    DrawTextW(hdc, numBuf, -1, &nr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                    SIZE ks{};
+                    GetTextExtentPoint32W(hdc, kindLabel, (int)wcslen(kindLabel), &ks);
+                    int bl = rowLeft + padIn + ns.cx + 10, br2 = bl + ks.cx + 16;
+                    fillRound(bl, cardTop + padIn, br2, cardTop + padIn + metaH, 6,
+                              BlendColor(Theme5250::BG, accent, 46));
+                    RECT kr = { bl, cardTop + padIn, br2, cardTop + padIn + metaH };
+                    SetTextColor(hdc, accent);
+                    DrawTextW(hdc, kindLabel, -1, &kr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+                    wchar_t info[96];
+                    swprintf_s(info, L"%zu line%ls", lines.size(), lines.size() == 1 ? L"" : L"s");
+                    RECT ir = { br2 + 9, cardTop + padIn, rowRight - 80, cardTop + padIn + metaH };
+                    SetTextColor(hdc, inkLo);
+                    DrawTextW(hdc, info, -1, &ir, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                    std::wstring age = RelativeTimeString(item->timestamp);
+                    RECT ar = { rowRight - 80, cardTop + padIn, rowRight - padIn, cardTop + padIn + metaH };
+                    SetTextColor(hdc, inkLo);
+                    DrawTextW(hdc, age.c_str(), -1, &ar, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                }
+
+                // Body: the real content, monospace and a size up from the rows.
+                SelectObject(hdc, GetOverlayFontLarge());
+                int ly = cardTop + padIn + metaH + 9;
+                SetTextColor(hdc, inkHi);
+                for (const auto& line : lines) {
+                    RECT lr = { rowLeft + padIn, ly, rowRight - padIn, ly + UI_EXPAND_LINE_H };
+                    DrawTextW(hdc, line.c_str(), -1, &lr,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    ly += UI_EXPAND_LINE_H;
+                }
+
+                // Buttons. Each replays a key that already works.
+                if (paneIsActive) {
+                    std::wstring pv = item->preview;
+                    bool isUrl = (pv.rfind(L"http://", 0) == 0 || pv.rfind(L"https://", 0) == 0);
+                    struct Btn { const wchar_t* key; const wchar_t* label; };
+                    Btn btns[5];
+                    int n = 0;
+                    btns[n++] = { L"\x21B5", L"Paste" };
+                    if (isUrl) btns[n++] = { L"U", L"Clean URL" };
+                    btns[n++] = { L"P", L"Plain" };
+                    btns[n++] = { L"E", L"Edit" };
+                    btns[n++] = { L"M", L"Merge" };
+
+                    SelectObject(hdc, GetUiFontSmall());
+                    int bh = g_themeFontSize + 12;
+                    int by = cardBot - padIn - bh;
+                    int bx = rowLeft + padIn;
+                    for (int k = 0; k < n; k++) {
+                        wchar_t buf[64];
+                        swprintf_s(buf, L"%ls  %ls", btns[k].key, btns[k].label);
+                        SIZE sz{};
+                        GetTextExtentPoint32W(hdc, buf, (int)wcslen(buf), &sz);
+                        int bw = sz.cx + 20;
+                        if (bx + bw > rowRight - padIn) break;
+                        bool primary = (k == 0);
+                        fillRound(bx, by, bx + bw, by + bh, UI_RADIUS_BTN,
+                                  primary ? accent : surfRaise);
+                        RECT br3 = { bx, by, bx + bw, by + bh };
+                        SetTextColor(hdc, primary ? BlendColor(accent, RGB(0, 0, 0), 200) : inkHi);
+                        DrawTextW(hdc, buf, -1, &br3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                        if (mgr->chipHitCount < 6) {
+                            mgr->chipHitRect[mgr->chipHitCount] = br3;
+                            mgr->chipHitKey[mgr->chipHitCount] =
+                                primary ? (WPARAM)VK_RETURN : (WPARAM)btns[k].key[0];
+                            mgr->chipHitCount++;
+                        }
+                        bx += bw + 6;
                     }
-                    SetTextColor(hdc, chipInk);
-                    DrawTextW(hdc, buf, -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                    cx += cw + 6;
+                    SelectObject(hdc, GetUiFont());
                 }
-                SelectObject(hdc, ob);
-                SelectObject(hdc, op);
-                DeleteObject(chipPen);
-                SelectObject(hdc, GetOverlayFont());
             }
         }
 
         // ---- Scrollbar -----------------------------------------------------------
         if (totalItems > itemsPerPage) {
-            int trackTop = CONTENT_TOP + 2, trackBot = listBottom - 2;
+            int trackTop = CONTENT_TOP + 4, trackBot = listBottom - 4;
             int trackH = trackBot - trackTop;
-            int trackX = rect.right - 6;
             if (trackH > 10) {
-                RECT track = { trackX, trackTop, trackX + 3, trackBot };
-                FillRect(hdc, &track, tg.divider);
-                int thumbH = std::max(20, trackH * itemsPerPage / totalItems);
-                int thumbY = trackTop + (maxScroll > 0 ? (trackH - thumbH) * pScroll / maxScroll : 0);
-                RECT thumb = { trackX, thumbY, trackX + 3, thumbY + thumbH };
-                FillRect(hdc, &thumb, tg.border);
+                int thumbH = std::max(24, trackH * itemsPerPage / totalItems);
+                int clamped = std::min(pScroll, maxScroll);
+                int thumbY = trackTop + (maxScroll > 0 ? (trackH - thumbH) * clamped / maxScroll : 0);
+                fillRound(rect.right - 6, thumbY, rect.right - 3, thumbY + thumbH, 2, UiSurface(48));
             }
         }
 
         // ---- Footer --------------------------------------------------------------
-        // Three essentials. The old strip listed seven shortcuts in 12px; the rest now
-        // live on the selected row's chips and behind "?".
         {
-            RECT footRect = { 0, rect.bottom - FOOTER_H, rect.right, rect.bottom };
-            FillRect(hdc, &footRect, tg.accent);
-            HGDIOBJ op = SelectObject(hdc, tg.dividerPen);
-            MoveToEx(hdc, 1, footRect.top, nullptr);
-            LineTo(hdc, rect.right - 1, footRect.top);
-            SelectObject(hdc, op);
+            SelectObject(hdc, GetUiFontSmall());
+            struct Hint { const wchar_t* k; const wchar_t* d; };
+            static const Hint mainHints[] = {
+                { L"\x21B5", L"Paste" }, { L"Tab", L"Pinned" }, { L"?", L"Shortcuts" }
+            };
+            static const Hint pinHints[] = { { L"Tab", L"List" }, { L"\x21B5", L"Paste" } };
+            const Hint* hints = paneIsPinned ? pinHints : mainHints;
+            int nHints = paneIsPinned ? 2 : 3;
 
-            SelectObject(hdc, GetOverlayFontSmall());
-            SetTextColor(hdc, BlendColor(Theme5250::BG, Theme5250::TXT, 170));
-            RECT hintRect = { 14, footRect.top, rect.right - 14, footRect.bottom };
-            DrawTextW(hdc, paneIsPinned ? L"\x21B5 paste     \x21E5 list     ? shortcuts"
-                                        : L"\x21B5 paste     \x21E5 pinned     ? shortcuts",
-                      -1, &hintRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SelectObject(hdc, GetOverlayFont());
+            int hy = rect.bottom - KEYS_H + (KEYS_H - (g_themeFontSize + 6)) / 2;
+            int hh = g_themeFontSize + 6;
+            int hx = rowLeft + 8;
+            for (int i = 0; i < nHints; i++) {
+                SIZE ks{}, ds{};
+                GetTextExtentPoint32W(hdc, hints[i].k, (int)wcslen(hints[i].k), &ks);
+                GetTextExtentPoint32W(hdc, hints[i].d, (int)wcslen(hints[i].d), &ds);
+                int capW = ks.cx + 12;
+                if (hx + capW + 6 + ds.cx > rowRight) break;
+                // Key cap: a small raised chip, the way a modern app shows a shortcut.
+                fillRound(hx, hy, hx + capW, hy + hh, 5, surfFld);
+                RECT kr = { hx, hy, hx + capW, hy + hh };
+                SetTextColor(hdc, inkMid);
+                DrawTextW(hdc, hints[i].k, -1, &kr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                RECT dr = { hx + capW + 6, hy, hx + capW + 6 + ds.cx, hy + hh };
+                SetTextColor(hdc, inkLo);
+                DrawTextW(hdc, hints[i].d, -1, &dr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                hx += capW + 6 + ds.cx + 16;
+            }
+            SelectObject(hdc, GetUiFont());
         }
 
-        // ---- "?" shortcut sheet --------------------------------------------------
-        // Everything the footer used to shout, in a readable list, on demand.
+        // ---- Shortcut sheet ------------------------------------------------------
         if (paneIsActive && mgr->showShortcuts) {
             RECT sheet = { 0, CONTENT_TOP, rect.right, listBottom };
             FillRect(hdc, &sheet, tg.bg);
-            HGDIOBJ op = SelectObject(hdc, tg.borderPen);
-            HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, 8, CONTENT_TOP + 8, rect.right - 8, listBottom - 8);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
+            fillRound(padX, CONTENT_TOP + 6, rect.right - padX, listBottom - 6,
+                      UI_RADIUS_CARD, surfFld);
 
             struct Row { const wchar_t* k; const wchar_t* d; };
             static const Row rows[] = {
-                { L"\x21B5",        L"Paste the selected item" },
-                { L"\x2191 \x2193", L"Move selection" },
-                { L"\x21E5",        L"Switch between the list and the pinned pane" },
+                { L"\x21B5",          L"Paste the selected item" },
+                { L"\x2191 \x2193",   L"Move selection" },
+                { L"\x21E5",          L"Switch between the list and the pinned pane" },
                 { L"Ctrl+\x2190 \x2192", L"Clipboard history or snippets" },
                 { L"digits + \x21B5", L"Jump to a numbered item" },
-                { L"Ctrl+click",    L"Add to a multi-selection" },
-                { L"U",             L"Paste a cleaned URL" },
-                { L"M",             L"Markdown link, or merge a multi-selection" },
-                { L"P",             L"Paste as plain text" },
-                { L"H",             L"Paste HTML as plain text" },
-                { L"E",             L"Edit, then paste" },
-                { L"X",             L"Edit, then save as a new item" },
-                { L"Z",             L"Fill Excel cells from a multi-selection" },
-                { L"Ctrl+F",        L"Focus the search field" },
-                { L"Esc",           L"Close, or dismiss this sheet" }
+                { L"Ctrl+click",      L"Add to a multi-selection" },
+                { L"U",               L"Paste a cleaned URL" },
+                { L"M",               L"Markdown link, or merge a multi-selection" },
+                { L"P",               L"Paste as plain text" },
+                { L"H",               L"Paste HTML as plain text" },
+                { L"E",               L"Edit, then paste" },
+                { L"X",               L"Edit, then save as a new item" },
+                { L"Z",               L"Fill Excel cells from a multi-selection" },
+                { L"Ctrl+F",          L"Focus the search field" },
+                { L"Esc",             L"Close" }
             };
-            int y = CONTENT_TOP + 26;
-            SelectObject(hdc, GetOverlayFontBold());
-            SetTextColor(hdc, Theme5250::TXT);
-            RECT tr = { 26, y, rect.right - 26, y + 20 };
+            int y = CONTENT_TOP + 22;
+            SelectObject(hdc, GetUiFontBold());
+            SetTextColor(hdc, inkHi);
+            RECT tr = { padX + 18, y, rect.right - padX - 18, y + g_themeFontSize + 6 };
             DrawTextW(hdc, L"Shortcuts", -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(hdc, GetOverlayFont());
-            y += 26;
+            SelectObject(hdc, GetUiFontSmall());
+            y += g_themeFontSize + 14;
+            int step = g_themeFontSize + 8;
             for (const Row& r : rows) {
-                if (y + 22 > listBottom - 18) break;
-                RECT kr = { 26, y, 140, y + 20 };
-                SetTextColor(hdc, Theme5250::TXT);
+                if (y + step > listBottom - 16) break;
+                RECT kr = { padX + 18, y, padX + 150, y + step };
+                SetTextColor(hdc, inkMid);
                 DrawTextW(hdc, r.k, -1, &kr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                RECT dr = { 150, y, rect.right - 26, y + 20 };
-                SetTextColor(hdc, metaCol);
+                RECT dr = { padX + 160, y, rect.right - padX - 18, y + step };
+                SetTextColor(hdc, inkLo);
                 DrawTextW(hdc, r.d, -1, &dr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                y += 22;
+                y += step;
             }
+            SelectObject(hdc, GetUiFont());
         }
 
         // Blit the finished frame to the window in one shot (flicker-free).
@@ -4023,7 +4340,17 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             mgr->UpdateListWindow();
             return 0;
         }
-        // "?" opens the shortcut sheet the footer points at.
+        // F3 exits, as the function-key legend says.
+        if (wParam == VK_F3) {
+            mgr->HideListWindow();
+            return 0;
+        }
+        // F1 (or "?") opens the key sheet the legend points at.
+        if (wParam == VK_F1) {
+            mgr->showShortcuts = !mgr->showShortcuts;
+            mgr->UpdateListWindow();
+            return 0;
+        }
         if (wParam == VK_OEM_2 && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
             mgr->showShortcuts = !mgr->showShortcuts;
             mgr->UpdateListWindow();
@@ -4035,6 +4362,8 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             mgr->UpdateListWindow();
             return 0;
         }
+        if (wParam == VK_F6) { SendMessage(hwnd, WM_KEYDOWN, (WPARAM)'P', 0); return 0; }
+        if (wParam == VK_F7) { SendMessage(hwnd, WM_KEYDOWN, (WPARAM)'E', 0); return 0; }
         // Tab moves focus between the list and the lateral pinned pane.
         if (wParam == VK_TAB && mgr->hwndPinned) {
             mgr->SwitchActivePane(!mgr->activeIsPinned);
@@ -4255,7 +4584,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                         
                         // Ensure selected item is visible
                         if (mgr->selectedIndex < mgr->scrollOffset) {
-                            mgr->scrollOffset = mgr->selectedIndex;
+                            mgr->EnsureSelectionVisible();
                         }
                         mgr->UpdateListWindow();
                     }
@@ -4289,13 +4618,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                             mgr->selectedIndex = newIndex;
                         }
                         
-                        int maxScroll = std::max(0, listSize - mgr->itemsPerPage);
-                        if (mgr->selectedIndex >= mgr->scrollOffset + mgr->itemsPerPage) {
-                            mgr->scrollOffset = mgr->selectedIndex - mgr->itemsPerPage + 1;
-                            if (mgr->scrollOffset > maxScroll) {
-                                mgr->scrollOffset = maxScroll;
-                            }
-                        }
+                        mgr->EnsureSelectionVisible();
                         mgr->UpdateListWindow();
                     }
                     return 0;
@@ -4385,6 +4708,10 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 mgr->ClearMultiSelection();
             }
             mgr->selectedIndex = newIndex;
+            // The row-count estimate above is an upper bound on what fits, so jumping
+            // by it alone leaves the last item off-screen now that the open panel
+            // exists. Let the layout settle it.
+            mgr->EnsureSelectionVisible();
             mgr->UpdateListWindow();
             return 0;
         }
@@ -4543,7 +4870,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 break;
             }
             // Scope row.
-            if (pt.y < SEARCH_H) {
+            if (pt.y < UI_CMD_H) {
                 for (int s = 0; s < 2; s++) {
                     if (PtInRect(&mgr->scopeTabRect[s], pt)) {
                         mgr->SetOverlayScope(s);
@@ -4873,7 +5200,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             // Update rounded region when window is resized
             RECT rect;
             GetClientRect(hwnd, &rect);
-            HRGN hRgn = CreateRectRgn(0, 0, rect.right + 1, rect.bottom + 1);
+            HRGN hRgn = CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, 22, 22);
             SetWindowRgn(hwnd, hRgn, TRUE);
             DeleteObject(hRgn);
             break;
@@ -4885,14 +5212,17 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             // brush must be recreated when BG changes; otherwise we'd leak the old brush
             // (or worse, return one tied to a different theme).
             HDC hdcEdit = (HDC)wParam;
-            SetTextColor(hdcEdit, Theme5250::TXT);
-            SetBkColor(hdcEdit, Theme5250::BG);
+            // The field is a raised pill, so the control matches that surface rather
+            // than the window background, and its text is neutral rather than accent.
+            COLORREF fieldBg = UiSurface(18);
+            SetTextColor(hdcEdit, UiInk(214));
+            SetBkColor(hdcEdit, fieldBg);
             static HBRUSH hDarkBrush = nullptr;
             static COLORREF hDarkBrushColor = (COLORREF)~0u;
-            if (!hDarkBrush || hDarkBrushColor != Theme5250::BG) {
+            if (!hDarkBrush || hDarkBrushColor != fieldBg) {
                 if (hDarkBrush) DeleteObject(hDarkBrush);
-                hDarkBrush = CreateSolidBrush(Theme5250::BG);
-                hDarkBrushColor = Theme5250::BG;
+                hDarkBrush = CreateSolidBrush(fieldBg);
+                hDarkBrushColor = fieldBg;
             }
             return (LRESULT)hDarkBrush;
         }
@@ -5480,23 +5810,119 @@ void ClipboardManager::EnsureActivePane(bool wantPinned, bool focusListWindow) {
     if (activeIsPinned != wantPinned) SwitchActivePane(wantPinned, focusListWindow);
 }
 
-// Row tops, with the one expanded row accounted for.
-int ClipboardManager::RowTopForVisible(int visibleRow, int selectedVisibleRow) const {
-    int top = OVERLAY_CONTENT_TOP + visibleRow * ROW_H;
-    if (selectedVisibleRow >= 0 && visibleRow > selectedVisibleRow)
-        top += (ROW_SEL_H - ROW_H);
-    return top;
+// The selected item's full text, for the open panel. Capped at the panel's line budget.
+std::vector<std::wstring> ClipboardManager::ExpandedLinesFor(int filteredIndex) const {
+    std::vector<std::wstring> lines;
+    if (filteredIndex < 0 || filteredIndex >= (int)filteredIndices.size()) return lines;
+    int actualIndex = filteredIndices[filteredIndex];
+    if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) return lines;
+    const auto& item = clipboardHistory[actualIndex];
+    if (!item) return lines;
+
+    std::wstring text;
+    try {
+        text = GetPlainTextForDirectPaste(item.get());
+    } catch (...) {
+        text.clear();
+    }
+    if (text.empty()) text = item->preview;
+
+    std::wstring cur;
+    for (wchar_t ch : text) {
+        if (ch == L'\r') continue;
+        if (ch == L'\n') {
+            lines.push_back(cur);
+            cur.clear();
+            if ((int)lines.size() >= UI_EXPAND_MAX_LINES) return lines;
+            continue;
+        }
+        if (ch == L'\t') ch = L' ';
+        cur.push_back(ch);
+    }
+    if (!cur.empty() && (int)lines.size() < UI_EXPAND_MAX_LINES) lines.push_back(cur);
+    if (lines.empty()) lines.push_back(item->preview);
+    return lines;
 }
 
-// The inverse, so a click lands on the row that was actually drawn there.
-int ClipboardManager::VisibleRowAtY(int y, int selectedVisibleRow) const {
-    if (y < OVERLAY_CONTENT_TOP) return -1;
-    int rel = y - OVERLAY_CONTENT_TOP;
-    if (selectedVisibleRow < 0) return rel / ROW_H;
-    int selTop = selectedVisibleRow * ROW_H;
-    if (rel < selTop) return rel / ROW_H;
-    if (rel < selTop + ROW_SEL_H) return selectedVisibleRow;
-    return selectedVisibleRow + 1 + (rel - selTop - ROW_SEL_H) / ROW_H;
+// Lay out the visible part of the main list: a section header wherever the recency band
+// changes, a tall panel for the selected item, a plain row for everything else. Stops as
+// soon as the next band would not fit, so a partially-drawn row is never clickable.
+void ClipboardManager::BuildVisibleBands(int listBottom, std::vector<RowBand>& out) const {
+    out.clear();
+    const bool snippets = snippetsMode;
+    const int total = snippets ? (int)filteredSnippetIndices.size() : (int)filteredIndices.size();
+    int y = UI_CONTENT_TOP;
+
+    for (int i = scrollOffset; i < total; i++) {
+        if (!snippets) {
+            if (i >= (int)filteredIndices.size()) break;
+            int actualIndex = filteredIndices[i];
+            if (actualIndex < 0 || actualIndex >= (int)clipboardHistory.size()) continue;
+            if (!clipboardHistory[actualIndex]) continue;
+        }
+
+        const bool isSel = (i == selectedIndex && selectedIndex >= 0);
+        int h = UI_ROW_H;
+        if (isSel && !snippets && expandSelected) {
+            int lineCount = (int)ExpandedLinesFor(i).size();
+            if (lineCount < 1) lineCount = 1;
+            if (lineCount > UI_EXPAND_MAX_LINES) lineCount = UI_EXPAND_MAX_LINES;
+            h = UI_EXPAND_CHROME + lineCount * UI_EXPAND_LINE_H;
+        }
+        if (y + h > listBottom) {
+            // A band that only half fits used to be dropped outright, which is why the
+            // selected item went blank at the bottom of the list. Clip the open panel
+            // instead, as long as a plain row's worth of space is left.
+            if (h > UI_ROW_H && y + UI_ROW_H <= listBottom) {
+                h = listBottom - y;
+            } else {
+                break;
+            }
+        }
+
+        RowBand band{};
+        band.top = y;
+        band.height = h;
+        band.filteredIndex = i;
+        band.expanded = (isSel && !snippets && expandSelected);
+        out.push_back(band);
+        y += h;
+    }
+}
+
+// Scroll until the selected item is actually laid out. With a variable-height open
+// panel, "is it within itemsPerPage rows" is no longer the same question as "does it
+// fit on screen" -- and the paint loop stops at the first band that does not fit, so
+// guessing wrong leaves the selection invisible.
+void ClipboardManager::EnsureSelectionVisible() {
+    if (!hwndList || selectedIndex < 0) return;
+
+    if (selectedIndex < scrollOffset) {
+        scrollOffset = selectedIndex;
+        return;
+    }
+    if (snippetsMode) {
+        if (itemsPerPage > 0 && selectedIndex >= scrollOffset + itemsPerPage)
+            scrollOffset = selectedIndex - itemsPerPage + 1;
+        if (scrollOffset < 0) scrollOffset = 0;
+        return;
+    }
+
+    RECT rect;
+    GetClientRect(hwndList, &rect);
+    int listBottom = rect.bottom - UI_KEYS_H;
+    std::vector<RowBand> bands;
+    // Advance one item at a time and re-lay out: cheap (a screenful of bands) and it
+    // asks the real layout rather than predicting it.
+    while (scrollOffset < selectedIndex) {
+        BuildVisibleBands(listBottom, bands);
+        bool laidOut = false;
+        for (const auto& b : bands) {
+            if (b.filteredIndex == selectedIndex) { laidOut = true; break; }
+        }
+        if (laidOut) return;
+        scrollOffset++;
+    }
 }
 
 // Switch what the list is showing. snippetsMode is kept in sync rather than replaced:
@@ -5522,30 +5948,34 @@ void ClipboardManager::SetOverlayScope(int scope) {
 
 int ClipboardManager::GetItemAtPosition(int x, int y) {
     if (!hwndList) return -1;
-    
+
     RECT rect;
     GetClientRect(hwndList, &rect);
-    
-    // Mirror the paint loop's geometry, including the expanded selected row.
-    int clickedY = y - OVERLAY_CONTENT_TOP;
-    int selVis = (selectedIndex >= scrollOffset && itemsPerPage > 0 &&
-                  selectedIndex < scrollOffset + itemsPerPage)
-                     ? (selectedIndex - scrollOffset) : -1;
-    
-    if (clickedY < 0) return -1;
-    
-    int row = VisibleRowAtY(y, selVis);
-    if (row < 0) return -1;
-    if (itemsPerPage > 0 && row >= itemsPerPage) return -1;  // below the last drawn row (footer gap)
-    int filteredIndex = scrollOffset + row;
-    
+
+    if (y < UI_CONTENT_TOP) return -1;
+    int listBottom = rect.bottom - UI_KEYS_H;
+    if (y >= listBottom) return -1;
+
     if (snippetsMode) {
-        if (filteredIndex >= 0 && filteredIndex < (int)filteredSnippetIndices.size()) {
+        // Snippets are a flat list: no recency bands and nothing opens in place.
+        int row = (y - UI_CONTENT_TOP) / UI_ROW_H;
+        if (UI_CONTENT_TOP + (row + 1) * UI_ROW_H > listBottom) return -1;
+        int filteredIndex = scrollOffset + row;
+        if (filteredIndex >= 0 && filteredIndex < (int)filteredSnippetIndices.size())
             return filteredIndex;
-        }
-    } else {
-        if (filteredIndex >= 0 && filteredIndex < (int)filteredIndices.size()) {
-            return filteredIndex;
+        return -1;
+    }
+
+    // Ask the layout engine where the rows actually landed rather than deriving it a
+    // second time: the open panel makes the geometry non-uniform, and two derivations
+    // that drift is exactly how clicks land on the wrong row.
+    std::vector<RowBand> bands;
+    BuildVisibleBands(listBottom, bands);
+    for (const auto& b : bands) {
+        if (y >= b.top && y < b.top + b.height) {
+            if (b.filteredIndex >= 0 && b.filteredIndex < (int)filteredIndices.size())
+                return b.filteredIndex;
+            return -1;
         }
     }
     return -1;
@@ -6640,6 +7070,7 @@ void ClipboardManager::ProcessClipboardFromSnapshot() {
         item->AddFormat(kv.first, std::move(kv.second), /*deferIndex=*/true);
     }
     item->FinalizeSearchIndex();
+    item->RefinePreviewFromText();
     bool isPastPaste = false;
     if (!lastPastedText.empty() && item->format == CF_UNICODETEXT) {
         try {
@@ -8075,6 +8506,7 @@ namespace {
         // Nothing usable survived (e.g. the byte constructor rejected an oversized payload).
         if (!item->HasAnyFormat()) return nullptr;
         item->FinalizeSearchIndex();  // once per item, not once per text format
+        item->RefinePreviewFromText();
         item->pinned = pinned;
         return item;
     }
@@ -8700,7 +9132,29 @@ void ClipboardManager::RefreshThemeVisuals() {
     if (hwndPinnedSearch) { InvalidateRect(hwndPinnedSearch, nullptr, TRUE); UpdateWindow(hwndPinnedSearch); }
 }
 
+void ClipboardManager::SetExpandSelected(bool enable) {
+    expandSelected = enable;
+    SaveExpandSelectedToRegistry(enable);
+    // The selected band changes height, so what fits on screen changes with it.
+    EnsureSelectionVisible();
+    UpdateListWindow();
+}
+
 void ClipboardManager::SetTheme(int themeId) {
+    // Picking a preset clears the per-element overrides and the legacy accent override
+    // first: a preset is a wholesale colour choice, and ApplyThemeId applies overrides
+    // LAST, so any slot the user had customised silently shadowed the preset forever.
+    // Without this the theme dropdown looks broken once any colour has been customised.
+    for (int i = 0; i < TC_COUNT; i++) {
+        if (g_colorOverride[i] != kColorUsePreset) {
+            g_colorOverride[i] = kColorUsePreset;
+            SaveThemeColorToRegistry(i, kColorUsePreset);
+        }
+    }
+    if (g_themeFontColor != kThemeFontColorPreset) {
+        g_themeFontColor = kThemeFontColorPreset;
+        SaveThemeFontColorToRegistry(kThemeFontColorPreset);
+    }
     ApplyThemeId(themeId);
     SaveThemeIdToRegistry(themeId);
     RefreshThemeVisuals();
@@ -8729,6 +9183,31 @@ void ClipboardManager::ResetThemeColorOverrides() {
     }
     ApplyThemeId(g_currentThemeId);
     RefreshThemeVisuals();
+}
+
+void ClipboardManager::SetThemeFontSize(int pt) {
+    if (pt < kMinThemeFontSize) pt = kMinThemeFontSize;
+    if (pt > kMaxThemeFontSize) pt = kMaxThemeFontSize;
+    g_themeFontSize = pt;
+    SaveThemeFontSizeToRegistry(pt);
+    // Rows change height, so the layout constants and the cached fonts both go.
+    RecomputeUiMetrics();
+    ResetOverlayFontCache();
+    HFONT newFont = GetOverlayFont();
+    if (hwndMainSearch && newFont) SendMessage(hwndMainSearch, WM_SETFONT, (WPARAM)newFont, TRUE);
+    if (hwndPinnedSearch && newFont) SendMessage(hwndPinnedSearch, WM_SETFONT, (WPARAM)newFont, TRUE);
+    // The search pill just changed height, so the control inside it moves with it.
+    if (hwndMainSearch) {
+        RECT er = UiSearchEditRect(WINDOW_WIDTH, false);
+        MoveWindow(hwndMainSearch, er.left, er.top, er.right - er.left, er.bottom - er.top, TRUE);
+    }
+    if (hwndPinnedSearch) {
+        RECT er = UiSearchEditRect(PINNED_WIDTH, true);
+        MoveWindow(hwndPinnedSearch, er.left, er.top, er.right - er.left, er.bottom - er.top, TRUE);
+    }
+    EnsureSelectionVisible();
+    if (hwndList) { InvalidateRect(hwndList, nullptr, TRUE); UpdateWindow(hwndList); }
+    if (hwndPinned) { InvalidateRect(hwndPinned, nullptr, TRUE); UpdateWindow(hwndPinned); }
 }
 
 void ClipboardManager::SetThemeFontFace(const std::wstring& face) {
@@ -9557,6 +10036,7 @@ static const int IDC_HK_PASTE_FOCUSED    = 3004;
 static const int IDC_HK_PASTE_CLIPBOARD  = 3005;
 static const int IDC_THEME_COMBO         = 3006;
 static const int IDC_FONT_COMBO          = 3007;
+static const int IDC_FONT_SIZE_COMBO     = 3021;
 static const int IDC_FONT_COLOR_BTN      = 3008;
 static const int IDC_FONT_COLOR_SWATCH   = 3009;
 static const int IDC_BTN_SAVE            = 3010;
@@ -9622,7 +10102,7 @@ void ClipboardManager::ShowSettingsDialog() {
         return;
     }
 
-    const int DLG_W = 480, DLG_H = 620;
+    const int DLG_W = 480, DLG_H = 660;
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
     int x = workArea.left + ((workArea.right - workArea.left) - DLG_W) / 2;
@@ -9719,6 +10199,24 @@ void ClipboardManager::ShowSettingsDialog() {
         if (sel == CB_ERR)
             sel = (int)SendMessageW(hFontCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)kDefaultThemeFontFace);
         if (sel != CB_ERR) SendMessageW(hFontCombo, CB_SETCURSEL, (WPARAM)sel, 0);
+    }
+    yPos += GAP;
+
+    // Overlay font size. The list metrics scale with it (see RecomputeUiMetrics),
+    // so this resizes rows and columns, not just the glyphs.
+    CreateHotkeyLabel(hwndSettings, L"Overlay font size:", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+    HWND hSizeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        HK_X, yPos, HK_W, 260, hwndSettings, (HMENU)(INT_PTR)IDC_FONT_SIZE_COMBO,
+        GetModuleHandle(nullptr), nullptr);
+    if (hSizeCombo) {
+        SendMessageW(hSizeCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+        int selIdx = 0, n = 0;
+        for (int pt = kMinThemeFontSize; pt <= kMaxThemeFontSize; pt++, n++) {
+            SendMessageW(hSizeCombo, CB_ADDSTRING, 0, (LPARAM)std::to_wstring(pt).c_str());
+            if (pt == g_themeFontSize) selIdx = n;
+        }
+        SendMessageW(hSizeCombo, CB_SETCURSEL, (WPARAM)selIdx, 0);
     }
     yPos += GAP;
 
@@ -9824,6 +10322,11 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
             // Reset font color override (back to preset) and font face (back to Consolas).
             mgr->SetThemeFontColor(kThemeFontColorPreset);
             mgr->SetThemeFontFace(kDefaultThemeFontFace);
+            mgr->SetThemeFontSize(kDefaultThemeFontSize);
+            HWND hSizeCombo = GetDlgItem(hwnd, IDC_FONT_SIZE_COMBO);
+            if (hSizeCombo)
+                SendMessageW(hSizeCombo, CB_SETCURSEL,
+                             (WPARAM)(kDefaultThemeFontSize - kMinThemeFontSize), 0);
             HWND hFontCombo = GetDlgItem(hwnd, IDC_FONT_COMBO);
             if (hFontCombo) {
                 int sel = (int)SendMessageW(hFontCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)kDefaultThemeFontFace);
@@ -9848,14 +10351,25 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
             int sel = (int)SendMessageW(hCombo, CB_GETCURSEL, 0, 0);
             if (sel >= 0 && sel < THEME_COUNT)
                 mgr->SetTheme(sel);
-            // The preset's accent might have changed; if the swatch is in "preset" mode,
-            // it needs a redraw to follow the new preset color.
+            // SetTheme just dropped every colour override, so each swatch has to be
+            // redrawn to show the preset colour it now follows.
             HWND hSwatch = GetDlgItem(hwnd, IDC_FONT_COLOR_SWATCH);
             if (hSwatch) InvalidateRect(hSwatch, nullptr, TRUE);
+            for (int s = 0; s < TC_COUNT; s++) {
+                HWND hsw = GetDlgItem(hwnd, IDC_COLOR_SWATCH_FIRST + s);
+                if (hsw) InvalidateRect(hsw, nullptr, TRUE);
+            }
             return 0;
         }
 
         // Live preview when the font face combo changes.
+        if (id == IDC_FONT_SIZE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            HWND hSizeCombo = (HWND)lParam;
+            int sel = (int)SendMessageW(hSizeCombo, CB_GETCURSEL, 0, 0);
+            if (sel >= 0) mgr->SetThemeFontSize(kMinThemeFontSize + sel);
+            return 0;
+        }
+
         if (id == IDC_FONT_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
             HWND hFontCombo = (HWND)lParam;
             int sel = (int)SendMessageW(hFontCombo, CB_GETCURSEL, 0, 0);

@@ -1,0 +1,156 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; background: #08080A; }
+    a { color: #FFB020; } a:hover { color: #FFC65C; }
+    .win {
+      box-sizing: border-box; height: 560px; background: #0B0B0D;
+      border-radius: 16px; overflow: hidden; display: flex; flex-direction: column;
+      font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+      font-size: 14px; line-height: 1;
+      box-shadow: inset 0 0 0 1px #1E1E23;
+    }
+    .head { flex: 0 0 auto; padding: 18px 18px 10px; display: flex; align-items: center; gap: 12px; }
+    .field { flex: 1 1 auto; display: flex; align-items: center; gap: 11px; height: 44px; padding: 0 15px; border-radius: 12px; background: #151518; }
+    .count { flex: 0 0 auto; color: #55555E; font-size: 13px; }
+    .list { flex: 1 1 auto; display: flex; flex-direction: column; gap: 3px; padding: 4px 10px; overflow: hidden; }
+    .row { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; height: 52px; padding: 0 14px; border-radius: 12px; position: relative; }
+    .row.hov { background: #131316; }
+    .row.on { background: #FFB020; }
+    .ico { flex: 0 0 18px; display: flex; align-items: center; justify-content: center; }
+    .txt { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #E4E4EA; font-family: Consolas, ui-monospace, monospace; font-size: 14px; }
+    .row.on .txt { color: #1A1103; }
+    .age { flex: 0 0 auto; color: #5C5C66; font-size: 12.5px; }
+    .row.on .age { color: #6B4E12; }
+    .pin { position: absolute; left: 0; top: 16px; width: 3px; height: 20px; border-radius: 2px; background: #FFB020; }
+    .card { flex: 0 0 auto; border-radius: 14px; background: #141417; padding: 16px 16px 14px; display: flex; flex-direction: column; gap: 13px; }
+    .top { display: flex; align-items: center; gap: 11px; }
+    .tag { height: 22px; padding: 0 10px; border-radius: 7px; background: #2A2008; color: #FFB020; font-size: 12px; display: flex; align-items: center; }
+    .m { color: #5C5C66; font-size: 12.5px; }
+    .body { white-space: pre; overflow: hidden; color: #DEDEE6; font-size: 13.5px; line-height: 1.65; font-family: Consolas, ui-monospace, monospace; }
+    .acts { display: flex; align-items: center; gap: 8px; }
+    .btn { height: 32px; padding: 0 14px; border-radius: 9px; background: #202026; color: #CFCFD8; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+    .btn.pri { background: #FFB020; color: #1A1103; }
+    .k { font-size: 11.5px; color: #74747E; }
+    .btn.pri .k { color: #6B4E12; }
+    .foot { flex: 0 0 auto; display: flex; align-items: center; gap: 20px; padding: 10px 20px 16px; color: #4A4A53; font-size: 12.5px; }
+    .plabel { padding: 18px 18px 8px; color: #5C5C66; font-size: 13px; }
+  </style>
+</helmet>
+
+<div style="display: flex; gap: 12px; align-items: flex-start; background: #08080A">
+
+  <div class="win" style="width: 320px">
+    <div class="plabel">Pinned</div>
+    <div class="list">
+      <sc-for list="{{pinned}}" as="row" hint-placeholder-count="5">
+        <div class="row">
+          <div class="pin"></div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+    </div>
+    <div class="foot"><div>Tab &#8594; list</div></div>
+  </div>
+
+  <div class="win" style="width: 640px">
+    <div class="head">
+      <div class="field">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="#5C5C66" stroke-width="1.5">
+          <circle cx="7.2" cy="7.2" r="4.3"></circle>
+          <path d="M10.4 10.4 L13.5 13.5" stroke-linecap="round"></path>
+        </svg>
+        <div style="flex: 1 1 auto; color: #4A4A53">Search clipboard</div>
+      </div>
+      <div class="count">47</div>
+    </div>
+
+    <div class="list">
+      <sc-for list="{{before}}" as="row" hint-placeholder-count="2">
+        <div class="row {{row.cls}}">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="#4E4E58" stroke-width="1.5" stroke-linecap="round">
+              <path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5"></path>
+            </svg>
+          </div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+
+      <div class="card">
+        <div class="top">
+          <div class="tag">Text</div>
+          <div class="m">7 lines</div>
+          <div style="flex: 1 1 auto"></div>
+          <div class="m">8m ago</div>
+        </div>
+        <div class="body">SELECT c.id, c.name, c.email, o.total
+  FROM customers c
+  JOIN orders o ON o.customer_id = c.id
+ WHERE c.active = 1</div>
+        <div class="acts">
+          <div class="btn pri"><span class="k">&#8629;</span>Paste</div>
+          <div class="btn"><span class="k">P</span>Plain</div>
+          <div class="btn"><span class="k">E</span>Edit</div>
+        </div>
+      </div>
+
+      <sc-for list="{{after}}" as="row" hint-placeholder-count="3">
+        <div class="row {{row.cls}}">
+          <div class="ico">
+            <svg width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="#4E4E58" stroke-width="1.5" stroke-linecap="round">
+              <path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5"></path>
+            </svg>
+          </div>
+          <div class="txt">{{row.text}}</div>
+          <div class="age">{{row.age}}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <div class="foot">
+      <div>Enter to paste</div><div>Tab for pinned</div><div>? for shortcuts</div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{ "$preview": { "width": 972, "height": 560 } }'>
+// Direction: "Bold". Fewer, larger rows with real breathing room, a solid accent block
+// for the selection, and 12-16px radii. Reads at a glance; shows less at once.
+class Component extends DCLogic {
+  renderVals() {
+    const mk = (t, a, cls) => ({ text: t, age: a, cls: cls || '' });
+    return {
+      before: [
+        mk('SELECT id, name FROM customers WHERE active = 1', '2m'),
+        mk('https://github.com/Unnamed10110/clip2/releases', '5m', 'hov')
+      ],
+      after: [
+        mk('Screenshot 2026-09-11 075812.png', '12m'),
+        mk('3 files - history.dat, blobs\\', '18m'),
+        mk('HookSafeSleep keeps the hook serviced', '24m')
+      ],
+      pinned: [
+        mk('ClipboardManager.cpp:6461', '8m'),
+        mk('HKCU\\Software\\clip2', '4h'),
+        mk('Ctrl+NumPadDot', '4d'),
+        mk('clip2.exe', '4d'),
+        mk('ico2.ico', '2w')
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

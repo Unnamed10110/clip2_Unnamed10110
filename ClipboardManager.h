@@ -35,6 +35,10 @@ struct ClipboardItem {
     bool isVideo;
     bool pinned;  // Pinned/favorite items stay on top, survive Clear, and always persist
     
+    // How much text a preview keeps. Generous on purpose: the row ellipsizes at
+    // whatever width it actually has, so this only needs to outrun the widest row.
+    static const size_t kPreviewChars = 300;
+
     ClipboardItem(UINT fmt, const std::vector<BYTE>& d) 
         : format(fmt), timestamp(std::chrono::system_clock::now()), thumbnail(nullptr), previewBitmap(nullptr), thumbnailAttempted(false), previewAttempted(false), isImage(false), isVideo(false), pinned(false), formatName(L"Unknown Format"), fileType(L"Other"), preview(L"[Unknown]"), searchIndexDirty(false) {
         // CRITICAL: Store data first, before any processing
@@ -47,34 +51,38 @@ struct ClipboardItem {
         
         InitFormatMetadata(fmt);
 
-        // Get preview - ONLY for text formats, skip complex processing
-        if (fmt == CF_UNICODETEXT && d.size() >= sizeof(wchar_t) && d.size() < 100000) {
+        // Preview text. Two things this deliberately does NOT do any more:
+        //   - bail out on large payloads. Copying 30KB of SQL is ordinary, and the old
+        //     size/length cut-offs turned exactly those items into "[Unknown Format]".
+        //     Reading the first kPreviewChars costs the same whatever the total size is.
+        //   - append a literal "..." after 50 characters. The row can be far wider than
+        //     50 characters, and the painter already ellipsizes at the real column
+        //     width, so truncating here just threw away text that would have fitted.
+        if (fmt == CF_UNICODETEXT && d.size() >= sizeof(wchar_t)) {
             try {
                 size_t len = d.size() / sizeof(wchar_t);
-                if (len > 0 && len < 10000) {
-                    const wchar_t* text = (const wchar_t*)d.data();
-                    if (text) {
-                        size_t previewLen = std::min(len, (size_t)50);
-                        preview.assign(text, previewLen);
-                        if (len > 50) preview += L"...";
-                    }
-                }
+                const wchar_t* text = (const wchar_t*)d.data();
+                size_t n = 0;
+                while (n < len && n < kPreviewChars && text[n] != L'\0') n++;
+                if (n > 0) preview.assign(text, n);
             } catch (...) {
                 preview = L"[Unicode Text]";
             }
-        } else if (fmt == CF_TEXT && d.size() > 0 && d.size() < 100000) {
+        } else if (fmt == CF_TEXT && d.size() > 0) {
             try {
-                size_t len = std::min(d.size(), (size_t)50);
                 const char* text = (const char*)d.data();
-                if (text) {
-                    std::string str(text, len);
+                size_t n = 0;
+                while (n < d.size() && n < kPreviewChars && text[n] != '\0') n++;
+                if (n > 0) {
+                    std::string str(text, n);
                     preview = std::wstring(str.begin(), str.end());
-                    if (d.size() > 50) preview += L"...";
                 }
             } catch (...) {
                 preview = L"[Text]";
             }
         } else {
+            // A non-text primary. Sibling formats have not arrived yet, so this may be
+            // replaced by RefinePreviewFromText() once they have.
             preview = L"[" + formatName + L"]";
         }
         
@@ -115,6 +123,10 @@ struct ClipboardItem {
         NoteTextFormatAdded(fmt, deferIndex);
     }
     // Rebuild the index if any deferred AddFormat touched a text format. Cheap no-op otherwise.
+    // Replace a "[Some Format]" placeholder with real text once every sibling format
+    // is present. Defined in ClipboardManager.cpp -- it needs the HDROP parser.
+    void RefinePreviewFromText();
+
     void FinalizeSearchIndex() {
         if (searchIndexDirty) RebuildSearchIndex();
     }
@@ -381,6 +393,7 @@ private:
     void SetTheme(int themeId);                     // Apply + persist a theme preset and repaint UI.
     void SetThemeFontColor(COLORREF color);          // Override (or clear, via sentinel) overlay font color.
     void SetThemeFontFace(const std::wstring& face); // Switch overlay/search font face and repaint.
+    void SetThemeFontSize(int pt);                   // Switch overlay font size, rescale rows, repaint.
     void SetThemeColorOverride(int slot, COLORREF color); // Override (or clear) one overlay element color.
     void ResetThemeColorOverrides();                 // Clear all per-element color overrides.
     void RefreshThemeVisuals();                      // Re-apply class brushes + repaint after a color change.
@@ -458,10 +471,25 @@ private:
     WPARAM chipHitKey[6];
     int chipHitCount;
     void SetOverlayScope(int scope);
-    // Only the selected row is tall, so row geometry has a closed form and the paint
-    // loop and hit-testing can share it without materialising a list of rects.
-    int RowTopForVisible(int visibleRow, int selectedVisibleRow) const;
-    int VisibleRowAtY(int y, int selectedVisibleRow) const;
+    // One laid-out row of the main list: a plain row, or the open panel for the
+    // selected item. The panel's height varies with its content, so geometry cannot be
+    // computed from an index -- the paint loop and hit-testing share this list rather
+    // than each deriving positions of their own and drifting apart.
+    struct RowBand {
+        int top;
+        int height;
+        int filteredIndex;
+        bool expanded;
+    };
+    void BuildVisibleBands(int listBottom, std::vector<RowBand>& out) const;
+    // Push scrollOffset until the selected item's band is fully laid out. Row heights
+    // vary now, so a row count cannot decide this -- only the layout can.
+    void EnsureSelectionVisible();
+    // Whether the selected item opens in place. Off makes every row a plain row.
+    bool expandSelected;
+    void SetExpandSelected(bool enable);
+    // Full text of an item, split for the open panel (at most TERM_EXPAND_MAX_LINES).
+    std::vector<std::wstring> ExpandedLinesFor(int filteredIndex) const;
     bool pasteInFlight;
     DWORD pasteStartTick;        // 0 when not pasting; else GetTickCount()|1 (watchdog)
     DWORD processingStartTick;   // 0 when not processing; else GetTickCount()|1 (watchdog)
@@ -544,11 +572,12 @@ private:
     static const int WINDOW_HEIGHT = 520;
     // ---- Palette overlay metrics ----
     // The search field is the header, so there is no separate app-name bar.
-    static const int SEARCH_H = 48;             // search/scope header height
-    static const int OVERLAY_CONTENT_TOP = 49;  // SEARCH_H + 1px rule
-    static const int ROW_H = 34;                // a normal row
-    static const int ROW_SEL_H = 68;            // the selected row, expanded for its actions
-    static const int OVERLAY_FOOTER_H = 26;
+    // ---- Terminal overlay metrics ----
+    // A 5250 screen is a character grid: a command line, a column header, fixed rows,
+    // and a function-key legend. No radii anywhere.
+    // The row heights and column offsets all scale with the overlay font size, so they
+    // live in ClipboardManager.cpp next to the font cache rather than being fixed here.
+    // See RecomputeUiMetrics().
     static const int PINNED_WIDTH = 320;   // Width of the left pinned panel
     static const int PANEL_GAP = 12;       // Gap between the pinned panel and the main list
     

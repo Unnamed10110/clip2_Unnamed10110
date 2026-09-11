@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; background: #000; }
+    a { color: #00ff66; } a:hover { color: #00c850; }
+    /* No radii anywhere: a 5250 screen is a character grid, not a card stack. */
+    .win {
+      box-sizing: border-box; height: 520px; background: #000;
+      box-shadow: inset 0 0 0 1px #00c850;
+      display: flex; flex-direction: column; overflow: hidden;
+      font-family: Consolas, "DejaVu Sans Mono", ui-monospace, monospace;
+      font-size: 13px; line-height: 1;
+    }
+    .cmd { flex: 0 0 auto; height: 24px; display: flex; align-items: center; gap: 7px; padding: 0 8px; }
+    .caret { width: 7px; height: 14px; background: #00ff66; }
+    .colhead {
+      flex: 0 0 auto; height: 18px; display: flex; align-items: center;
+      font-size: 10px; letter-spacing: 1px; color: #008028; padding: 0 8px;
+      box-shadow: inset 0 -1px 0 #004b17;
+    }
+    .row { flex: 0 0 auto; height: 26px; display: flex; align-items: center; padding: 0 8px; }
+    .on { background: #00ff66; }           /* selection is inverse video, as on the real thing */
+    .c-mark { flex: 0 0 14px; color: #00ff66; }
+    .c-idx  { flex: 0 0 30px; text-align: right; padding-right: 8px; color: #00963c; }
+    .c-typ  { flex: 0 0 38px; color: #00963c; font-size: 11px; letter-spacing: 0.5px; }
+    .c-con  { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #00ff66; }
+    .c-age  { flex: 0 0 42px; text-align: right; color: #00963c; font-size: 11px; }
+    .on .c-mark, .on .c-idx, .on .c-typ, .on .c-age { color: #004b17; }
+    .on .c-con { color: #000; }
+    /* Function-key legend: the 5250 answer to discoverability, and a better one than
+       seven shortcuts crammed into a single 12px strip. */
+    .keys {
+      flex: 0 0 auto; margin-top: auto; height: 22px; background: #00260f;
+      display: flex; align-items: center; gap: 14px; padding: 0 8px;
+      font-size: 11px; color: #00963c; box-shadow: inset 0 1px 0 #004b17;
+    }
+    .keys b { color: #00ff66; font-weight: 400; }
+  </style>
+</helmet>
+
+<div style="display: flex; gap: 12px; align-items: flex-start; background: #000">
+
+  <!-- ============ PINNED, lateral ============ -->
+  <div class="win" style="width: 320px">
+    <div class="cmd">
+      <div style="color: #008028">&gt;</div>
+      <div style="flex: 1 1 auto; color: #005c1c">search pinned</div>
+    </div>
+    <div class="colhead">
+      <div style="flex: 0 0 14px">*</div>
+      <div style="flex: 1 1 auto">PINNED</div>
+      <div style="flex: 0 0 42px; text-align: right">AGE</div>
+    </div>
+    <sc-for list="{{pinned}}" as="row" hint-placeholder-count="6">
+      <div class="row">
+        <div class="c-mark">*</div>
+        <div class="c-con">{{row.text}}</div>
+        <div class="c-age">{{row.age}}</div>
+      </div>
+    </sc-for>
+    <div class="keys">
+      <div><b>F3</b> exit</div>
+      <div><b>Tab</b> list</div>
+    </div>
+  </div>
+
+  <!-- ============ MAIN LIST ============ -->
+  <div class="win" style="width: 640px">
+    <!-- The command line replaces the boxed search field: a prompt and a cursor. -->
+    <div class="cmd">
+      <div style="color: #00ff66">&gt;</div>
+      <div class="caret"></div>
+      <div style="flex: 1 1 auto"></div>
+      <div style="font-size: 11px; color: #008028">CLIPBOARD&#160;&#160;47</div>
+    </div>
+
+    <div class="colhead">
+      <div style="flex: 0 0 14px"></div>
+      <div style="flex: 0 0 30px; text-align: right; padding-right: 8px">#</div>
+      <div style="flex: 0 0 38px">TYPE</div>
+      <div style="flex: 1 1 auto">CONTENT</div>
+      <div style="flex: 0 0 42px; text-align: right">AGE</div>
+    </div>
+
+    <sc-for list="{{rows}}" as="row" hint-placeholder-count="17">
+      <div class="row {{row.cls}}">
+        <div class="c-mark">{{row.mark}}</div>
+        <div class="c-idx">{{row.idx}}</div>
+        <div class="c-typ">{{row.type}}</div>
+        <div class="c-con">{{row.text}}</div>
+        <div class="c-age">{{row.age}}</div>
+      </div>
+    </sc-for>
+
+    <div class="keys">
+      <div><b>F1</b> keys</div>
+      <div><b>F3</b> exit</div>
+      <div><b>Tab</b> pinned</div>
+      <div><b>&#8629;</b> paste</div>
+      <div><b>F6</b> plain</div>
+      <div><b>F7</b> edit</div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{ "$preview": { "width": 972, "height": 520 } }'>
+// Direction: "Terminal". Leans all the way into the 5250 heritage the neon palette
+// comes from -- character grid, hard edges, inverse-video selection, function-key
+// legend. Colour is identical in all four directions; structure is the variable.
+class Component extends DCLogic {
+  renderVals() {
+    const SELECTED = 3;
+    const data = [
+      ['SELECT id, name FROM customers WHERE active = 1', 'TXT', '2m'],
+      ['https://github.com/Unnamed10110/clip2/releases',  'TXT', '5m'],
+      ['ClipboardManager.cpp:6461',                       'TXT', '8m', 1],
+      ['Screenshot 2026-09-11 075812.png',                'IMG', '12m'],
+      ['3 files - history.dat, blobs\\, settings.reg',     'FIL', '18m'],
+      ['HookSafeSleep keeps the low-level hook serviced',  'TXT', '24m'],
+      ['cmake -S . -B build -DCLIP2_TRACE=ON',             'TXT', '31m'],
+      ['RGB(0, 255, 102)',                                 'TXT', '47m'],
+      ['%APPDATA%\\clip2\\history.dat',                    'TXT', '1h'],
+      ['overlay-dual-pane.png',                            'IMG', '1h'],
+      ['git rebase -i HEAD~3',                             'TXT', '2h'],
+      ['Consolas',                                         'TXT', '3h'],
+      ['LowLevelHooksTimeout',                             'TXT', '3h'],
+      ['HKCU\\Software\\clip2',                            'TXT', '4h', 1],
+      ['clip2.exe',                                        'FIL', '5h'],
+      ['AddClipboardFormatListener failed err=1418',       'TXT', '6h'],
+      ['ico2.ico',                                         'IMG', '1d']
+    ];
+    return {
+      rows: data.map((d, i) => ({
+        idx: String(i + 1),
+        text: d[0],
+        type: d[1],
+        age: d[2],
+        mark: d[3] ? '*' : '',
+        cls: i === SELECTED ? 'on' : ''
+      })),
+      pinned: [
+        { text: 'ClipboardManager.cpp:6461', age: '8m' },
+        { text: 'HKCU\\Software\\clip2',     age: '4h' },
+        { text: 'Ctrl+NumPadDot',            age: '4d' },
+        { text: 'clip2.exe',                 age: '4d' },
+        { text: 'RGB(0, 255, 102)',          age: '1w' },
+        { text: 'ico2.ico',                  age: '2w' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
