@@ -1060,7 +1060,7 @@ static void RecomputeUiMetrics() {
     UI_EXPAND_LINE_H = s + 9;   // the card body is drawn 3pt larger than the rows
     // Card padding + the meta row + the action buttons + the gaps between them. Both
     // of those are chrome, so the card's fixed height tracks the chrome size.
-    UI_EXPAND_CHROME = g_uiFontSize * 2 + 51;
+    UI_EXPAND_CHROME = g_uiFontSize * 2 + 68;
 
     // Radii and insets, all proportional so they survive a font-size change.
     UI_RADIUS_ROW    = 9;
@@ -4095,7 +4095,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             std::wstring preview = item->preview;
             for (auto& ch : preview) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
             SelectObject(hdc, GetOverlayFont());   // content stays monospace
-            RECT pr = { rowLeft + 12 + UI_ICON_W + 8, top, rowRight - UI_AGE_W - 20, bot };
+            RECT pr = { rowLeft + 12 + UI_ICON_W + 8, top, rowRight - UI_AGE_W - 26, bot };
             SetTextColor(hdc, inkHi);
             DrawTextW(hdc, preview.c_str(), -1, &pr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -5903,19 +5903,23 @@ void ClipboardManager::BuildVisibleBands(int listBottom, std::vector<RowBand>& o
         }
 
         const bool isSel = (i == selectedIndex && selectedIndex >= 0);
+        bool expandHere = (isSel && !snippets && expandSelected);
         int h = UI_ROW_H;
-        if (isSel && !snippets && expandSelected) {
+        if (expandHere) {
             int lineCount = (int)ExpandedLinesFor(i).size();
             if (lineCount < 1) lineCount = 1;
             if (lineCount > UI_EXPAND_MAX_LINES) lineCount = UI_EXPAND_MAX_LINES;
             h = UI_EXPAND_CHROME + lineCount * UI_EXPAND_LINE_H;
         }
         if (y + h > listBottom) {
-            // A band that only half fits used to be dropped outright, which is why the
-            // selected item went blank at the bottom of the list. Clip the open panel
-            // instead, as long as a plain row's worth of space is left.
+            // Show the full card or a plain row -- never a clipped one. The card places
+            // its body from its top and its buttons from its bottom, so a squashed card
+            // overlaps itself and spills its body past the list onto the footer.
+            // EnsureSelectionVisible scrolls so the whole card fits; this is the
+            // fallback for a window too short to hold one at all.
             if (h > UI_ROW_H && y + UI_ROW_H <= listBottom) {
-                h = listBottom - y;
+                h = UI_ROW_H;
+                expandHere = false;
             } else {
                 break;
             }
@@ -5925,7 +5929,7 @@ void ClipboardManager::BuildVisibleBands(int listBottom, std::vector<RowBand>& o
         band.top = y;
         band.height = h;
         band.filteredIndex = i;
-        band.expanded = (isSel && !snippets && expandSelected);
+        band.expanded = expandHere;
         out.push_back(band);
         y += h;
     }
@@ -5959,7 +5963,12 @@ void ClipboardManager::EnsureSelectionVisible() {
         BuildVisibleBands(listBottom, bands);
         bool laidOut = false;
         for (const auto& b : bands) {
-            if (b.filteredIndex == selectedIndex) { laidOut = true; break; }
+            if (b.filteredIndex != selectedIndex) continue;
+            // With the card on, landing as the plain-row fallback is NOT good enough:
+            // keep scrolling until the whole card fits.
+            if (expandSelected && !snippetsMode && !b.expanded) break;
+            laidOut = true;
+            break;
         }
         if (laidOut) return;
         scrollOffset++;
