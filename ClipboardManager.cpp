@@ -312,6 +312,15 @@ static const int kDefaultThemeFontSize = 14;
 static const int kMinThemeFontSize = 10;
 static const int kMaxThemeFontSize = 24;
 static int g_themeFontSize = kDefaultThemeFontSize;
+
+// Chrome text size -- the item number, the action buttons, the key caps, the scope
+// control, the ages. Deliberately independent of the content size above: the two are
+// read differently, and tying them together means making item previews huge just to
+// get a legible button.
+static const int kDefaultUiFontSize = 16;
+static const int kMinUiFontSize = 10;
+static const int kMaxUiFontSize = 28;
+static int g_uiFontSize = kDefaultUiFontSize;
 static std::wstring g_themeFontFace = kDefaultThemeFontFace;
 
 // ---- Per-element color overrides -------------------------------------------------
@@ -510,6 +519,30 @@ static void SaveThemeFontSizeToRegistry(int value) {
     DWORD v = (DWORD)value;
     RegSetValueExW(hKey, L"ThemeFontSize", 0, REG_DWORD, (BYTE*)&v, sizeof(DWORD));
     RegCloseKey(hKey);
+}
+
+static void SaveUiFontSizeToRegistry(int value) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD v = (DWORD)value;
+    RegSetValueExW(hKey, L"UiFontSize", 0, REG_DWORD, (BYTE*)&v, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
+static int LoadUiFontSizeFromRegistry() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\clip2", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return kDefaultUiFontSize;
+    DWORD val = kDefaultUiFontSize, sz = sizeof(DWORD), type = REG_DWORD;
+    if (RegQueryValueExW(hKey, L"UiFontSize", nullptr, &type, (BYTE*)&val, &sz) != ERROR_SUCCESS)
+        val = kDefaultUiFontSize;
+    RegCloseKey(hKey);
+    int v = (int)val;
+    if (v < kMinUiFontSize) v = kMinUiFontSize;
+    if (v > kMaxUiFontSize) v = kMaxUiFontSize;
+    return v;
 }
 
 static int LoadThemeFontSizeFromRegistry() {
@@ -760,6 +793,9 @@ static bool FontFamilyExists(const std::wstring& face);
 static HFONT g_uiFont = nullptr;
 static HFONT g_uiFontSmall = nullptr;
 static HFONT g_uiFontBold = nullptr;
+// Snippet names are item text, not chrome, so they follow the CONTENT size even though
+// they are drawn in the UI sans rather than monospace.
+static HFONT g_uiFontItem = nullptr;
 
 static HFONT MakeUiFont(int size, int weight) {
     const wchar_t* face = FontFamilyExists(L"Segoe UI Variable Text") ? L"Segoe UI Variable Text"
@@ -772,14 +808,16 @@ static HFONT MakeUiFont(int size, int weight) {
 
 static void EnsureUiFonts() {
     if (g_uiFont) return;
-    g_uiFont      = MakeUiFont(g_themeFontSize, FW_NORMAL);
-    g_uiFontSmall = MakeUiFont(std::max(9, g_themeFontSize - 2), FW_NORMAL);
-    g_uiFontBold  = MakeUiFont(g_themeFontSize, FW_SEMIBOLD);
+    g_uiFont      = MakeUiFont(g_uiFontSize, FW_NORMAL);
+    g_uiFontSmall = MakeUiFont(g_uiFontSize, FW_NORMAL);
+    g_uiFontBold  = MakeUiFont(g_uiFontSize, FW_SEMIBOLD);
+    g_uiFontItem  = MakeUiFont(g_themeFontSize, FW_NORMAL);
 }
 
 static HFONT GetUiFont()      { EnsureUiFonts(); return g_uiFont; }
 static HFONT GetUiFontSmall() { EnsureUiFonts(); return g_uiFontSmall; }
 static HFONT GetUiFontBold()  { EnsureUiFonts(); return g_uiFontBold; }
+static HFONT GetUiFontItem()  { EnsureUiFonts(); return g_uiFontItem; }
 
 static HFONT GetOverlayFontBold()  { EnsureOverlayFontVariants(); return g_overlayFontBold; }
 static HFONT GetOverlayFontSmall() { EnsureOverlayFontVariants(); return g_overlayFontSmall; }
@@ -996,7 +1034,7 @@ static COLORREF UiInk(int amount) {
 // draws the pill and the icon; the EDIT control draws the text and its own cue banner,
 // so only one of them ever renders the query.
 static RECT UiSearchFieldRect(int paneWidth, bool pinnedPane) {
-    int fieldH = g_themeFontSize + 20;
+    int fieldH = std::max(g_themeFontSize, g_uiFontSize) + 20;
     int left = UI_PAD_X;
     int right = paneWidth - UI_PAD_X;
     if (!pinnedPane) right -= (g_themeFontSize * 13) + 10;   // room for the scope control
@@ -1016,12 +1054,13 @@ static void RecomputeUiMetrics() {
     const int s = g_themeFontSize;
 
     UI_ROW_H         = s + 26;   // 40 at the default size: room to breathe
-    UI_CMD_H         = s + 40;   // the search header
+    UI_CMD_H         = std::max(s, g_uiFontSize) + 40;   // the search header
     UI_CONTENT_TOP   = UI_CMD_H;
-    UI_KEYS_H        = s + 24;   // footer hints
+    UI_KEYS_H        = g_uiFontSize + 22;   // footer hints, sized by the chrome text
     UI_EXPAND_LINE_H = s + 9;   // the card body is drawn 3pt larger than the rows
-    // Card padding + the meta row + the action buttons + the gaps between them.
-    UI_EXPAND_CHROME = s + 75;
+    // Card padding + the meta row + the action buttons + the gaps between them. Both
+    // of those are chrome, so the card's fixed height tracks the chrome size.
+    UI_EXPAND_CHROME = g_uiFontSize * 2 + 51;
 
     // Radii and insets, all proportional so they survive a font-size change.
     UI_RADIUS_ROW    = 9;
@@ -1042,6 +1081,7 @@ static void ResetOverlayFontCache() {
     if (g_uiFont) { DeleteObject(g_uiFont); g_uiFont = nullptr; }
     if (g_uiFontSmall) { DeleteObject(g_uiFontSmall); g_uiFontSmall = nullptr; }
     if (g_uiFontBold) { DeleteObject(g_uiFontBold); g_uiFontBold = nullptr; }
+    if (g_uiFontItem) { DeleteObject(g_uiFontItem); g_uiFontItem = nullptr; }
     if (g_overlayFontBold) { DeleteObject(g_overlayFontBold); g_overlayFontBold = nullptr; }
     if (g_overlayFontSmall) { DeleteObject(g_overlayFontSmall); g_overlayFontSmall = nullptr; }
     if (g_overlayFontLarge) { DeleteObject(g_overlayFontLarge); g_overlayFontLarge = nullptr; }
@@ -3088,6 +3128,7 @@ bool ClipboardManager::Initialize() {
     ResetOverlayFontCache();
     LoadThemeColorsFromRegistry();
     g_themeFontSize = LoadThemeFontSizeFromRegistry();
+    g_uiFontSize = LoadUiFontSizeFromRegistry();
     RecomputeUiMetrics();
     expandSelected = LoadExpandSelectedFromRegistry();
     ApplyThemeId(LoadThemeIdFromRegistry());
@@ -4074,7 +4115,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                                   BlendColor(Theme5250::BG, accent, 40));
                     else if (i == pHover)
                         fillRound(rowLeft, y, rowRight, bot, UI_RADIUS_ROW, surfRow);
-                    SelectObject(hdc, GetUiFont());
+                    SelectObject(hdc, GetUiFontItem());
                     RECT pr = { rowLeft + 14, y, rowRight - 12, bot };
                     SetTextColor(hdc, inkHi);
                     DrawTextW(hdc, snip.name.c_str(), -1, &pr,
@@ -4131,7 +4172,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
 
                 std::vector<std::wstring> lines = mgr->ExpandedLinesFor(b.filteredIndex);
                 int padIn = 12;
-                int metaH = g_themeFontSize + 5;
+                int metaH = g_uiFontSize + 6;
 
                 // Kind badge: a tinted pill, the one place the accent appears as a fill.
                 SelectObject(hdc, GetUiFontSmall());
@@ -4196,7 +4237,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     btns[n++] = { L"M", L"Merge" };
 
                     SelectObject(hdc, GetUiFontSmall());
-                    int bh = g_themeFontSize + 12;
+                    int bh = g_uiFontSize + 12;
                     int by = cardBot - padIn - bh;
                     int bx = rowLeft + padIn;
                     for (int k = 0; k < n; k++) {
@@ -4249,7 +4290,7 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int nHints = paneIsPinned ? 2 : 3;
 
             int hy = rect.bottom - KEYS_H + (KEYS_H - (g_themeFontSize + 6)) / 2;
-            int hh = g_themeFontSize + 6;
+            int hh = g_uiFontSize + 7;
             int hx = rowLeft + 8;
             for (int i = 0; i < nHints; i++) {
                 SIZE ks{}, ds{};
@@ -4298,11 +4339,11 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
             int y = CONTENT_TOP + 22;
             SelectObject(hdc, GetUiFontBold());
             SetTextColor(hdc, inkHi);
-            RECT tr = { padX + 18, y, rect.right - padX - 18, y + g_themeFontSize + 6 };
+            RECT tr = { padX + 18, y, rect.right - padX - 18, y + g_uiFontSize + 6 };
             DrawTextW(hdc, L"Shortcuts", -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             SelectObject(hdc, GetUiFontSmall());
-            y += g_themeFontSize + 14;
-            int step = g_themeFontSize + 8;
+            y += g_uiFontSize + 12;
+            int step = g_uiFontSize + 8;
             for (const Row& r : rows) {
                 if (y + step > listBottom - 16) break;
                 RECT kr = { padX + 18, y, padX + 150, y + step };
@@ -9185,6 +9226,27 @@ void ClipboardManager::ResetThemeColorOverrides() {
     RefreshThemeVisuals();
 }
 
+void ClipboardManager::SetUiFontSize(int pt) {
+    if (pt < kMinUiFontSize) pt = kMinUiFontSize;
+    if (pt > kMaxUiFontSize) pt = kMaxUiFontSize;
+    g_uiFontSize = pt;
+    SaveUiFontSizeToRegistry(pt);
+    // Card height, footer height and the search header all follow the chrome size.
+    RecomputeUiMetrics();
+    ResetOverlayFontCache();   // also drops the cached UI faces
+    if (hwndMainSearch) {
+        RECT er = UiSearchEditRect(WINDOW_WIDTH, false);
+        MoveWindow(hwndMainSearch, er.left, er.top, er.right - er.left, er.bottom - er.top, TRUE);
+    }
+    if (hwndPinnedSearch) {
+        RECT er = UiSearchEditRect(PINNED_WIDTH, true);
+        MoveWindow(hwndPinnedSearch, er.left, er.top, er.right - er.left, er.bottom - er.top, TRUE);
+    }
+    EnsureSelectionVisible();
+    if (hwndList) { InvalidateRect(hwndList, nullptr, TRUE); UpdateWindow(hwndList); }
+    if (hwndPinned) { InvalidateRect(hwndPinned, nullptr, TRUE); UpdateWindow(hwndPinned); }
+}
+
 void ClipboardManager::SetThemeFontSize(int pt) {
     if (pt < kMinThemeFontSize) pt = kMinThemeFontSize;
     if (pt > kMaxThemeFontSize) pt = kMaxThemeFontSize;
@@ -10037,6 +10099,7 @@ static const int IDC_HK_PASTE_CLIPBOARD  = 3005;
 static const int IDC_THEME_COMBO         = 3006;
 static const int IDC_FONT_COMBO          = 3007;
 static const int IDC_FONT_SIZE_COMBO     = 3021;
+static const int IDC_UI_SIZE_COMBO       = 3022;
 static const int IDC_FONT_COLOR_BTN      = 3008;
 static const int IDC_FONT_COLOR_SWATCH   = 3009;
 static const int IDC_BTN_SAVE            = 3010;
@@ -10102,7 +10165,7 @@ void ClipboardManager::ShowSettingsDialog() {
         return;
     }
 
-    const int DLG_W = 480, DLG_H = 660;
+    const int DLG_W = 480, DLG_H = 700;
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
     int x = workArea.left + ((workArea.right - workArea.left) - DLG_W) / 2;
@@ -10220,6 +10283,25 @@ void ClipboardManager::ShowSettingsDialog() {
     }
     yPos += GAP;
 
+    // Chrome text size: the item number, action buttons, key caps and scope control.
+    // Separate from the overlay font size because content and labels are read
+    // differently -- tying them together means huge previews just to get legible buttons.
+    CreateHotkeyLabel(hwndSettings, L"UI text size:", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
+    HWND hUiCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        HK_X, yPos, HK_W, 260, hwndSettings, (HMENU)(INT_PTR)IDC_UI_SIZE_COMBO,
+        GetModuleHandle(nullptr), nullptr);
+    if (hUiCombo) {
+        SendMessageW(hUiCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+        int selIdx = 0, n = 0;
+        for (int pt = kMinUiFontSize; pt <= kMaxUiFontSize; pt++, n++) {
+            SendMessageW(hUiCombo, CB_ADDSTRING, 0, (LPARAM)std::to_wstring(pt).c_str());
+            if (pt == g_uiFontSize) selIdx = n;
+        }
+        SendMessageW(hUiCombo, CB_SETCURSEL, (WPARAM)selIdx, 0);
+    }
+    yPos += GAP;
+
     // Font color: small swatch + "Pick..." button that opens the standard color dialog.
     CreateHotkeyLabel(hwndSettings, L"Font color:", LBL_X, yPos + 4, LBL_W, ROW_H, hFont);
     HWND hSwatch = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
@@ -10323,6 +10405,11 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
             mgr->SetThemeFontColor(kThemeFontColorPreset);
             mgr->SetThemeFontFace(kDefaultThemeFontFace);
             mgr->SetThemeFontSize(kDefaultThemeFontSize);
+            mgr->SetUiFontSize(kDefaultUiFontSize);
+            HWND hUiCombo2 = GetDlgItem(hwnd, IDC_UI_SIZE_COMBO);
+            if (hUiCombo2)
+                SendMessageW(hUiCombo2, CB_SETCURSEL,
+                             (WPARAM)(kDefaultUiFontSize - kMinUiFontSize), 0);
             HWND hSizeCombo = GetDlgItem(hwnd, IDC_FONT_SIZE_COMBO);
             if (hSizeCombo)
                 SendMessageW(hSizeCombo, CB_SETCURSEL,
@@ -10363,6 +10450,13 @@ LRESULT CALLBACK ClipboardManager::SettingsDialogProc(HWND hwnd, UINT uMsg, WPAR
         }
 
         // Live preview when the font face combo changes.
+        if (id == IDC_UI_SIZE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+            HWND hUiCombo = (HWND)lParam;
+            int sel = (int)SendMessageW(hUiCombo, CB_GETCURSEL, 0, 0);
+            if (sel >= 0) mgr->SetUiFontSize(kMinUiFontSize + sel);
+            return 0;
+        }
+
         if (id == IDC_FONT_SIZE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
             HWND hSizeCombo = (HWND)lParam;
             int sel = (int)SendMessageW(hSizeCombo, CB_GETCURSEL, 0, 0);

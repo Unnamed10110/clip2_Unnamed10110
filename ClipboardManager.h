@@ -394,6 +394,7 @@ private:
     void SetThemeFontColor(COLORREF color);          // Override (or clear, via sentinel) overlay font color.
     void SetThemeFontFace(const std::wstring& face); // Switch overlay/search font face and repaint.
     void SetThemeFontSize(int pt);                   // Switch overlay font size, rescale rows, repaint.
+    void SetUiFontSize(int pt);                      // Switch chrome text size (labels, buttons, caps).
     void SetThemeColorOverride(int slot, COLORREF color); // Override (or clear) one overlay element color.
     void ResetThemeColorOverrides();                 // Clear all per-element color overrides.
     void RefreshThemeVisuals();                      // Re-apply class brushes + repaint after a color change.
