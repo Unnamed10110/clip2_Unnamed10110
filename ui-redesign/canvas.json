@@ -1,0 +1,36 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html",      "x": 0,   "y": 0,   "w": 640, "h": 520, "title": "Palette — leading candidate" },
+    { "file": "Preview.dc.html",   "x": 740, "y": 0,   "w": 900, "h": 560, "title": "Preview" },
+    { "file": "Dense.dc.html",     "x": 0,   "y": 880, "w": 640, "h": 560, "title": "Dense" },
+    { "file": "QuickPick.dc.html", "x": 740, "y": 880, "w": 420, "h": 272, "title": "Quick pick" }
+  ],
+  "annotations": [
+    {
+      "id": "framing",
+      "x": 0, "y": -190, "w": 900,
+      "text": "Colour is identical in all four — the Slate preset you just shipped — so the only thing being compared here is structure.\n\nAll four stay inside what GDI can actually draw: flat fills, rounded rects, 1px rules, text and blitted thumbnails. The icons are SVG in these mockups; in the app they would be Polyline/Ellipse paths or one small blitted icon strip, since GDI has no SVG."
+    },
+    {
+      "id": "note-palette",
+      "x": 0, "y": 590, "w": 440,
+      "text": "PALETTE — leading candidate\n\nAxis: consolidation, keyboard-first.\n\nOne window. Pinned and Snippets become scopes instead of a second window, so there is one header, one search, one footer. The selected row grows to carry the paste modes, which stops the seven shortcuts hiding in a 12px strip. 12 rows visible vs 10 today, in a shorter window.\n\nTradeoff: the pinned list is no longer permanently on screen — it becomes a keystroke away."
+    },
+    {
+      "id": "note-preview",
+      "x": 740, "y": 590, "w": 440,
+      "text": "PREVIEW\n\nAxis: information depth.\n\nSpends the second window on a pane that shows the whole item rather than a second list. Today you only ever see one ellipsized line — this is the direction that fixes that. Pinned moves inline as a section header.\n\nTradeoff: wants 900px of width, and the pane is dead weight when all you want is the item you just copied."
+    },
+    {
+      "id": "note-dense",
+      "x": 0, "y": 1470, "w": 440,
+      "text": "DENSE\n\nAxis: density.\n\n18 rows in the same 560px where the current design fits 10. Real columns, hairline rules, and the outlined letter badge collapses to a 3-character type code. This is the direction closest to the app's AS/400 heritage.\n\nTradeoff: no room for a preview or inline actions, and image thumbnails would have to shrink or go."
+    },
+    {
+      "id": "note-quickpick",
+      "x": 740, "y": 1470, "w": 440,
+      "text": "QUICK PICK\n\nAxis: footprint.\n\nOpens at the text caret for the case that is most of the use — take one of the last six copies and carry on typing. Press the digit, it pastes.\n\nTradeoff: no browsing, no search, no pinning. This is a companion to one of the other three, not a replacement for it."
+    }
+  ],
+  "launch": { "view": "canvas" }
+}

@@ -1,0 +1,171 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; background: #000; }
+    a { color: #83bdf8; } a:hover { color: #b6d5f4; }
+    .win {
+      width: 640px; height: 520px; box-sizing: border-box;
+      background: #000; box-shadow: inset 0 0 0 1px #466c93;
+      display: flex; flex-direction: column; overflow: hidden;
+      font-family: Consolas, "DejaVu Sans Mono", ui-monospace, monospace;
+      font-size: 13px; line-height: 1;
+    }
+    .search { flex: 0 0 auto; height: 48px; display: flex; align-items: center; gap: 10px; padding: 0 14px; }
+    .scopes { display: flex; align-items: center; gap: 14px; font-size: 11px; }
+    .rule { flex: 0 0 auto; height: 1px; background: #14222f; }
+    .list { flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; }
+    .row { flex: 0 0 auto; height: 34px; display: flex; align-items: center; gap: 0; position: relative; }
+    .gut { flex: 0 0 26px; display: flex; align-items: center; justify-content: center; }
+    .prev { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #b6d5f4; }
+    .when { flex: 0 0 46px; text-align: right; padding-right: 14px; font-size: 11px; color: #6b7d8f; }
+    .pin { position: absolute; left: 0; top: 7px; width: 3px; height: 20px; background: #83bdf8; }
+    .sel { height: 68px; background: #83bdf8; flex-direction: column; align-items: stretch; }
+    .sel-top { display: flex; align-items: center; height: 34px; }
+    .sel-acts { display: flex; align-items: center; gap: 6px; padding-left: 26px; height: 34px; }
+    .chip {
+      display: flex; align-items: center; gap: 5px; height: 18px; padding: 0 7px;
+      border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.34);
+      font-size: 10px; color: #06101c; white-space: nowrap;
+    }
+    .chip b { font-weight: 700; }
+    .foot {
+      flex: 0 0 auto; height: 26px; background: #131c24; display: flex; align-items: center;
+      gap: 18px; padding: 0 14px; font-size: 11px; color: #6b7d8f;
+    }
+    .foot b { color: #b6d5f4; font-weight: 400; }
+  </style>
+</helmet>
+
+<div class="win">
+
+  <!-- Search IS the header: no app-name bar, no mode pill, no second window. -->
+  <div class="search">
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="#6b7d8f" stroke-width="1.4">
+      <circle cx="7" cy="7" r="4.5"></circle>
+      <path d="M10.5 10.5 L14 14" stroke-linecap="round"></path>
+    </svg>
+    <div style="flex: 1 1 auto; color: #46586b; font-size: 13px">Search clipboard</div>
+    <div class="scopes">
+      <div style="color: #83bdf8">All <span style="color: #46586b">47</span></div>
+      <div style="color: #6b7d8f">Pinned <span style="color: #46586b">6</span></div>
+      <div style="color: #6b7d8f">Snippets <span style="color: #46586b">12</span></div>
+    </div>
+  </div>
+  <div class="rule"></div>
+
+  <div class="list">
+    <sc-for list="{{rows}}" as="row" hint-placeholder-count="12">
+
+      <!-- Unselected row: gutter glyph, content, age. Nothing else competes. -->
+      <sc-if value="{{row.plain}}" hint-placeholder-val="{{true}}">
+        <div class="row">
+          <sc-if value="{{row.pinned}}" hint-placeholder-val="{{true}}">
+            <div class="pin"></div>
+          </sc-if>
+          <div class="gut">
+            <sc-if value="{{row.isText}}" hint-placeholder-val="{{true}}">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#466c93" stroke-width="1.4" stroke-linecap="round">
+                <path d="M3 4.5h10M3 8h10M3 11.5h6"></path>
+              </svg>
+            </sc-if>
+            <sc-if value="{{row.isImage}}" hint-placeholder-val="{{true}}">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#466c93" stroke-width="1.4">
+                <rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.6"></rect>
+                <circle cx="5.8" cy="6.4" r="1.1"></circle>
+                <path d="M3 11.4 L6.6 8.4 L9 10.2 L11 8.8 L13 10.6" stroke-linecap="round"></path>
+              </svg>
+            </sc-if>
+            <sc-if value="{{row.isFile}}" hint-placeholder-val="{{true}}">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#466c93" stroke-width="1.4">
+                <path d="M4.4 2.6h4.4L12 5.8v7.6H4.4z" stroke-linejoin="round"></path>
+                <path d="M8.6 2.8v3.2H11.8"></path>
+              </svg>
+            </sc-if>
+          </div>
+          <div class="prev">{{row.text}}</div>
+          <div class="when">{{row.when}}</div>
+        </div>
+      </sc-if>
+
+      <!-- Selected row grows to reveal the actions that apply to THIS item.
+           The old design hid all seven modes in one 12px footer strip. -->
+      <sc-if value="{{row.selected}}" hint-placeholder-val="{{true}}">
+        <div class="row sel">
+          <div class="sel-top">
+            <div class="gut">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="#06101c" stroke-width="1.4" stroke-linecap="round">
+                <path d="M3 4.5h10M3 8h10M3 11.5h6"></path>
+              </svg>
+            </div>
+            <div class="prev" style="color: #06101c">{{row.text}}</div>
+            <div class="when" style="color: #2c4a6b">{{row.when}}</div>
+          </div>
+          <div class="sel-acts">
+            <div class="chip" style="background: rgba(0,0,0,0.14)"><b>&#8629;</b> Paste</div>
+            <div class="chip"><b>U</b> Clean URL</div>
+            <div class="chip"><b>M</b> Markdown link</div>
+            <div class="chip"><b>P</b> Plain</div>
+            <div class="chip"><b>E</b> Edit</div>
+            <div class="chip" style="padding: 0 6px"><b>&#8943;</b></div>
+          </div>
+        </div>
+      </sc-if>
+
+    </sc-for>
+  </div>
+
+  <!-- Three essentials, not a wall of seven. "?" opens the full sheet. -->
+  <div class="foot">
+    <div><b>&#8629;</b> paste</div>
+    <div><b>&#8677;</b> scope</div>
+    <div><b>?</b> shortcuts</div>
+  </div>
+
+</div>
+</x-dc>
+
+<script data-dc-script data-props='{ "$preview": { "width": 640, "height": 520 } }'>
+// Direction: "Palette". One window, search-first, actions on the selected item.
+// Colour is deliberately identical across all four directions (the Slate preset)
+// so the only thing being compared is structure.
+class Component extends DCLogic {
+  renderVals() {
+    const SELECTED = 1;   // the URL row, so its actions are the ones that really apply
+    const data = [
+      { text: 'SELECT id, name FROM customers WHERE active = 1', when: '2m',  type: 'text' },
+      { text: 'https://github.com/Unnamed10110/clip2/releases',  when: '5m',  type: 'text' },
+      { text: 'ClipboardManager.cpp:6461',                       when: '8m',  type: 'text', pinned: true },
+      { text: 'Screenshot 2026-09-10 081722.png',                when: '12m', type: 'image' },
+      { text: '3 files - history.dat, blobs\\, settings.reg',    when: '18m', type: 'file' },
+      { text: 'HookSafeSleep keeps the low-level hook serviced', when: '24m', type: 'text' },
+      { text: 'cmake -S . -B build -DCLIP2_TRACE=ON',            when: '31m', type: 'text' },
+      { text: 'RGB(131, 189, 248)',                              when: '47m', type: 'text' },
+      { text: '%APPDATA%\\clip2\\history.dat',                   when: '1h',  type: 'text' },
+      { text: 'overlay-dual-pane.png',                           when: '1h',  type: 'image' },
+      { text: 'git rebase -i HEAD~3',                            when: '2h',  type: 'text' },
+      { text: 'Consolas',                                        when: '3h',  type: 'text' }
+    ];
+    return {
+      rows: data.map((d, i) => ({
+        text: d.text,
+        when: d.when,
+        pinned: !!d.pinned,
+        isText: d.type === 'text',
+        isImage: d.type === 'image',
+        isFile: d.type === 'file',
+        selected: i === SELECTED,
+        plain: i !== SELECTED
+      }))
+    };
+  }
+}
+</script>
+</body>
+</html>

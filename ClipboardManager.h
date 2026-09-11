@@ -445,6 +445,23 @@ private:
     // True while a paste is injecting keystrokes. The pump keeps running during a
     // paste (HookSafeSleep) purely to service the keyboard hook, so the window procs
     // use this to drop input rather than start a second paste from inside the first.
+    // What the main list is showing. Pinned items are NOT a scope: they keep their own
+    // lateral pane, so the scope row only chooses between history and snippets.
+    enum OverlayScope { SCOPE_ALL = 0, SCOPE_SNIPPETS = 1 };
+    int overlayScope;
+    bool showShortcuts;   // the "?" sheet is over the list
+    // Painted hit targets. The scope row and the selected row's action chips are drawn
+    // by the paint pass, so it records where they landed and the click handler tests
+    // these instead of recomputing the layout.
+    RECT scopeTabRect[3];
+    RECT chipHitRect[6];
+    WPARAM chipHitKey[6];
+    int chipHitCount;
+    void SetOverlayScope(int scope);
+    // Only the selected row is tall, so row geometry has a closed form and the paint
+    // loop and hit-testing can share it without materialising a list of rects.
+    int RowTopForVisible(int visibleRow, int selectedVisibleRow) const;
+    int VisibleRowAtY(int y, int selectedVisibleRow) const;
     bool pasteInFlight;
     DWORD pasteStartTick;        // 0 when not pasting; else GetTickCount()|1 (watchdog)
     DWORD processingStartTick;   // 0 when not processing; else GetTickCount()|1 (watchdog)
@@ -523,8 +540,15 @@ private:
     static constexpr int MIN_MAX_ITEMS = 10;        // Lower clamp for the configurable history size
     static constexpr int MAX_MAX_ITEMS = 2000;      // Upper clamp for the configurable history size
     int maxItems;                               // Runtime-configurable history cap (registry: MaxItems)
-    static const int WINDOW_WIDTH = 600;
-    static const int WINDOW_HEIGHT = 600;
+    static const int WINDOW_WIDTH = 640;
+    static const int WINDOW_HEIGHT = 520;
+    // ---- Palette overlay metrics ----
+    // The search field is the header, so there is no separate app-name bar.
+    static const int SEARCH_H = 48;             // search/scope header height
+    static const int OVERLAY_CONTENT_TOP = 49;  // SEARCH_H + 1px rule
+    static const int ROW_H = 34;                // a normal row
+    static const int ROW_SEL_H = 68;            // the selected row, expanded for its actions
+    static const int OVERLAY_FOOTER_H = 26;
     static const int PINNED_WIDTH = 320;   // Width of the left pinned panel
     static const int PANEL_GAP = 12;       // Gap between the pinned panel and the main list
     
