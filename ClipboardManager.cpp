@@ -4587,10 +4587,9 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                 return 0;
             }
         }
-        // Navigate with arrow keys (only if search box doesn't have focus)
+        // Navigate with arrow keys. SearchEditProc forwards Up/Down here while Ctrl+F
+        // search still has focus, so the same path moves the result highlight.
         {
-            HWND focusedWindow = GetFocus();
-            if (focusedWindow != mgr->hwndSearch) {
                 int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
                 bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
                 if (mgr->snippetsMode) isShiftPressed = false;  // No multi-select for snippets
@@ -4664,7 +4663,6 @@ LRESULT CALLBACK ClipboardManager::ListWindowProc(HWND hwnd, UINT uMsg, WPARAM w
                     }
                     return 0;
                 }
-            }
         }
         if (wParam == VK_PRIOR) {
             int listSize = mgr->snippetsMode ? (int)mgr->filteredSnippetIndices.size() : (int)mgr->filteredIndices.size();
@@ -5363,9 +5361,8 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
         return 0;
     }
     
-    // In snippets mode, forward Up/Down to list so arrow keys move selection even when search has focus
-    if (uMsg == WM_KEYDOWN && mgr->snippetsMode && (wParam == VK_UP || wParam == VK_DOWN)) {
-        SetFocus(ownerList);
+    // Up/Down walk the filtered results while the search box stays focused (Ctrl+F).
+    if (uMsg == WM_KEYDOWN && (wParam == VK_UP || wParam == VK_DOWN)) {
         SendMessage(ownerList, WM_KEYDOWN, wParam, lParam);
         return 0;
     }
@@ -5386,16 +5383,22 @@ LRESULT CALLBACK ClipboardManager::SearchEditProc(HWND hwnd, UINT uMsg, WPARAM w
                 mgr->HideListWindow();
                 mgr->ShowSnippetsManagerDialog();
             } else {
+                int pick = mgr->selectedIndex;
                 mgr->FilterSnippets();
-                if (!mgr->filteredSnippetIndices.empty()) {
-                    mgr->PasteSnippet(mgr->filteredSnippetIndices[0]);
+                if (pick >= 0 && pick < (int)mgr->filteredSnippetIndices.size())
+                    mgr->selectedIndex = pick;
+                if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredSnippetIndices.size()) {
+                    mgr->PasteSnippet(mgr->filteredSnippetIndices[mgr->selectedIndex]);
                     mgr->HideListWindow();
                 }
             }
         } else {
+            int pick = mgr->selectedIndex;
             mgr->FilterItems();
-            if (!mgr->filteredIndices.empty()) {
-                mgr->PasteItem(0);
+            if (pick >= 0 && pick < (int)mgr->filteredIndices.size())
+                mgr->selectedIndex = pick;
+            if (mgr->selectedIndex >= 0 && mgr->selectedIndex < (int)mgr->filteredIndices.size()) {
+                mgr->PasteItem(mgr->selectedIndex);
                 mgr->HideListWindow();
             }
         }
