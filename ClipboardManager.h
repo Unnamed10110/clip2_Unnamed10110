@@ -436,6 +436,11 @@ private:
     // Last-resort clears for the re-entrancy flags. The scope guards make a latched
     // flag essentially impossible; this catches a future path that forgets one.
     static const UINT_PTR TIMER_FLAG_WATCHDOG = 4;
+    // Level-triggered capture recovery. WM_CLIPBOARDUPDATE is a single, edge-triggered
+    // shot per change: a copy that loses the clipboard-contention race (common when the
+    // machine is starved) is otherwise dropped for good, with nothing to re-check it.
+    // This timer re-compares the clipboard sequence number and retries the capture.
+    static const UINT_PTR TIMER_CLIPBOARD_RECONCILE = 5;
     NOTIFYICONDATA nid;
     UINT wmTaskbarCreated;
     bool isRunning;
@@ -495,6 +500,8 @@ private:
     DWORD pasteStartTick;        // 0 when not pasting; else GetTickCount()|1 (watchdog)
     DWORD processingStartTick;   // 0 when not processing; else GetTickCount()|1 (watchdog)
     DWORD hookLastCallbackTick;  // Last time LowLevelKeyboardProc ran (hook liveness)
+    DWORD retrySeq;              // Clipboard sequence the reconcile timer is retrying (0 = none)
+    int retryCount;             // Reconcile attempts for retrySeq; bounded so bad content is dropped
     std::wstring lastPastedText;  // Store last pasted text to ignore it if it's copied back
     DWORD lastPastedTextTick;     // When lastPastedText was set; it expires (see kPasteEchoWindowMs)
     // Remember what we just pasted so an app echoing it straight back to the clipboard

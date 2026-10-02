@@ -3085,7 +3085,7 @@ static void RestartSelf(ClipboardManager* mgr) {
 }
 
 ClipboardManager::ClipboardManager()
-    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), overlayScope(SCOPE_ALL), showShortcuts(false), chipHitCount(0), expandSelected(true), isPasting(false), isProcessingClipboard(false), pasteInFlight(false), pasteStartTick(0), processingStartTick(0), hookLastCallbackTick(0), lastPastedText(L""), lastPastedTextTick(0), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
+    : hwndMain(nullptr), hwndList(nullptr), hwndPinned(nullptr), hwndPreview(nullptr), hwndSearch(nullptr), hwndMainSearch(nullptr), hwndPinnedSearch(nullptr), activeIsPinned(false), overlayShownTick(0), overlayGotForeground(false), hasSavedOverlayPos(false), overlayPosX(0), overlayPosY(0), historyDirty(false), hwndSettings(nullptr), hwndEditPaste(nullptr), editPasteSaveAsNew(false), hwndSnippetsManager(nullptr), hwndSnippetEditor(nullptr), snippetEditorEditIndex(-1), ignoreNextSnippetShortcutChar(false), isRunning(false), listVisible(false), lastSequenceNumber(0), hKeyboardHook(nullptr), scrollOffset(0), itemsPerPage(10), numberInput(L""), searchText(L""), snippetsMode(false), lastSKeyTime(0), ignoreNextSChar(false), overlayScope(SCOPE_ALL), showShortcuts(false), chipHitCount(0), expandSelected(true), isPasting(false), isProcessingClipboard(false), pasteInFlight(false), pasteStartTick(0), processingStartTick(0), hookLastCallbackTick(0), retrySeq(0), retryCount(0), lastPastedText(L""), lastPastedTextTick(0), previousFocusWindow(nullptr), hoveredItemIndex(-1), selectedIndex(0), multiSelectAnchor(-1), originalSearchEditProc(nullptr), lastHotkeyTick(0), hasImmediateClipboardSnapshot(false), maxItems(DEFAULT_MAX_ITEMS) {
     instance = this;
     ZeroMemory(&nid, sizeof(nid));
     hotkeyConfig.modifiers = MOD_CONTROL;
@@ -3317,6 +3317,12 @@ bool ClipboardManager::Initialize() {
     SetTimer(hwndMain, TIMER_HOOK_KEEPALIVE, 60000, nullptr);
     // Last-resort recovery for a latched re-entrancy flag (see the WM_TIMER handler).
     SetTimer(hwndMain, TIMER_FLAG_WATCHDOG, 5000, nullptr);
+    // Level-triggered capture recovery. WM_CLIPBOARDUPDATE fires once per change; a copy
+    // that lost the clipboard-contention race leaves lastSequenceNumber behind the real
+    // sequence number, and nothing else re-checks. This re-compares and retries so a copy
+    // starved out under load is picked up within ~0.5 s instead of being lost until the
+    // next clipboard change.
+    SetTimer(hwndMain, TIMER_CLIPBOARD_RECONCILE, 500, nullptr);
 
     wmTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
     lastSequenceNumber = GetClipboardSequenceNumber();
@@ -3368,6 +3374,7 @@ void ClipboardManager::Stop() {
         KillTimer(hwndMain, TIMER_SAVE_HISTORY);
         KillTimer(hwndMain, TIMER_HOOK_KEEPALIVE);
         KillTimer(hwndMain, TIMER_FLAG_WATCHDOG);
+        KillTimer(hwndMain, TIMER_CLIPBOARD_RECONCILE);
     }
     if (historyDirty) {
         historyDirty = false;
@@ -3622,27 +3629,35 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
             // we caused ourselves when pasting.
             if (currentSequence != mgr->lastSequenceNumber) {
                 // Beat the copying app to the content FIRST: some apps clear or replace
-                // the clipboard right after copying. The click sound used to run before
-                // this, and on a Media Foundation failure that meant re-running MFStartup
-                // plus a full mp3 decode on every single clipboard change -- ahead of the
-                // capture it was supposed to be announcing.
+                // the clipboard right after copying.
                 bool captured = mgr->TryCaptureClipboardImmediately();
-                mgr->PlayClickSound();
 
-                // Only consume the event once we actually hold the bytes. This used to be
-                // stamped unconditionally, so a capture that lost the race threw the copy
-                // away for good -- there was nothing left to retry from.
+                // The click sound announces a capture, so only play it when one actually
+                // happened. On a failed race it used to fire anyway, and on a Media
+                // Foundation failure that meant re-running MFStartup plus an mp3 decode
+                // (or the MCI/WMP fallback) on the UI thread -- latency landing right
+                // where the copy needed the thread free. The reconcile timer handles the
+                // retry, so a lost race here stays silent and cheap.
                 if (captured) {
+                    mgr->PlayClickSound();
+                    // Only consume the event once we actually hold the bytes. Stamping
+                    // unconditionally used to throw a lost race away for good.
                     mgr->lastSequenceNumber = currentSequence;
                 } else {
                     CLIP2_TRACE(L"capture lost the race; seq %lu not consumed",
                                 (unsigned long)currentSequence);
                 }
 
-                // Process asynchronously: ProcessClipboard() retries the capture if the
-                // one above failed, then builds the item with the clipboard released.
+                // Process asynchronously: ProcessClipboard() makes one more capture
+                // attempt if the one above failed, then builds the item with the
+                // clipboard released. TIMER_CLIPBOARD_RECONCILE keeps retrying after that.
                 PostMessage(hwnd, WM_PROCESS_CLIPBOARD, 0, 0);
             }
+        } else {
+            // A notification arrived mid-paste. This is our own clipboard write (or its
+            // echo), not a user copy, so consume the sequence: otherwise the reconcile
+            // timer would later see a mismatch and record our paste as a new history item.
+            mgr->lastSequenceNumber = GetClipboardSequenceNumber();
         }
         return 0;
         
@@ -3707,6 +3722,30 @@ LRESULT CALLBACK ClipboardManager::WindowProc(HWND hwnd, UINT uMsg, WPARAM wPara
                 mgr->isPasting = false;
                 mgr->pasteInFlight = false;
                 mgr->pasteStartTick = 0;
+            }
+        } else if (wParam == TIMER_CLIPBOARD_RECONCILE) {
+            // The clipboard changed but lastSequenceNumber never caught up: the
+            // WM_CLIPBOARDUPDATE capture lost the race (some app held the clipboard, which
+            // is common when the machine is starved) and nothing else re-checks. Retry the
+            // capture here, without sleeping, so the UI thread and keyboard hook stay
+            // responsive. Skip while we are pasting or already processing so we never
+            // record our own echo or re-enter.
+            DWORD seq = GetClipboardSequenceNumber();
+            if (seq != mgr->lastSequenceNumber && !mgr->isPasting &&
+                !mgr->pasteInFlight && !mgr->isProcessingClipboard) {
+                if (seq != mgr->retrySeq) { mgr->retrySeq = seq; mgr->retryCount = 0; }
+                if (++mgr->retryCount > 10) {
+                    // ~5 s of attempts. Content we simply cannot record (handle-only
+                    // formats, oversized payloads, an empty clipboard) must not retry
+                    // forever, so consume the sequence and move on.
+                    CLIP2_TRACE(L"reconcile giving up on seq %lu after %d tries",
+                                (unsigned long)seq, mgr->retryCount);
+                    mgr->lastSequenceNumber = seq;
+                } else {
+                    CLIP2_TRACE(L"reconcile retrying seq %lu (try %d)",
+                                (unsigned long)seq, mgr->retryCount);
+                    mgr->ProcessClipboard();  // stamps lastSequenceNumber on success
+                }
             }
         }
         return 0;
@@ -7642,14 +7681,14 @@ void ClipboardManager::ProcessClipboard() {
 
     if (!hasImmediateClipboardSnapshot) {
         // WM_CLIPBOARDUPDATE's snapshot lost the race -- some app was holding the
-        // clipboard. Retry the SNAPSHOT, which is cheap and lock-scoped, rather than
-        // the whole pipeline. Same backoff the old retry ladder used.
-        CLIP2_TRACE(L"no snapshot from the notification; retrying capture");
-        for (int retry = 1; retry <= 4 && !hasImmediateClipboardSnapshot; retry++) {
-            HookSafeSleep(50u * (DWORD)retry);
-            if (TryCaptureClipboardImmediately()) break;
-        }
-        if (hasImmediateClipboardSnapshot) {
+        // clipboard. Try the SNAPSHOT once more here; it is cheap and lock-scoped. Do
+        // NOT sleep-retry on this thread: the old 4-step ~500 ms HookSafeSleep ladder ran
+        // on the message-pump / keyboard-hook thread, overshooting LowLevelHooksTimeout
+        // (300 ms) exactly when the machine was already starved. If this attempt also
+        // fails, TIMER_CLIPBOARD_RECONCILE retries from the timer ~0.5 s later with the
+        // thread free in between.
+        CLIP2_TRACE(L"no snapshot from the notification; one more immediate attempt");
+        if (TryCaptureClipboardImmediately()) {
             // The content may have changed since the notification, so re-stamp to avoid
             // processing this same state again.
             lastSequenceNumber = GetClipboardSequenceNumber();
@@ -7658,8 +7697,8 @@ void ClipboardManager::ProcessClipboard() {
     }
 
     if (!hasImmediateClipboardSnapshot) {
-        // Leave lastSequenceNumber alone: the copy was NOT consumed, so the next
-        // notification for it can still be captured.
+        // Leave lastSequenceNumber alone: the copy was NOT consumed, so the reconcile
+        // timer (or the next notification) can still capture it.
         CLIP2_TRACE(L"nothing captured; sequence number left unconsumed");
         return;
     }
